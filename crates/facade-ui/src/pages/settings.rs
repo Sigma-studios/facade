@@ -12,18 +12,24 @@ use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::components::{CopyField, ErrorNote, Loading, Modal};
-use crate::util::{download, polled, run, toasts};
+use crate::util::{download, me, polled, run, toasts};
 
 #[component]
 pub fn Settings() -> impl IntoView {
+    // Members only manage their password and their own logins.
+    let me = me();
     view! {
         <div class="page page-narrow">
             <header class="page-head"><h1>"Settings"</h1></header>
             <Password/>
-            <ServerAccess/>
+            <Show when=move || me.is_admin()>
+                <ServerAccess/>
+            </Show>
             <Credentials/>
-            <Export/>
-            <Apply/>
+            <Show when=move || me.is_admin()>
+                <Export/>
+                <Apply/>
+            </Show>
         </div>
     }
 }
@@ -248,6 +254,7 @@ fn ServerAccess() -> impl IntoView {
 
 #[component]
 fn Credentials() -> impl IntoView {
+    let me = me();
     let list = polled(None, || async {
         api::get::<Vec<CredentialView>>("/api/credentials").await
     });
@@ -299,6 +306,11 @@ fn Credentials() -> impl IntoView {
                 "Registry logins are used to pull private images and the images a Dockerfile's FROM names "
                 "(e.g. ghcr.io, with a token that can read packages). Git logins are used to clone private "
                 "repositories over HTTPS (e.g. github.com, with a token that can read the repository)."
+                {move || if me.is_admin() {
+                    " An app builds with its owner's logins: the admins' ones below, or a member's own."
+                } else {
+                    " Builds of the apps you own use yours."
+                }}
             </p>
             <ErrorNote error=list.error/>
             <Show when=move || list.loaded() fallback=Loading>
@@ -306,23 +318,40 @@ fn Credentials() -> impl IntoView {
                     fallback=|| view! { <p class="muted small">"No logins yet."</p> }>
                     <div class="table-wrap">
                         <table class="table">
-                            <thead><tr><th>"Kind"</th><th>"Host"</th><th>"Username"</th><th></th></tr></thead>
+                            <thead>
+                                <tr>
+                                    <th>"Kind"</th><th>"Host"</th><th>"Username"</th>
+                                    <Show when=move || me.is_admin()><th>"Owner"</th></Show>
+                                    <th></th>
+                                </tr>
+                            </thead>
                             <tbody>
                                 <For each=move || list.data.get().unwrap_or_default()
-                                    key=|c| (c.kind, c.host.clone(), c.username.clone())
+                                    key=|c| (c.kind, c.host.clone(), c.username.clone(), c.owner.clone())
                                     let:c>
                                     {
                                         let target = c.clone();
+                                        let owner = c.owner.clone();
+                                        // Admins manage the admins' logins; a member's are theirs to change.
+                                        let admins_own = owner.is_none();
                                         view! {
                                             <tr>
                                                 <td>{c.kind.to_string()}</td>
                                                 <td><code>{c.host.clone()}</code></td>
                                                 <td>{c.username.clone()}</td>
+                                                <Show when=move || me.is_admin()>
+                                                    <td class="muted">{owner.clone().unwrap_or_else(|| "admins".into())}</td>
+                                                </Show>
                                                 <td class="row-actions">
-                                                    <button class="link-button danger" on:click=move |_| {
-                                                        remove_target.set(Some(target.clone()));
-                                                        remove_open.set(true);
-                                                    }>"Remove"</button>
+                                                    <Show when=move || admins_own || !me.is_admin()>
+                                                        <button class="link-button danger" on:click={
+                                                            let target = target.clone();
+                                                            move |_| {
+                                                                remove_target.set(Some(target.clone()));
+                                                                remove_open.set(true);
+                                                            }
+                                                        }>"Remove"</button>
+                                                    </Show>
                                                 </td>
                                             </tr>
                                         }

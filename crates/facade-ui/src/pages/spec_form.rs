@@ -7,7 +7,7 @@ use leptos::task::spawn_local;
 
 use crate::api;
 use crate::components::ErrorNote;
-use crate::util::bytes;
+use crate::util::{bytes, cpus, me};
 
 #[derive(Clone, Copy)]
 pub struct SpecForm {
@@ -652,6 +652,7 @@ pub fn SpecFields(
     editing: bool,
 ) -> impl IntoView {
     let f = form;
+    let me = me();
     view! {
         <fieldset class="form-section">
             <legend>"App"</legend>
@@ -832,10 +833,15 @@ pub fn SpecFields(
                             "Opened on the node's public interface, outside the web entry point (e.g. a game server or TURN relay)."
                         }}</small>
                     </div>
-                    <label class="check">
-                        <input type="checkbox" bind:checked=f.host_network/>
-                        "Use the node's network"
-                    </label>
+                    <div class="check-field">
+                        <label class="check">
+                            <input type="checkbox" bind:checked=f.host_network disabled=move || me.is_member()/>
+                            "Use the node's network"
+                        </label>
+                        <Show when=move || me.is_member()>
+                            <small class="muted small">"Only an admin can do this; publish ports instead."</small>
+                        </Show>
+                    </div>
                 </div>
             </Show>
         </fieldset>
@@ -854,11 +860,21 @@ pub fn SpecFields(
                 <div class="form-row">
                     <label class="field">
                         <span>"Memory (MB)"</span>
-                        <input type="number" min="16" bind:value=f.memory placeholder="no limit"/>
+                        <input type="number" min="16" bind:value=f.memory
+                            required=move || me.memory_cap().is_some()
+                            placeholder=move || if me.memory_cap().is_some() { "required" } else { "no limit" }/>
+                        {move || me.memory_cap().map(|(used, cap)| view! {
+                            <small>{format!("{used} of {cap} MB used by your apps.")}</small>
+                        })}
                     </label>
                     <label class="field">
                         <span>"CPUs"</span>
-                        <input type="number" min="0.1" step="0.1" bind:value=f.cpus placeholder="no limit"/>
+                        <input type="number" min="0.1" step="0.1" bind:value=f.cpus
+                            required=move || me.cpu_cap().is_some()
+                            placeholder=move || if me.cpu_cap().is_some() { "required" } else { "no limit" }/>
+                        {move || me.cpu_cap().map(|(used, cap)| view! {
+                            <small>{format!("{} of {} CPUs used by your apps.", cpus(used), cpus(cap))}</small>
+                        })}
                     </label>
                 </div>
             </fieldset>

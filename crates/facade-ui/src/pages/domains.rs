@@ -7,10 +7,11 @@ use leptos_router::components::A;
 
 use crate::api;
 use crate::components::{ErrorNote, Loading};
-use crate::util::{polled, run, toasts};
+use crate::util::{me, polled, run, toasts};
 
 #[component]
 pub fn Domains() -> impl IntoView {
+    let me = me();
     let domains = polled(Some(Duration::from_secs(15)), || async {
         api::get::<Vec<DomainStatus>>("/api/domains").await
     });
@@ -21,7 +22,9 @@ pub fn Domains() -> impl IntoView {
                 "Each domain points straight at the node running its app, which serves it over HTTPS. "
                 "Add domains in an app's settings."
             </p>
-            <DnsProvider on_change=move || domains.reload()/>
+            <Show when=move || me.is_admin()>
+                <DnsProvider on_change=move || domains.reload()/>
+            </Show>
             <ErrorNote error=domains.error/>
             <Show when=move || domains.loaded() fallback=Loading>
                 <DomainTable domains=Signal::derive(move || domains.data.get().unwrap_or_default()) show_app=true/>

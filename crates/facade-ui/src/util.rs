@@ -64,6 +64,47 @@ where
     polled
 }
 
+// ---------------------------------------------------------------- signed-in user
+
+/// Who is signed in, fetched by the shell and shared with every page.
+#[derive(Clone, Copy)]
+pub struct Me(pub Polled<facade_core::api::WhoAmI>);
+
+pub fn me() -> Me {
+    expect_context::<Me>()
+}
+
+impl Me {
+    /// False until known, so members never see admin-only controls flash by.
+    pub fn is_admin(&self) -> bool {
+        self.0
+            .data
+            .with(|w| w.as_ref().is_some_and(|w| w.role == "admin"))
+    }
+
+    pub fn is_member(&self) -> bool {
+        self.0
+            .data
+            .with(|w| w.as_ref().is_some_and(|w| w.role != "admin"))
+    }
+
+    /// `(used, cap)` in MB, when the user's apps share a memory cap.
+    pub fn memory_cap(&self) -> Option<(u64, u64)> {
+        self.0.data.with(|w| {
+            let w = w.as_ref()?;
+            Some((w.memory_allocated_mb, w.memory_cap_mb?))
+        })
+    }
+
+    /// `(used, cap)` in CPUs, when the user's apps share a CPU cap.
+    pub fn cpu_cap(&self) -> Option<(f64, f64)> {
+        self.0.data.with(|w| {
+            let w = w.as_ref()?;
+            Some((w.cpus_allocated, w.cpu_cap?))
+        })
+    }
+}
+
 // ---------------------------------------------------------------- toasts
 
 #[derive(Clone, PartialEq)]
@@ -183,6 +224,12 @@ pub fn date(at: u64) -> String {
 /// The 7-character form of a git commit hash.
 pub fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
+}
+
+/// A CPU count without needless decimals: `2`, `1.5`, `0.25`.
+pub fn cpus(n: f64) -> String {
+    let s = format!("{n:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 pub fn percent(part: u64, whole: u64) -> f64 {

@@ -6,10 +6,11 @@ use leptos::task::spawn_local;
 
 use crate::api;
 use crate::components::{ErrorNote, Loading};
-use crate::util::{ago, polled, run, toasts};
+use crate::util::{ago, me, polled, run, toasts};
 
 #[component]
 pub fn Alerts() -> impl IntoView {
+    let me = me();
     let alerts = polled(Some(Duration::from_secs(10)), || async {
         api::get::<Vec<AlertView>>("/api/alerts").await
     });
@@ -46,7 +47,9 @@ pub fn Alerts() -> impl IntoView {
                     </ul>
                 </Show>
             </Show>
-            <DiscordSettings/>
+            <Show when=move || me.is_admin()>
+                <DiscordSettings/>
+            </Show>
         </div>
     }
 }

@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use facade_core::api::{
     AppMetric, AppView, BackupReport, BackupRequest, BackupView, CommitView, DeploymentStatus,
-    DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, UpdateCheck, VolumeView,
+    DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, SetOwner, UpdateCheck,
+    UserView, VolumeView,
 };
 use facade_core::proto::AppState;
 use facade_core::{Build, Source};
@@ -16,7 +17,7 @@ use super::domains::DomainTable;
 use super::spec_form::{SpecFields, SpecForm};
 use crate::api;
 use crate::components::{ErrorNote, Loading, Modal, Sparkline, StateBadge};
-use crate::util::{ago, bytes, clock, date, polled, run, short_hash, strip_ansi, toasts};
+use crate::util::{ago, bytes, clock, date, me, polled, run, short_hash, strip_ansi, toasts};
 
 const TABS: &[(&str, &str)] = &[
     ("overview", "Overview"),
@@ -29,6 +30,7 @@ const TABS: &[(&str, &str)] = &[
 
 #[component]
 pub fn AppPage() -> impl IntoView {
+    let me = me();
     let params = use_params_map();
     let query = use_query_map();
     let navigate = use_navigate();
@@ -133,6 +135,12 @@ pub fn AppPage() -> impl IntoView {
                     </h1>
                     <div class="muted small subtitle">
                         {move || view_of().map(|a| subtitle(&a))}
+                        {move || {
+                            view_of()
+                                .and_then(|a| a.owner)
+                                .filter(|_| me.is_admin())
+                                .map(|o| format!(" · owned by {o}"))
+                        }}
                     </div>
                 </div>
                 <div class="actions">
@@ -193,6 +201,7 @@ pub fn AppPage() -> impl IntoView {
                     "volumes" => view! { <VolumesTab name=name/> }.into_any(),
                     "settings" => view! {
                         <SettingsTab app=app.data.get_untracked().expect("loaded")
+                            live=Signal::derive(move || app.data.get())
                             on_saved=move || app.reload() on_delete=move || confirm_delete.set(true)/>
                     }.into_any(),
                     _ => view! {
@@ -1171,9 +1180,13 @@ fn VolumesTab(name: Memo<String>) -> impl IntoView {
 #[component]
 fn SettingsTab(
     app: AppView,
+    /// The app as it is now, for the access section (saved on its own).
+    #[prop(into)]
+    live: Signal<Option<AppView>>,
     on_saved: impl Fn() + Clone + Send + Sync + 'static,
     on_delete: impl Fn() + Clone + Send + Sync + 'static,
 ) -> impl IntoView {
+    let me = me();
     let nodes = polled(None, || async {
         api::get::<Vec<NodeView>>("/api/nodes").await
     });
@@ -1185,6 +1198,7 @@ fn SettingsTab(
     let had_volumes = !app.spec.volumes.is_empty();
     let move_data = RwSignal::new(false);
     let moving = move || had_volumes && form.node.with(|n| old_node.with_value(|o| n != o));
+    let on_access = on_saved.clone();
     let submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let spec = match form.to_spec() {
@@ -1229,12 +1243,146 @@ fn SettingsTab(
                 "Saving applies right away: the app restarts, and is rebuilt first if its source changed."
             </p>
         </form>
+        <Show when=move || me.is_admin()>
+            <AccessSection live=live on_change=on_access.clone()/>
+        </Show>
         <section class="card danger-zone">
             <div>
                 <h2 class="section-title">"Delete this app"</h2>
                 <p class="muted small">"Removes its container, image and variables. Its volumes are kept unless you choose otherwise."</p>
             </div>
             <button class="button button-danger" on:click=move |_| on_delete()>"Delete app…"</button>
+        </section>
+    }
+}
+
+/// Who owns the app and which members may manage it. Admins only.
+#[component]
+fn AccessSection(
+    #[prop(into)] live: Signal<Option<AppView>>,
+    on_change: impl Fn() + Clone + Send + Sync + 'static,
+) -> impl IntoView {
+    let users = polled(None, || async {
+        api::get::<Vec<UserView>>("/api/users").await
+    });
+    let members = move || {
+        users.data.with(|u| {
+            u.iter()
+                .flatten()
+                .filter(|u| u.role != "admin")
+                .map(|u| u.username.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    let name = move || live.with(|a| a.as_ref().map(|a| a.spec.name.clone()).unwrap_or_default());
+    let owner = move || live.with(|a| a.as_ref().and_then(|a| a.owner.clone()));
+    let access = move || live.with(|a| a.as_ref().map(|a| a.access.clone()).unwrap_or_default());
+    let set_owner = {
+        let on_change = on_change.clone();
+        move |value: String| {
+            let body = SetOwner {
+                owner: Some(value).filter(|v| !v.is_empty()),
+            };
+            let done = match &body.owner {
+                Some(o) => format!("Now owned by {o}"),
+                None => "Now owned by the admins".to_string(),
+            };
+            let path = format!("/api/apps/{}/owner", name());
+            run(
+                done,
+                async move { api::put_empty(&path, &body).await },
+                on_change.clone(),
+            );
+        }
+    };
+    let grantee = RwSignal::new(String::new());
+    let grant = {
+        let on_change = on_change.clone();
+        move |ev: leptos::ev::SubmitEvent| {
+            ev.prevent_default();
+            let user = grantee.get_untracked();
+            if user.is_empty() {
+                return;
+            }
+            let path = format!("/api/apps/{}/access/{user}", name());
+            let on_change = on_change.clone();
+            run(
+                format!("{user} can now manage it"),
+                async move { api::put_empty(&path, &()).await },
+                move || {
+                    grantee.set(String::new());
+                    on_change();
+                },
+            );
+        }
+    };
+    let revoke = Callback::new(move |user: String| {
+        let path = format!("/api/apps/{}/access/{user}", name());
+        run(
+            format!("{user} no longer has access"),
+            async move { api::delete(&path).await },
+            on_change.clone(),
+        );
+    });
+    // Members who could still be given access.
+    let candidates = move || {
+        let (owner, access) = (owner(), access());
+        members()
+            .into_iter()
+            .filter(|m| Some(m) != owner.as_ref() && !access.contains(m))
+            .collect::<Vec<_>>()
+    };
+
+    view! {
+        <section class="card form">
+            <h2 class="section-title">"Access"</h2>
+            <ErrorNote error=users.error/>
+            <label class="field">
+                <span>"Owner"</span>
+                <select on:change=move |ev| set_owner(event_target_value(&ev))
+                    prop:value=move || owner().unwrap_or_default()>
+                    <option value="" selected=move || owner().is_none()>"The admins"</option>
+                    <For each=members key=|m| m.clone() let:m>
+                        <option value=m.clone()
+                            selected={
+                                let name = m.clone();
+                                move || owner().as_deref() == Some(name.as_str())
+                            }>{m.clone()}</option>
+                    </For>
+                </select>
+                <small>"The owner's memory and CPU caps count this app, and its builds use the owner's registry and git logins."</small>
+            </label>
+            <div class="field">
+                <span>"Members with access"</span>
+                <Show when=move || !access().is_empty()
+                    fallback=|| view! { <p class="muted small">"Only the owner and the admins."</p> }>
+                    <ul class="access-list">
+                        <For each=access key=|u| u.clone() let:user>
+                            <li>
+                                {user.clone()}
+                                <button class="link-button danger" on:click={
+                                    let user = user.clone();
+                                    move |_| revoke.run(user.clone())
+                                }>"Remove"</button>
+                            </li>
+                        </For>
+                    </ul>
+                </Show>
+            </div>
+            <Show when=move || !candidates().is_empty()>
+                <form class="form-row" on:submit=grant.clone()>
+                    <select on:change=move |ev| grantee.set(event_target_value(&ev))
+                        prop:value=move || grantee.get()>
+                        <option value="">"Choose a member…"</option>
+                        <For each=candidates key=|m| m.clone() let:m>
+                            <option value=m.clone()>{m.clone()}</option>
+                        </For>
+                    </select>
+                    <button type="submit" class="button" disabled=move || grantee.with(String::is_empty)>
+                        "Give access"
+                    </button>
+                </form>
+            </Show>
         </section>
     }
 }
