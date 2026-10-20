@@ -1,0 +1,13 @@
+# `trunk serve` for UI work: hot reload on http://127.0.0.1:8080, API calls proxied to a
+# local `facaded server` (see README, "Working on the web UI").
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+
+[[proxy]]
+backend = "https://127.0.0.1:17701/api/"
+insecure = true

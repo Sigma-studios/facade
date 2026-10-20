@@ -27,6 +27,7 @@ instant-acme = { version = "0.8", default-features = false, features = ["ring", 
 parking_lot = "0.12"
 rand = "0.9"
 rcgen = "0.14"
+rust-embed = { version = "8", features = ["mime-guess"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
@@ -44,3 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 x509-parser = "0.18"
+
+[features]
+# A DNS provider backed by Pebble's challenge test server, for end-to-end ACME tests.
+pebble-test = []

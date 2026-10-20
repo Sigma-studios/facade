@@ -18,7 +18,7 @@ use bollard::query_parameters::{
     ListImagesOptions, LogsOptions, RemoveContainerOptions, RemoveImageOptions,
     RestartContainerOptions, StartContainerOptions, StatsOptions, StopContainerOptions,
 };
-use facade_core::proto::{AppState, AppStats, Workload};
+use facade_core::proto::{AppState, AppStats, JoinToken, Workload};
 use facade_core::{Build, Protocol, Source};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -27,6 +27,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::DeployLog;
 use super::build;
+use crate::lang;
 
 const LABEL_APP: &str = "facade.app";
 const LABEL_RUN: &str = "facade.run";
@@ -38,9 +39,9 @@ pub struct Runtime(Arc<Inner>);
 struct Inner {
     docker: Docker,
     dir: PathBuf,
-    /// Containers are labelled with their node, so several agents sharing one
+    /// Containers are labelled with `token.node`, so several agents sharing one
     /// Docker daemon never touch each other's apps.
-    node: String,
+    token: JoinToken,
 }
 
 fn container(app: &str) -> String {
@@ -81,7 +82,7 @@ fn is_not_modified(e: &bollard::errors::Error) -> bool {
 }
 
 impl Runtime {
-    pub async fn new(dir: PathBuf, node: String) -> anyhow::Result<Self> {
+    pub async fn new(dir: PathBuf, token: JoinToken) -> anyhow::Result<Self> {
         let docker = Docker::connect_with_local_defaults().context("connecting to Docker")?;
         docker
             .ping()
@@ -90,7 +91,7 @@ impl Runtime {
         for sub in ["static", "builds"] {
             std::fs::create_dir_all(dir.join(sub))?;
         }
-        Ok(Self(Arc::new(Inner { docker, dir, node })))
+        Ok(Self(Arc::new(Inner { docker, dir, token })))
     }
 
     fn docker(&self) -> &Docker {
@@ -161,15 +162,15 @@ impl Runtime {
         self.create(w, &image, &run_key).await?;
         self.start(&name).await?;
         log.line(format!("started {name} from {image}"));
-        if matches!(w.spec.source, Source::Git { .. }) {
+        if !matches!(w.spec.source, Source::Image { .. }) {
             self.prune_images(app, &image).await;
         }
         Ok(AppState::Running)
     }
 
-    /// The image to run: pulled for `Source::Image`, built for git sources. Git builds
-    /// are tagged with a hash of the source and revision, so they are reused until
-    /// either changes.
+    /// The image to run: pulled for `Source::Image`, built otherwise. Builds are
+    /// tagged with a hash of the source and revision, so they are reused until either
+    /// changes.
     async fn ensure_image(&self, w: &Workload, log: &DeployLog) -> anyhow::Result<String> {
         match &w.spec.source {
             Source::Image { image } => {
@@ -198,6 +199,44 @@ impl Runtime {
                 }
                 Ok(image.clone())
             }
+            Source::Executable {
+                sha256,
+                filename,
+                arch,
+                args,
+            } => {
+                let key = short_hash(&(&w.spec.source, w.revision));
+                let tag = format!("{}:{key}", image_repo(&w.spec.name));
+                if self.docker().inspect_image(&tag).await.is_ok() {
+                    return Ok(tag);
+                }
+                if arch != std::env::consts::ARCH {
+                    bail!(
+                        "{filename} is built for {arch} but this node is {}",
+                        std::env::consts::ARCH
+                    );
+                }
+                log.state(AppState::Building);
+                let workdir = self
+                    .0
+                    .dir
+                    .join("builds")
+                    .join(format!("{}-{key}", w.spec.name));
+                let _ = tokio::fs::remove_dir_all(&workdir).await;
+                tokio::fs::create_dir_all(&workdir).await?;
+                let result = async {
+                    log.line(format!("downloading {filename}"));
+                    super::fetch_artifact(&self.0.token, sha256, &workdir.join("app")).await?;
+                    let dockerfile = workdir.join("Dockerfile");
+                    tokio::fs::write(&dockerfile, lang::executable::dockerfile(filename, args))
+                        .await?;
+                    build::docker_build(&w.spec.name, &tag, &dockerfile, &workdir, log).await
+                }
+                .await;
+                let _ = tokio::fs::remove_dir_all(&workdir).await;
+                result?;
+                Ok(tag)
+            }
             Source::Git {
                 repo,
                 branch,
@@ -222,24 +261,14 @@ impl Runtime {
                             dockerfile,
                             context,
                         } => (workdir.join(dockerfile), workdir.join(context)),
-                        Build::Rust {
-                            package,
-                            bin,
-                            features,
-                            no_default_features,
-                        } => {
+                        Build::Static { .. } => unreachable!("static sites have no image"),
+                        generated => {
                             let path = workdir.join(".facade.Dockerfile");
-                            let contents = build::rust_dockerfile(
-                                &w.spec.name,
-                                package.as_deref(),
-                                bin,
-                                features,
-                                *no_default_features,
-                            );
+                            let contents = lang::generated_dockerfile(&w.spec.name, generated)
+                                .expect("every other build kind generates a Dockerfile");
                             tokio::fs::write(&path, contents).await?;
                             (path, workdir.clone())
                         }
-                        Build::Static { .. } => unreachable!("static sites have no image"),
                     };
                     build::docker_build(&w.spec.name, &tag, &dockerfile, &context, log).await
                 }
@@ -325,7 +354,7 @@ impl Runtime {
             labels: Some(HashMap::from([
                 (LABEL_APP.to_string(), app.clone()),
                 (LABEL_RUN.to_string(), run_key.to_string()),
-                (LABEL_NODE.to_string(), self.0.node.clone()),
+                (LABEL_NODE.to_string(), self.0.token.node.clone()),
             ])),
             host_config: Some(host_config),
             ..Default::default()
@@ -467,7 +496,7 @@ impl Runtime {
             "label".to_string(),
             vec![
                 LABEL_APP.to_string(),
-                format!("{LABEL_NODE}={}", self.0.node),
+                format!("{LABEL_NODE}={}", self.0.token.node),
             ],
         )]);
         let containers = self

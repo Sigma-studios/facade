@@ -32,6 +32,7 @@ impl NodeSampler {
             .map(|d| (d.total_space(), d.total_space() - d.available_space()))
             .unwrap_or((0, 0));
         NodeStats {
+            arch: std::env::consts::ARCH.to_string(),
             cpus: self.system.cpus().len(),
             cpu_percent: self.system.global_cpu_usage(),
             load1: System::load_average().one,

@@ -66,11 +66,30 @@ CREATE TABLE IF NOT EXISTS certs (
     not_before INTEGER NOT NULL,
     not_after INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dns_records (
+    domain TEXT PRIMARY KEY,
+    zone TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 "#;
+
+/// `ALTER TABLE … ADD COLUMN`, once.
+fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> anyhow::Result<()> {
+    let exists = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .flatten()
+        .any(|name| name == column);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+    }
+    Ok(())
+}
 
 pub struct UserRow {
     pub id: i64,
@@ -83,6 +102,8 @@ pub struct NodeRow {
     pub name: String,
     pub hostname: Option<String>,
     pub address: Option<String>,
+    /// Set by hand; otherwise `address` (or the server's own) is used.
+    pub public_ip: Option<String>,
     pub agent_version: Option<String>,
     pub last_seen: Option<u64>,
 }
@@ -129,6 +150,7 @@ impl Store {
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
         )?;
         conn.execute_batch(SCHEMA)?;
+        add_column(&conn, "nodes", "public_ip", "TEXT")?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -254,7 +276,7 @@ impl Store {
     pub fn list_nodes(&self) -> anyhow::Result<Vec<NodeRow>> {
         let conn = self.0.lock();
         let mut stmt = conn.prepare(
-            "SELECT name, hostname, address, agent_version, last_seen FROM nodes ORDER BY name",
+            "SELECT name, hostname, address, agent_version, last_seen, public_ip FROM nodes ORDER BY name",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -264,6 +286,7 @@ impl Store {
                     address: r.get(2)?,
                     agent_version: r.get(3)?,
                     last_seen: r.get(4)?,
+                    public_ip: r.get(5)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -289,6 +312,14 @@ impl Store {
         self.0.lock().execute(
             "UPDATE nodes SET last_seen = ?2 WHERE name = ?1",
             params![name, facade_core::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_node_ip(&self, name: &str, ip: Option<&str>) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE nodes SET public_ip = ?2 WHERE name = ?1",
+            params![name, ip],
         )?;
         Ok(())
     }
@@ -557,6 +588,33 @@ impl Store {
         self.0
             .lock()
             .execute("DELETE FROM kv WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    // ---- DNS records facade created
+
+    /// `(domain, zone, ip)` of every record facade manages.
+    pub fn dns_records(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare("SELECT domain, zone, ip FROM dns_records ORDER BY domain")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn put_dns_record(&self, domain: &str, zone: &str, ip: &str) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "INSERT OR REPLACE INTO dns_records (domain, zone, ip, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![domain, zone, ip, facade_core::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_dns_record(&self, domain: &str) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .execute("DELETE FROM dns_records WHERE domain = ?1", [domain])?;
         Ok(())
     }
 }

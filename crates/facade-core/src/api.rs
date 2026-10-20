@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::proto::{AppState, AppStats, NodeStats};
-use crate::spec::AppSpec;
+use crate::spec::{AppSpec, Build};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoginRequest {
@@ -36,7 +36,13 @@ pub struct NodeView {
     /// The server's own node.
     pub local: bool,
     pub hostname: Option<String>,
+    /// Where the agent last connected from.
     pub address: Option<String>,
+    /// The address domains of apps on this node point to.
+    pub public_ip: Option<String>,
+    /// `public_ip` was set by hand rather than detected.
+    #[serde(default)]
+    pub public_ip_manual: bool,
     pub agent_version: Option<String>,
     pub last_seen: Option<u64>,
     pub stats: Option<NodeStats>,
@@ -45,6 +51,12 @@ pub struct NodeView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateNode {
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetNodeIp {
+    /// `None` goes back to the detected address.
+    pub public_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,7 +102,7 @@ fn default_sensitive() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentStatus {
     Running,
@@ -127,6 +139,48 @@ pub struct ApplyReport {
     pub missing_secrets: Vec<String>,
     /// Nodes declared in the manifest that did not exist; start their agents with these.
     pub new_nodes: Vec<CreatedNode>,
+    /// Apps whose executable is not on this server yet: upload it again.
+    #[serde(default)]
+    pub missing_uploads: Vec<String>,
+}
+
+/// An uploaded executable, ready to be used as `Source::Executable`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactView {
+    pub sha256: String,
+    pub filename: String,
+    pub arch: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectRequest {
+    pub repo: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// What a repository scan found.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectReport {
+    /// Short hash and subject of the commit that was scanned.
+    pub commit: String,
+    /// Best first.
+    pub candidates: Vec<Candidate>,
+}
+
+/// One way to build and run something found in a repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Candidate {
+    /// Which detector found it: `rust`, `dockerfile`, `static`, …
+    pub detector: String,
+    pub title: String,
+    pub detail: String,
+    pub build: Build,
+    /// Port the code seems to listen on.
+    pub http_port: Option<u16>,
+    /// Environment variables the code reads.
+    pub env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +202,48 @@ pub struct AlertView {
     pub since: u64,
     /// `None` while still firing.
     pub resolved_at: Option<u64>,
+}
+
+/// The DNS provider facade manages records (and wildcard certificates) with.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DnsSettings {
+    /// `porkbun`, or `None` when records are created by hand.
+    pub provider: Option<String>,
+    /// Domains the provider lets facade manage.
+    pub zones: Vec<String>,
+    /// Why the provider could not be reached, if it could not.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DnsUpdate {
+    /// `porkbun`, or empty to stop managing DNS.
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub secret_key: String,
+}
+
+/// Everything facade knows about one routed host name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainStatus {
+    pub domain: String,
+    /// `None` for the server's own API domain.
+    pub app: Option<String>,
+    pub node: String,
+    /// The address the name must point to.
+    pub expected_ip: Option<String>,
+    /// What the name resolves to right now.
+    pub resolved: Vec<String>,
+    /// The record is kept in sync by the DNS provider.
+    pub managed: bool,
+    pub dns_ok: bool,
+    pub dns_error: Option<String>,
+    /// Name of the certificate covering it (`*.example.com` or the domain itself).
+    pub certificate: Option<String>,
+    pub cert_expires: Option<u64>,
+    pub cert_error: Option<String>,
 }
 
 /// Where alerts go. Read with the webhook partly hidden.

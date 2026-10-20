@@ -90,12 +90,6 @@ impl Hub {
         result
     }
 
-    pub async fn open_tunnel(&self, node: &str, app: &str) -> anyhow::Result<DataStream> {
-        let app = app.to_string();
-        self.dial_back(node, |tunnel| AgentRequest::OpenTunnel { tunnel, app })
-            .await
-    }
-
     pub async fn open_logs(
         &self,
         node: &str,
@@ -149,7 +143,9 @@ async fn accept(
     let hello: Hello = serde_json::from_str(&line).context("malformed hello")?;
 
     let (node, secret) = match &hello {
-        Hello::Control { node, secret, .. } | Hello::Data { node, secret, .. } => (node, secret),
+        Hello::Control { node, secret, .. }
+        | Hello::Data { node, secret, .. }
+        | Hello::Fetch { node, secret, .. } => (node, secret),
     };
     let authorized = server
         .store
@@ -168,6 +164,7 @@ async fn accept(
     }
 
     match hello {
+        Hello::Fetch { node, sha256, .. } => send_artifact(&server, &node, &sha256, stream).await,
         Hello::Data { tunnel, .. } => {
             if let Some(waiter) = server.hub.tunnels.lock().remove(&tunnel) {
                 let _ = waiter.send(stream);
@@ -258,6 +255,11 @@ async fn control(
             if let Err(e) = result {
                 warn!(%node, "sync failed: {e:#}");
             }
+            if let Err(e) = super::acme::push_ingress(&server, &node).await {
+                warn!(%node, "sending certificates failed: {e:#}");
+            }
+            // Its address may have changed: DNS records follow.
+            server.domains_wake.notify_one();
         });
     }
 
@@ -312,6 +314,34 @@ async fn control(
         Err(e) => warn!(%node, "node disconnected: {e:#}"),
     }
     result
+}
+
+/// Streams an uploaded executable to an agent that runs an app using it.
+async fn send_artifact(
+    server: &Server,
+    node: &str,
+    sha256: &str,
+    mut stream: DataStream,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let allowed = super::artifacts::used_by_node(server, node)?
+        .iter()
+        .any(|s| s == sha256);
+    let file = match super::artifacts::path(server, sha256) {
+        Some(path) if allowed => tokio::fs::File::open(path).await.ok(),
+        _ => None,
+    };
+    let Some(mut file) = file else {
+        stream
+            .write_all(b"error the executable is not on the server (upload it again)\n")
+            .await?;
+        return Ok(());
+    };
+    let size = file.metadata().await?.len();
+    stream.write_all(format!("ok {size}\n").as_bytes()).await?;
+    tokio::io::copy(&mut file, &mut stream).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 fn on_event(server: &Server, node: &str, event: AgentEvent) {

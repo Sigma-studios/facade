@@ -49,6 +49,9 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/nodes/{name}", axum::routing::delete(delete_node))
         .route("/api/nodes/{name}/token", post(rotate_node_token))
         .route("/api/nodes/{name}/metrics", get(node_metrics))
+        .route("/api/nodes/{name}/ip", put(set_node_ip))
+        .route("/api/dns", get(dns_settings).put(update_dns))
+        .route("/api/domains", get(domains))
         .route("/api/apps", get(list_apps).post(create_app))
         .route(
             "/api/apps/{name}",
@@ -65,7 +68,15 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/deployments/{id}", get(get_deployment))
         .route("/api/export", get(export))
         .route("/api/apply", post(apply))
+        .route(
+            "/api/artifacts",
+            post(super::artifacts::upload).layer(axum::extract::DefaultBodyLimit::max(
+                super::artifacts::MAX_UPLOAD,
+            )),
+        )
+        .route("/api/inspect", post(super::inspect::inspect))
         .route("/api/health", get(|| async { "ok" }))
+        .fallback(super::ui::serve)
         .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(server)
 }
@@ -96,6 +107,17 @@ pub async fn serve_direct(server: Arc<Server>) -> anyhow::Result<()> {
                     .await;
         });
     }
+}
+
+/// The API in plain HTTP on loopback, for this machine's entry point to forward
+/// `api_domain` to.
+pub async fn serve_loopback(server: Arc<Server>) -> anyhow::Result<()> {
+    let addr = server.cfg.api_loopback;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    axum::serve(listener, router(server)).await?;
+    Ok(())
 }
 
 /// Creates the first admin with a random password, printed once and saved next to
@@ -142,6 +164,12 @@ pub struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(ErrorBody { error: self.1 })).into_response()
+    }
+}
+
+impl ApiError {
+    pub fn bad_request(msg: impl ToString) -> Self {
+        ApiError(StatusCode::BAD_REQUEST, msg.to_string())
     }
 }
 
@@ -258,6 +286,8 @@ fn node_views(server: &Server) -> anyhow::Result<Vec<NodeView>> {
         .map(|n| {
             let conn = server.hub.connection(&n.name);
             NodeView {
+                public_ip_manual: n.public_ip.is_some(),
+                public_ip: server.node_ip(&n.name),
                 connected: conn.is_some(),
                 local: n.name == server.cfg.local_node,
                 hostname: n.hostname,
@@ -413,6 +443,48 @@ async fn delete_node(State(server): S, _: User, Path(name): Path<String>) -> Api
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn set_node_ip(
+    State(server): S,
+    _: User,
+    Path(name): Path<String>,
+    Json(req): Json<SetNodeIp>,
+) -> ApiResult<StatusCode> {
+    if !server.store.node_exists(&name)? {
+        return Err(not_found(format!("no node named {name}")));
+    }
+    let ip = req
+        .public_ip
+        .map(|ip| ip.trim().to_string())
+        .filter(|ip| !ip.is_empty());
+    if let Some(ip) = &ip
+        && ip.parse::<std::net::IpAddr>().is_err()
+    {
+        return Err(bad_request(format!("`{ip}` is not an IP address")));
+    }
+    server.store.set_node_ip(&name, ip.as_deref())?;
+    server.domains_wake.notify_one();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn dns_settings(State(server): S, _: User) -> Json<DnsSettings> {
+    Json(server.dns.settings())
+}
+
+async fn update_dns(
+    State(server): S,
+    _: User,
+    Json(update): Json<DnsUpdate>,
+) -> ApiResult<Json<DnsSettings>> {
+    super::dns::update(&server, update)
+        .await
+        .map(Json)
+        .map_err(bad_request)
+}
+
+async fn domains(State(server): S, _: User) -> Json<Vec<DomainStatus>> {
+    Json(super::dns::statuses(&server).await)
+}
+
 async fn node_metrics(
     State(server): S,
     _: User,
@@ -439,6 +511,35 @@ fn load_app(server: &Server, name: &str) -> ApiResult<super::store::AppRow> {
 /// Checks that apply to a spec in the context of the whole installation.
 fn check_spec(server: &Server, spec: &AppSpec) -> ApiResult<()> {
     spec.validate().map_err(bad_request)?;
+    if let facade_core::Source::Executable {
+        sha256,
+        arch,
+        filename,
+        ..
+    } = &spec.source
+    {
+        if !super::artifacts::exists(server, sha256) {
+            return Err(bad_request(
+                "the executable was not uploaded to this server",
+            ));
+        }
+        let node_arch = server
+            .live
+            .read()
+            .nodes
+            .get(&spec.node)
+            .and_then(|n| n.stats.as_ref())
+            .map(|s| s.arch.clone())
+            .filter(|a| !a.is_empty());
+        if let Some(node_arch) = node_arch
+            && node_arch != *arch
+        {
+            return Err(bad_request(format!(
+                "{filename} is built for {arch}, but node {} is {node_arch}",
+                spec.node
+            )));
+        }
+    }
     if !server.store.node_exists(&spec.node)? {
         return Err(bad_request(format!("no node named {}", spec.node)));
     }
@@ -774,6 +875,7 @@ async fn apply(State(server): S, _: User, body: String) -> ApiResult<Json<ApplyR
         unchanged: vec![],
         missing_secrets: vec![],
         new_nodes: vec![],
+        missing_uploads: vec![],
     };
 
     for node in &manifest.nodes {
@@ -816,6 +918,13 @@ async fn apply(State(server): S, _: User, body: String) -> ApiResult<Json<ApplyR
 
     for app in manifest.apps {
         let name = app.spec.name.clone();
+        if let facade_core::Source::Executable {
+            sha256, filename, ..
+        } = &app.spec.source
+            && !super::artifacts::exists(&server, sha256)
+        {
+            report.missing_uploads.push(format!("{name}: {filename}"));
+        }
         let existing = server.store.get_app(&name)?;
         let current_env = server.store.list_env(&name)?;
         let mut changed = existing.as_ref().is_none_or(|e| e.spec != app.spec);

@@ -68,43 +68,6 @@ pub async fn docker_build(
     run_logged(cmd, log).await.context("docker build failed")
 }
 
-/// Multi-stage build of one cargo binary, with the registry and target directory in
-/// BuildKit cache mounts so redeploys only rebuild what changed.
-pub fn rust_dockerfile(
-    app: &str,
-    package: Option<&str>,
-    bin: &str,
-    features: &[String],
-    no_default_features: bool,
-) -> String {
-    let mut args = String::new();
-    if let Some(package) = package {
-        args += &format!(" -p {package}");
-    }
-    args += &format!(" --bin {bin}");
-    if no_default_features {
-        args += " --no-default-features";
-    }
-    if !features.is_empty() {
-        args += &format!(" --features {}", features.join(","));
-    }
-    format!(
-        r#"FROM rust:1-slim-bookworm AS build
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=facade-cargo-registry \
-    --mount=type=cache,target=/src/target,id=facade-{app}-target \
-    cargo build --release{args} && cp target/release/{bin} /facade-app
-
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
-COPY --from=build /facade-app /usr/local/bin/{bin}
-CMD ["/usr/local/bin/{bin}"]
-"#
-    )
-}
-
 /// Runs `cmd`, forwarding stdout and stderr line by line to the deploy log.
 async fn run_logged(mut cmd: Command, log: &DeployLog) -> anyhow::Result<()> {
     let mut child = cmd

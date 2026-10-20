@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Builds static (musl) Linux binaries in Docker, so they run on any distribution.
+# Needs trunk and the wasm32-unknown-unknown target locally for the web UI.
 #
 #   deploy/build-linux.sh [amd64|arm64]     default amd64
 #
@@ -10,6 +11,9 @@ arch=${1:-amd64}
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/dist/$arch
 mkdir -p "$out"
+
+# The web UI is WebAssembly, so it is built once here and embedded into facaded.
+(cd "$root/crates/facade-ui" && trunk build --release)
 
 docker run --rm --platform "linux/$arch" \
     -v "$root":/src -w /src \

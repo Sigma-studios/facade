@@ -32,6 +32,13 @@ pub enum Hello {
         secret: String,
         tunnel: Uuid,
     },
+    /// Download an uploaded executable. The server answers `ok <size>\n` then the
+    /// bytes, or `error <message>\n`.
+    Fetch {
+        node: String,
+        secret: String,
+        sha256: String,
+    },
 }
 
 /// Everything an agent needs to run one app.
@@ -79,10 +86,16 @@ pub enum AgentRequest {
     Restart {
         app: String,
     },
-    /// Dial a data connection for `tunnel` and pipe it to the app's HTTP port.
-    OpenTunnel {
-        tunnel: Uuid,
-        app: String,
+    /// Certificates and extra routes for the node's HTTP(S) entry point. Replaces
+    /// whatever was sent before.
+    Ingress {
+        certs: Vec<CertBundle>,
+        proxies: Vec<ProxyRoute>,
+    },
+    /// Answer (or stop answering) an ACME HTTP-01 challenge on port 80.
+    Challenge {
+        token: String,
+        key_authorization: Option<String>,
     },
     /// Dial a data connection for `tunnel` and write the app's logs to it.
     Logs {
@@ -126,7 +139,7 @@ pub enum AgentEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppState {
     Pending,
@@ -163,6 +176,9 @@ pub struct NodeReport {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeStats {
+    /// `x86_64` or `aarch64`.
+    #[serde(default)]
+    pub arch: String,
     pub cpus: usize,
     pub cpu_percent: f32,
     pub load1: f64,
@@ -183,6 +199,21 @@ pub struct AppStats {
     pub net_rx: u64,
     pub net_tx: u64,
     pub restarts: u64,
+}
+
+/// A certificate and its key, for the names it covers (`*.example.com` included).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CertBundle {
+    pub names: Vec<String>,
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+/// A host name the node forwards to a local plain-HTTP port (the server's API).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProxyRoute {
+    pub domain: String,
+    pub port: u16,
 }
 
 /// What `facaded agent --join` takes: where the server is, how to recognise it, and

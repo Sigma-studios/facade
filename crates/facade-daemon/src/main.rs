@@ -1,12 +1,14 @@
 //! `facaded`: the facade daemon.
 //!
-//! * `facaded server` — control plane: API, ingress (HTTP/HTTPS + ACME), node hub,
+//! * `facaded server` — control plane: API, node hub, certificates and DNS,
 //!   monitoring. Also runs an agent for its own machine.
-//! * `facaded agent --join <token>` — runs apps on a node, dialing the server.
+//! * `facaded agent --join <token>` — runs and serves apps on a node, dialing the
+//!   server.
 
 mod agent;
 mod config;
 mod framing;
+mod lang;
 mod server;
 mod tls;
 
@@ -45,6 +47,11 @@ enum Command {
             default_value = "/var/lib/facade-agent"
         )]
         data_dir: PathBuf,
+        /// Where apps are served over HTTP (also used for certificate challenges).
+        #[arg(long, env = "FACADE_HTTP_LISTEN", default_value = "0.0.0.0:80")]
+        http_listen: std::net::SocketAddr,
+        #[arg(long, env = "FACADE_HTTPS_LISTEN", default_value = "0.0.0.0:443")]
+        https_listen: std::net::SocketAddr,
     },
 }
 
@@ -64,6 +71,17 @@ async fn main() -> anyhow::Result<()> {
             let config = config::ServerConfig::load(&config)?;
             server::run(config).await
         }
-        Command::Agent { join, data_dir } => agent::run_standalone(join, data_dir).await,
+        Command::Agent {
+            join,
+            data_dir,
+            http_listen,
+            https_listen,
+        } => {
+            let ingress = agent::IngressOptions {
+                http: Some(http_listen),
+                https: Some(https_listen),
+            };
+            agent::run_standalone(join, data_dir, ingress).await
+        }
     }
 }

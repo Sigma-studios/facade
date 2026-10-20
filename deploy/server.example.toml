@@ -10,7 +10,7 @@ public_host = "203.0.113.10"
 # https_listen = "0.0.0.0:443"
 # local_node = "main"             # name of this machine as a node
 
-# Also serve the API at this domain, through the ingress, with a real certificate.
+# Also serve the API and web UI at this domain (from this machine, with a real certificate).
 # api_domain = "facade.example.com"
 
 [acme]

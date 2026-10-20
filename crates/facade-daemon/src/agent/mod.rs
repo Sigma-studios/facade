@@ -2,6 +2,7 @@
 //! desired workloads, and dials data connections on request.
 
 mod build;
+mod ingress;
 mod runtime;
 mod stats;
 
@@ -22,6 +23,7 @@ use uuid::Uuid;
 
 use crate::framing::{JsonLines, write_json};
 use crate::tls;
+pub use ingress::IngressOptions;
 use runtime::Runtime;
 
 const REPORT_EVERY: Duration = Duration::from_secs(15);
@@ -32,7 +34,11 @@ const HEAL_EVERY: Duration = Duration::from_secs(120);
 const READ_TIMEOUT: Duration = Duration::from_secs(70);
 
 /// `facaded agent`: join with a token once, then reuse the saved one.
-pub async fn run_standalone(join: Option<String>, data_dir: PathBuf) -> anyhow::Result<()> {
+pub async fn run_standalone(
+    join: Option<String>,
+    data_dir: PathBuf,
+    ingress: IngressOptions,
+) -> anyhow::Result<()> {
     tls::create_private_dir(&data_dir)?;
     let saved = data_dir.join("join-token");
     let token = match join {
@@ -52,7 +58,7 @@ pub async fn run_standalone(join: Option<String>, data_dir: PathBuf) -> anyhow::
         }
     };
     info!(node = %token.node, server = %token.server, "agent starting");
-    Agent::new(token, data_dir).await?.run().await;
+    Agent::new(token, data_dir, ingress).await?.run().await;
     Ok(())
 }
 
@@ -68,11 +74,19 @@ pub struct Agent {
     /// Workloads whose last convergence failed, by hash. Periodic healing skips
     /// them so a broken build is not retried every two minutes.
     failed: Mutex<HashMap<String, String>>,
+    certs: Arc<ingress::Certs>,
+    routing: ingress::Routing,
+    ingress: IngressOptions,
 }
 
 impl Agent {
-    pub async fn new(token: JoinToken, data_dir: PathBuf) -> anyhow::Result<Arc<Self>> {
-        let runtime = Runtime::new(data_dir, token.node.clone()).await?;
+    pub async fn new(
+        token: JoinToken,
+        data_dir: PathBuf,
+        ingress: IngressOptions,
+    ) -> anyhow::Result<Arc<Self>> {
+        let certs = Arc::new(ingress::Certs::load(&data_dir)?);
+        let runtime = Runtime::new(data_dir, token.clone()).await?;
         Ok(Arc::new(Self {
             token,
             runtime,
@@ -80,10 +94,15 @@ impl Agent {
             locks: Default::default(),
             outbox: Default::default(),
             failed: Default::default(),
+            certs,
+            routing: Default::default(),
+            ingress,
         }))
     }
 
     pub async fn run(self: Arc<Self>) {
+        // Apps stay reachable while the server is away.
+        ingress::run(self.clone(), self.ingress).await;
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = std::time::Instant::now();
@@ -198,14 +217,19 @@ impl Agent {
                 self.runtime.remove(&app).await?;
             }
             AgentRequest::Restart { app } => self.runtime.restart(&app).await?,
-            AgentRequest::OpenTunnel { tunnel, app } => {
-                let workload = self
-                    .workloads
-                    .lock()
-                    .get(&app)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("app {app} is not on this node"))?;
-                self.open_tunnel(tunnel, workload).await?;
+            AgentRequest::Ingress { certs, proxies } => {
+                self.certs.replace(&certs);
+                *self.routing.proxies.write() = proxies;
+            }
+            AgentRequest::Challenge {
+                token,
+                key_authorization,
+            } => {
+                let mut challenges = self.routing.challenges.write();
+                match key_authorization {
+                    Some(key) => challenges.insert(token, key),
+                    None => challenges.remove(&token),
+                };
             }
             AgentRequest::Logs {
                 tunnel,
@@ -336,50 +360,51 @@ impl Agent {
         .await?;
         Ok(stream)
     }
-
-    async fn open_tunnel(&self, tunnel: Uuid, workload: Workload) -> anyhow::Result<()> {
-        if !workload.spec.enabled {
-            bail!("app {} is stopped", workload.spec.name);
-        }
-        if workload.spec.is_static() {
-            let root = self.runtime.static_root(&workload)?;
-            let stream = self.dial_data(tunnel).await?;
-            tokio::spawn(serve_static(stream, root));
-            return Ok(());
-        }
-        let target = self.runtime.http_target(&workload).await?;
-        let mut upstream = tokio::net::TcpStream::connect(target)
-            .await
-            .with_context(|| format!("connecting to {} on {target}", workload.spec.name))?;
-        upstream.set_nodelay(true)?;
-        let mut stream = self.dial_data(tunnel).await?;
-        tokio::spawn(async move {
-            let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
-        });
-        Ok(())
-    }
 }
 
-async fn serve_static(stream: tls::ClientStream, root: PathBuf) {
-    use tower_http::services::{ServeDir, ServeFile};
-    use tower_http::set_status::SetStatus;
-    let not_found = SetStatus::new(
-        ServeFile::new(root.join("404.html")),
-        hyper::StatusCode::NOT_FOUND,
-    );
-    let service = ServeDir::new(&root)
-        .append_index_html_on_directories(true)
-        .precompressed_gzip()
-        .precompressed_br()
-        .not_found_service(not_found);
-    let service = hyper_util::service::TowerToHyperService::new(service);
-    let io = hyper_util::rt::TokioIo::new(stream);
-    if let Err(e) = hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, service)
-        .await
-    {
-        tracing::debug!("static connection: {e}");
+/// Downloads an uploaded executable from the server and checks its hash.
+pub async fn fetch_artifact(
+    token: &JoinToken,
+    sha256: &str,
+    dest: &std::path::Path,
+) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tls::connect_pinned(&token.server, &token.fingerprint).await?;
+    write_json(
+        &mut stream,
+        &Hello::Fetch {
+            node: token.node.clone(),
+            secret: token.secret.clone(),
+            sha256: sha256.to_string(),
+        },
+    )
+    .await?;
+    let status = crate::framing::read_line_unbuffered(&mut stream).await?;
+    let size: u64 = match status.split_once(' ') {
+        Some(("ok", size)) => size.parse()?,
+        Some(("error", message)) => bail!("{message}"),
+        _ => bail!("unexpected answer from server: {status}"),
+    };
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut hasher = Sha256::new();
+    let mut remaining = size;
+    let mut buf = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            bail!("download interrupted");
+        }
+        let n = n.min(remaining as usize);
+        hasher.update(&buf[..n]);
+        file.write_all(&buf[..n]).await?;
+        remaining -= n as u64;
     }
+    file.flush().await?;
+    if hex::encode(hasher.finalize()) != sha256 {
+        bail!("downloaded file does not match its checksum");
+    }
+    Ok(())
 }
 
 /// Build/deploy output, forwarded to the server when it belongs to a deployment.

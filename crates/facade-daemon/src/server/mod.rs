@@ -2,11 +2,14 @@
 
 mod acme;
 mod api;
+mod artifacts;
+mod dns;
 mod hub;
-mod ingress;
+mod inspect;
 mod monitor;
 mod secrets;
 mod store;
+mod ui;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -37,10 +40,13 @@ pub struct Server {
     pub hub: Hub,
     pub live: RwLock<Live>,
     pub routes: RwLock<Routes>,
-    pub certs: Arc<ingress::CertStore>,
-    /// ACME HTTP-01 tokens → key authorizations.
-    pub challenges: RwLock<HashMap<String, String>>,
-    pub acme_wake: Notify,
+    pub dns: dns::Dns,
+    /// Last DNS (`dns:<domain>`) and certificate (`cert:<name>`) failures.
+    pub domain_errors: RwLock<HashMap<String, String>>,
+    /// `public_host`, resolved at start.
+    pub public_host_ip: Option<String>,
+    /// Re-checks DNS records and certificates.
+    pub domains_wake: Notify,
     pub alerts: parking_lot::Mutex<monitor::Alerts>,
     pub notifier: monitor::Notifier,
 }
@@ -164,7 +170,7 @@ impl Server {
             }
         }
         *self.routes.write() = routes;
-        self.acme_wake.notify_one();
+        self.domains_wake.notify_one();
         Ok(())
     }
 
@@ -231,6 +237,14 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         .or_else(sysinfo::System::host_name)
         .unwrap_or_else(|| cfg.local_node.clone());
     let notifier = monitor::Notifier::new(origin)?;
+    let public_host_ip = match &cfg.public_host {
+        Some(host) => tokio::net::lookup_host((host.as_str(), 0))
+            .await
+            .ok()
+            .and_then(|mut a| a.find(|a| a.is_ipv4()).or_else(|| a.next()))
+            .map(|a| a.ip().to_string()),
+        None => None,
+    };
     let server = Arc::new(Server {
         store,
         secrets,
@@ -238,15 +252,17 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         hub: Hub::default(),
         live: Default::default(),
         routes: Default::default(),
-        certs: Default::default(),
-        challenges: Default::default(),
-        acme_wake: Notify::new(),
+        dns: Default::default(),
+        domain_errors: Default::default(),
+        public_host_ip,
+        domains_wake: Notify::new(),
         alerts: Default::default(),
         notifier,
         cfg,
     });
-    server.certs.set_fallback(server.identity.key.clone());
-    server.load_certs();
+    if let Err(e) = dns::load(&server).await {
+        warn!("DNS provider: {e:#}");
+    }
     server.notifier.load(&server.store, &server.secrets)?;
     server.refresh_routes()?;
     api::ensure_admin(&server)?;
@@ -275,14 +291,21 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(hub::listen(server.clone()));
     tasks.spawn(api::serve_direct(server.clone()));
-    tasks.spawn(ingress::run(server.clone()));
+    if server.cfg.api_domain.is_some() {
+        tasks.spawn(api::serve_loopback(server.clone()));
+    }
     tasks.spawn(acme::run(server.clone()));
     tasks.spawn(monitor::run(server.clone()));
+    tasks.spawn(artifacts::collect_garbage(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
+    let ingress = crate::agent::IngressOptions {
+        http: Some(server.cfg.http_listen),
+        https: Some(server.cfg.https_listen),
+    };
     tokio::spawn(async move {
         loop {
-            match crate::agent::Agent::new(local_token.clone(), agent_dir.clone()).await {
+            match crate::agent::Agent::new(local_token.clone(), agent_dir.clone(), ingress).await {
                 Ok(agent) => return agent.run().await,
                 Err(e) => {
                     error!("local agent cannot start, retrying in 30s: {e:#}");

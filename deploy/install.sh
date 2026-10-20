@@ -64,5 +64,6 @@ else
     install -m 0644 "$here/facaded-agent.service" /etc/systemd/system/facaded-agent.service
     systemctl daemon-reload
     systemctl enable --now facaded-agent
+    open_ports 80/tcp 443/tcp
     echo "facade agent running; check with: journalctl -u facaded-agent -f"
 fi

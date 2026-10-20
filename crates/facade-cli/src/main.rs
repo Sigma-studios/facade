@@ -65,6 +65,11 @@ enum Command {
     Env(EnvCommand),
     #[command(subcommand)]
     Domain(DomainCommand),
+    /// Every routed domain: where it must point, whether it does, and its certificate.
+    Domains,
+    /// Show or set the DNS provider facade manages records with.
+    #[command(subcommand)]
+    Dns(DnsCommand),
     /// Build (if needed) and (re)start an app, following the output.
     Deploy {
         app: String,
@@ -97,6 +102,12 @@ enum Command {
         /// Show this deployment's full log.
         #[arg(long)]
         id: Option<String>,
+    },
+    /// List what could be deployed from a git repository.
+    Scan {
+        repo: String,
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// CPU / memory history of an app (last hour).
     Metrics {
@@ -145,6 +156,8 @@ enum NodeCommand {
     Remove { name: String },
     /// CPU / memory / disk history (last hour).
     Metrics { name: String },
+    /// Set the public IP domains of this node's apps point to (`auto` to detect it).
+    Ip { name: String, ip: String },
 }
 
 #[derive(Subcommand)]
@@ -180,9 +193,16 @@ struct SpecArgs {
     #[arg(long)]
     node: Option<String>,
     /// Run a registry image.
-    #[arg(long, conflicts_with = "git")]
+    #[arg(long, conflicts_with_all = ["git", "executable"])]
     image: Option<String>,
-    /// Build from a git repository.
+    /// Upload and run a Linux executable (built for the node's CPU).
+    #[arg(long, conflicts_with = "git")]
+    executable: Option<PathBuf>,
+    /// Argument passed to the executable (repeatable).
+    #[arg(long = "arg", allow_hyphen_values = true)]
+    args: Vec<String>,
+    /// Build from a git repository. Without --dockerfile, --rust-bin or --static, the
+    /// repository is scanned and the best match is used (see `facade scan`).
     #[arg(long)]
     git: Option<String>,
     #[arg(long)]
@@ -227,10 +247,39 @@ struct SpecArgs {
 }
 
 impl SpecArgs {
-    fn source(&self, current: Option<&Source>) -> anyhow::Result<Option<Source>> {
+    /// The source these flags describe, given the current one and an executable
+    /// uploaded for `--executable`.
+    fn source(
+        &self,
+        current: Option<&Source>,
+        uploaded: Option<&ArtifactView>,
+    ) -> anyhow::Result<Option<Source>> {
         if let Some(image) = &self.image {
             return Ok(Some(Source::Image {
                 image: image.clone(),
+            }));
+        }
+        if let Some(artifact) = uploaded {
+            return Ok(Some(Source::Executable {
+                sha256: artifact.sha256.clone(),
+                filename: artifact.filename.clone(),
+                arch: artifact.arch.clone(),
+                args: self.args.clone(),
+            }));
+        }
+        if let Some(Source::Executable {
+            sha256,
+            filename,
+            arch,
+            ..
+        }) = current
+            && !self.args.is_empty()
+        {
+            return Ok(Some(Source::Executable {
+                sha256: sha256.clone(),
+                filename: filename.clone(),
+                arch: arch.clone(),
+                args: self.args.clone(),
             }));
         }
         let touches_git = self.git.is_some()
@@ -286,11 +335,19 @@ impl SpecArgs {
         }))
     }
 
-    fn apply(&self, spec: &mut AppSpec) -> anyhow::Result<()> {
+    /// Whether the build was left for the repository scan to choose.
+    fn build_unspecified(&self) -> bool {
+        self.dockerfile.is_none()
+            && self.context.is_none()
+            && self.rust_bin.is_none()
+            && self.static_dir.is_none()
+    }
+
+    fn apply(&self, spec: &mut AppSpec, uploaded: Option<&ArtifactView>) -> anyhow::Result<()> {
         if let Some(node) = &self.node {
             spec.node = node.clone();
         }
-        if let Some(source) = self.source(Some(&spec.source))? {
+        if let Some(source) = self.source(Some(&spec.source), uploaded)? {
             spec.source = source;
         }
         if let Some(port) = self.port {
@@ -339,6 +396,22 @@ enum EnvCommand {
         #[arg(required = true)]
         keys: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum DnsCommand {
+    /// Current provider and the domains it manages.
+    Show,
+    /// Manage DNS through Porkbun (keys from porkbun.com/account/api; turn on API
+    /// access in each domain's settings).
+    Porkbun {
+        #[arg(long, env = "PORKBUN_API_KEY")]
+        api_key: String,
+        #[arg(long, env = "PORKBUN_SECRET_KEY")]
+        secret_key: String,
+    },
+    /// Stop managing DNS; records are then created by hand.
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -595,7 +668,7 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
             }
             if add {
                 eprintln!(
-                    "{domain} → {name}. Point its DNS at the node running the server; HTTPS is set up automatically once it resolves."
+                    "{domain} → {name}. Check its DNS and certificate with `facade domains`."
                 );
             } else {
                 eprintln!("{domain} removed from {name}");
@@ -680,6 +753,99 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                     ]
                 }),
             );
+        }
+        Command::Domains => {
+            let domains: Vec<DomainStatus> = api.get("/api/domains").await?;
+            if json {
+                return print_json(&domains);
+            }
+            if domains.is_empty() {
+                println!("no domains; add one with `facade domain add <app> <domain>`");
+            }
+            table(
+                &["DOMAIN", "APP", "NODE", "DNS", "CERTIFICATE"],
+                domains.iter().map(|d| {
+                    let ip = d.expected_ip.clone().unwrap_or_else(|| "?".into());
+                    let dns = if let Some(e) = &d.dns_error {
+                        format!("error: {e}")
+                    } else if d.dns_ok {
+                        format!("ok ({ip})")
+                    } else if d.managed {
+                        format!("managed, propagating ({ip})")
+                    } else {
+                        format!("create an A record → {ip}")
+                    };
+                    let cert = match (&d.certificate, &d.cert_error) {
+                        (_, Some(e)) => format!("error: {e}"),
+                        (Some(name), None) => format!(
+                            "{name}, valid until {}",
+                            output::date(d.cert_expires.unwrap_or(0))
+                        ),
+                        (None, None) => "pending".into(),
+                    };
+                    vec![
+                        d.domain.clone(),
+                        d.app.clone().unwrap_or_else(|| "(facade)".into()),
+                        d.node.clone(),
+                        dns,
+                        cert,
+                    ]
+                }),
+            );
+        }
+        Command::Dns(cmd) => {
+            let settings: DnsSettings = match cmd {
+                DnsCommand::Show => api.get("/api/dns").await?,
+                DnsCommand::Porkbun {
+                    api_key,
+                    secret_key,
+                } => {
+                    api.json(api.request(Method::PUT, "/api/dns").json(&DnsUpdate {
+                        provider: "porkbun".into(),
+                        api_key,
+                        secret_key,
+                    }))
+                    .await?
+                }
+                DnsCommand::Off => {
+                    api.json(
+                        api.request(Method::PUT, "/api/dns")
+                            .json(&DnsUpdate::default()),
+                    )
+                    .await?
+                }
+            };
+            if json {
+                return print_json(&settings);
+            }
+            match &settings.provider {
+                Some(p) => println!("provider: {p}"),
+                None => {
+                    println!("provider: none (create DNS records by hand; see `facade domains`)")
+                }
+            }
+            if !settings.zones.is_empty() {
+                println!("domains:  {}", settings.zones.join(", "));
+            }
+            if let Some(e) = &settings.error {
+                println!("error:    {e}");
+            }
+        }
+        Command::Scan { repo, branch } => {
+            let report = scan(api, &repo, branch.as_deref()).await?;
+            if json {
+                return print_json(&report);
+            }
+            println!("commit {}", report.commit);
+            if report.candidates.is_empty() {
+                println!("nothing deployable found");
+            }
+            for (i, c) in report.candidates.iter().enumerate() {
+                println!("{}. {}\n   {}", i + 1, c.title, c.detail);
+                if !c.env.is_empty() {
+                    println!("   reads {}", c.env.join(", "));
+                }
+            }
         }
         Command::Metrics { app } => {
             let metrics: Vec<AppMetric> = api.get(&format!("/api/apps/{app}/metrics")).await?;
@@ -824,6 +990,15 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
                 "node {name} removed (stop its agent: systemctl disable --now facaded-agent)"
             );
         }
+        NodeCommand::Ip { name, ip } => {
+            let public_ip = (ip != "auto").then_some(ip);
+            api.send(
+                api.request(Method::PUT, &format!("/api/nodes/{name}/ip"))
+                    .json(&SetNodeIp { public_ip }),
+            )
+            .await?;
+            eprintln!("updated {name}; DNS records follow");
+        }
         NodeCommand::Metrics { name } => {
             let metrics: Vec<NodeMetric> = api.get(&format!("/api/nodes/{name}/metrics")).await?;
             if json {
@@ -873,21 +1048,49 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
             print_app_detail(&view);
         }
         AppCommand::Create { name, spec: args } => {
-            let source = args.source(None)?.context(
-                "give a source: --image <ref>, or --git <url> [--rust-bin <bin> | --static <dir> | --dockerfile <path>]",
-            )?;
+            let uploaded = match &args.executable {
+                Some(path) => Some(upload(api, path).await?),
+                None => None,
+            };
+            let mut source = args
+                .source(None, uploaded.as_ref())?
+                .context("give a source: --git <url>, --executable <file> or --image <ref>")?;
+            let mut http_port = None;
+            if let Source::Git {
+                repo,
+                branch,
+                build,
+            } = &mut source
+                && args.build_unspecified()
+            {
+                let report = scan(api, repo, branch.as_deref()).await?;
+                let best = report.candidates.into_iter().next().context(
+                    "nothing deployable found in the repository; pass --dockerfile, --rust-bin or --static",
+                )?;
+                if !json {
+                    eprintln!("using {} ({})", best.title, best.detail);
+                    if !best.env.is_empty() {
+                        eprintln!("it reads: {}", best.env.join(", "));
+                    }
+                }
+                *build = best.build;
+                http_port = best.http_port;
+            }
             let mut spec = AppSpec {
                 name,
                 node: String::new(),
                 source,
-                http_port: None,
+                http_port,
                 domains: vec![],
                 ports: vec![],
                 host_network: false,
                 limits: Limits::default(),
                 enabled: true,
             };
-            args.apply(&mut spec)?;
+            args.apply(&mut spec, None)?;
+            if spec.is_static() {
+                spec.http_port = None;
+            }
             if spec.node.is_empty() {
                 spec.node = default_node(api).await?;
             }
@@ -905,7 +1108,11 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
         AppCommand::Update { name, spec: args } => {
             let view: AppView = api.get(&format!("/api/apps/{name}")).await?;
             let mut spec = view.spec;
-            args.apply(&mut spec)?;
+            let uploaded = match &args.executable {
+                Some(path) => Some(upload(api, path).await?),
+                None => None,
+            };
+            args.apply(&mut spec, uploaded.as_ref())?;
             let view: AppView = api
                 .json(
                     api.request(Method::PUT, &format!("/api/apps/{name}"))
@@ -927,6 +1134,42 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Uploads an executable, returning what the server made of it.
+async fn upload(api: &Api, path: &std::path::Path) -> anyhow::Result<ArtifactView> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("opening {}", path.display()))?;
+    let size = file.metadata().await?.len();
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "app".into());
+    eprintln!("uploading {filename} ({})", bytes(size));
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+    let artifact: ArtifactView = api
+        .json(
+            api.request(Method::POST, "/api/artifacts")
+                .query(&[("filename", &filename)])
+                .header("content-length", size)
+                .body(body),
+        )
+        .await?;
+    eprintln!("uploaded: {} executable", artifact.arch);
+    Ok(artifact)
+}
+
+async fn scan(api: &Api, repo: &str, branch: Option<&str>) -> anyhow::Result<InspectReport> {
+    eprintln!("scanning {repo}…");
+    api.json(
+        api.request(Method::POST, "/api/inspect")
+            .json(&InspectRequest {
+                repo: repo.to_string(),
+                branch: branch.map(str::to_string),
+            }),
+    )
+    .await
 }
 
 async fn default_node(api: &Api) -> anyhow::Result<String> {
@@ -1010,13 +1253,25 @@ async fn env(api: &Api, cmd: EnvCommand, json: bool) -> anyhow::Result<()> {
 
 fn print_nodes(nodes: &[NodeView]) {
     table(
-        &["NODE", "STATUS", "HOST", "CPU", "MEMORY", "DISK", "SEEN"],
+        &[
+            "NODE",
+            "STATUS",
+            "PUBLIC IP",
+            "CPU",
+            "MEMORY",
+            "DISK",
+            "SEEN",
+        ],
         nodes.iter().map(|n| {
             let s = n.stats.as_ref();
             vec![
                 format!("{}{}", n.name, if n.local { " (server)" } else { "" }),
                 if n.connected { "online" } else { "OFFLINE" }.into(),
-                n.hostname.clone().unwrap_or_default(),
+                format!(
+                    "{}{}",
+                    n.public_ip.clone().unwrap_or_else(|| "?".into()),
+                    if n.public_ip_manual { " (set)" } else { "" }
+                ),
                 s.map(|s| format!("{:.0}% of {}", s.cpu_percent, s.cpus))
                     .unwrap_or_default(),
                 s.map(|s| format!("{} / {}", bytes(s.mem_used), bytes(s.mem_total)))
@@ -1066,6 +1321,19 @@ fn print_app_detail(view: &AppView) {
     println!("revision:  {}", view.revision);
     match &spec.source {
         Source::Image { image } => println!("source:    image {image}"),
+        Source::Executable {
+            filename,
+            arch,
+            args,
+            ..
+        } => println!(
+            "source:    executable {filename} ({arch}){}",
+            if args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", args.join(" "))
+            }
+        ),
         Source::Git {
             repo,
             branch,

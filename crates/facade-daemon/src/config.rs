@@ -17,7 +17,10 @@ pub struct ServerConfig {
     pub node_listen: SocketAddr,
     /// API with the server's self-signed certificate (CLI pins its fingerprint).
     pub api_listen: SocketAddr,
-    /// Public ingress.
+    /// Plain-HTTP API on loopback, which this machine's entry point forwards
+    /// `api_domain` to.
+    pub api_loopback: SocketAddr,
+    /// Where this machine serves its apps.
     pub http_listen: SocketAddr,
     pub https_listen: SocketAddr,
     /// Name of the node the server itself runs apps on.
@@ -34,6 +37,7 @@ impl Default for ServerConfig {
             public_host: None,
             node_listen: "0.0.0.0:7700".parse().unwrap(),
             api_listen: "0.0.0.0:7701".parse().unwrap(),
+            api_loopback: "127.0.0.1:7702".parse().unwrap(),
             http_listen: "0.0.0.0:80".parse().unwrap(),
             https_listen: "0.0.0.0:443".parse().unwrap(),
             local_node: "main".into(),
@@ -51,6 +55,12 @@ pub struct AcmeConfig {
     pub email: Option<String>,
     /// Use Let's Encrypt's staging environment (untrusted certs, generous limits).
     pub staging: bool,
+    /// Another ACME directory URL than Let's Encrypt's.
+    pub directory: Option<String>,
+    /// CA certificate to trust for `directory` (test CAs such as Pebble).
+    pub root_ca: Option<PathBuf>,
+    /// How long to let DNS challenge records spread before validation.
+    pub dns_propagation_secs: u64,
 }
 
 impl Default for AcmeConfig {
@@ -59,6 +69,9 @@ impl Default for AcmeConfig {
             enabled: true,
             email: None,
             staging: false,
+            directory: None,
+            root_ca: None,
+            dns_propagation_secs: 60,
         }
     }
 }

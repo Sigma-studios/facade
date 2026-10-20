@@ -87,6 +87,22 @@ impl AppSpec {
                     return err("image must be a non-empty image reference");
                 }
             }
+            Source::Executable {
+                sha256,
+                filename,
+                arch,
+                ..
+            } => {
+                if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return err("upload an executable first");
+                }
+                if filename.is_empty() || filename.contains(['/', '\\']) {
+                    return err("invalid executable file name");
+                }
+                if !matches!(arch.as_str(), "x86_64" | "aarch64") {
+                    return err(format!("unsupported architecture `{arch}`"));
+                }
+            }
             Source::Git {
                 repo,
                 branch,
@@ -193,6 +209,17 @@ pub fn validate_domain(domain: &str) -> Result<(), SpecError> {
 pub enum Source {
     /// A prebuilt image from a registry.
     Image { image: String },
+    /// A Linux executable uploaded to the server (`POST /api/artifacts`), run in a
+    /// minimal Debian image.
+    Executable {
+        /// SHA-256 of the uploaded file, which is how the server stores it.
+        sha256: String,
+        filename: String,
+        /// CPU architecture the file was built for: `x86_64` or `aarch64`.
+        arch: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+    },
     /// A git repository, built on the node.
     Git {
         repo: String,
