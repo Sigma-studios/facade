@@ -38,7 +38,24 @@ pub enum Change {
 }
 
 pub async fn check(cfg: &ServerConfig, json: bool) -> anyhow::Result<()> {
-    let store = Store::open_read_only(&cfg.data_dir.join("facade.db"))?;
+    // The running server's database may predate this binary's schema: read a
+    // copy, brought up to date the way this binary would, and never touch the
+    // real one.
+    let copy = cfg
+        .data_dir
+        .join("tmp")
+        .join(format!("upgrade-check-{}.db", uuid::Uuid::new_v4()));
+    crate::tls::create_private_dir(copy.parent().expect("has a parent"))?;
+    Store::open_read_only(&cfg.data_dir.join("facade.db"))?.snapshot(&copy)?;
+    let result = check_copy(cfg, &copy, json).await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", copy.display()));
+    }
+    result
+}
+
+async fn check_copy(cfg: &ServerConfig, copy: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    let store = Store::open(copy)?;
     let secrets = SecretBox::load_or_create(&cfg.data_dir.join("master.key"))?;
     let docker = Docker::connect_with_local_defaults().context("connecting to Docker")?;
 
