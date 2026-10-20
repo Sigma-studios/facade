@@ -3,6 +3,7 @@
 mod acme;
 mod api;
 mod artifacts;
+mod backups;
 mod dns;
 mod hub;
 mod inspect;
@@ -16,7 +17,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use facade_core::api::{AppMetric, NodeMetric};
-use facade_core::proto::{AgentRequest, AppState, AppStats, JoinToken, NodeStats, Workload};
+use facade_core::proto::{
+    AgentRequest, AppState, AppStats, Credential, JoinToken, Listener, NodeStats, Workload,
+};
 use parking_lot::RwLock;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -49,6 +52,8 @@ pub struct Server {
     pub domains_wake: Notify,
     pub alerts: parking_lot::Mutex<monitor::Alerts>,
     pub notifier: monitor::Notifier,
+    /// Last failed backups, `app/volume` → why. Cleared by the next success.
+    pub backup_errors: RwLock<HashMap<String, String>>,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -64,6 +69,9 @@ pub struct NodeLive {
     pub history: VecDeque<NodeMetric>,
     /// When the node was last seen disconnecting (or the server started).
     pub offline_since: Option<u64>,
+    /// Listening sockets, from the last report.
+    pub listeners: Vec<Listener>,
+    pub ingress_errors: Vec<String>,
 }
 
 pub struct AppLive {
@@ -87,7 +95,7 @@ impl Default for AppLive {
 /// Derived from the apps table; rebuilt whenever apps change.
 #[derive(Default)]
 pub struct Routes {
-    /// domain → app
+    /// domain → app, redirect domains included
     pub domains: HashMap<String, String>,
     /// app → node
     pub nodes: HashMap<String, String>,
@@ -127,7 +135,24 @@ impl Server {
             spec: row.spec,
             env,
             revision: row.revision,
+            credentials: self.credentials()?,
         })
+    }
+
+    /// Every registry and git login, decrypted.
+    pub fn credentials(&self) -> anyhow::Result<Vec<Credential>> {
+        self.store
+            .list_credentials()?
+            .into_iter()
+            .map(|c| {
+                Ok(Credential {
+                    kind: c.kind,
+                    host: c.host,
+                    username: c.username,
+                    secret: self.secrets.open_string(&c.sealed_secret)?,
+                })
+            })
+            .collect()
     }
 
     /// Apps run from their first deploy on; before that they are only configuration.
@@ -165,7 +190,7 @@ impl Server {
             routes
                 .nodes
                 .insert(app.spec.name.clone(), app.spec.node.clone());
-            for domain in &app.spec.domains {
+            for domain in app.spec.domains.iter().chain(&app.spec.redirects) {
                 routes.domains.insert(domain.clone(), app.spec.name.clone());
             }
         }
@@ -179,6 +204,8 @@ impl Server {
         let mut live = self.live.write();
         let entry = live.nodes.entry(node.to_string()).or_default();
         entry.stats = Some(report.node.clone());
+        entry.listeners = report.listeners;
+        entry.ingress_errors = report.ingress_errors;
         push_capped(
             &mut entry.history,
             NodeMetric {
@@ -258,6 +285,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         domains_wake: Notify::new(),
         alerts: Default::default(),
         notifier,
+        backup_errors: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -297,6 +325,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tasks.spawn(acme::run(server.clone()));
     tasks.spawn(monitor::run(server.clone()));
     tasks.spawn(artifacts::collect_garbage(server.clone()));
+    tasks.spawn(backups::run(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
     let ingress = crate::agent::IngressOptions {

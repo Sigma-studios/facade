@@ -1,7 +1,7 @@
 //! The app settings form, shared by "New app" and an app's Settings tab.
 
 use facade_core::api::{ArtifactView, Candidate, InspectReport, InspectRequest, NodeView};
-use facade_core::{AppSpec, Build, Limits, PortMap, Source};
+use facade_core::{AppSpec, Build, DEFAULT_PYTHON, Limits, PortMap, Source, Volume};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -12,7 +12,7 @@ use crate::util::bytes;
 #[derive(Clone, Copy)]
 pub struct SpecForm {
     pub name: RwSignal<String>,
-    node: RwSignal<String>,
+    pub node: RwSignal<String>,
     source: RwSignal<&'static str>,
     image: RwSignal<String>,
     repo: RwSignal<String>,
@@ -24,16 +24,20 @@ pub struct SpecForm {
     rust_bin: RwSignal<String>,
     features: RwSignal<String>,
     no_default_features: RwSignal<bool>,
+    python_version: RwSignal<String>,
+    python_entry: RwSignal<String>,
     static_dir: RwSignal<String>,
     http_port: RwSignal<String>,
     domains: RwSignal<String>,
+    redirects: RwSignal<String>,
     ports: RwSignal<String>,
     host_network: RwSignal<bool>,
+    volumes: RwSignal<String>,
     memory: RwSignal<String>,
     cpus: RwSignal<String>,
     enabled: RwSignal<bool>,
     artifact: RwSignal<Option<ArtifactView>>,
-    exec_args: RwSignal<String>,
+    args: RwSignal<String>,
     scan: RwSignal<Option<InspectReport>>,
     scan_error: RwSignal<Option<String>>,
     scanning: RwSignal<bool>,
@@ -67,16 +71,20 @@ impl SpecForm {
             rust_bin: s(""),
             features: s(""),
             no_default_features: RwSignal::new(false),
+            python_version: s(""),
+            python_entry: s(""),
             static_dir: s("."),
             http_port: s(""),
             domains: s(""),
+            redirects: s(""),
             ports: s(""),
             host_network: RwSignal::new(false),
+            volumes: s(""),
             memory: s(""),
             cpus: s(""),
             enabled: RwSignal::new(true),
             artifact: RwSignal::new(None),
-            exec_args: s(""),
+            args: s(""),
             scan: RwSignal::new(None),
             scan_error: RwSignal::new(None),
             scanning: RwSignal::new(false),
@@ -97,7 +105,6 @@ impl SpecForm {
                 sha256,
                 filename,
                 arch,
-                args,
             } => {
                 form.source.set("executable");
                 form.artifact.set(Some(ArtifactView {
@@ -106,7 +113,6 @@ impl SpecForm {
                     arch: arch.clone(),
                     size: 0,
                 }));
-                form.exec_args.set(join_args(args));
             }
             Source::Git {
                 repo,
@@ -137,6 +143,11 @@ impl SpecForm {
                         form.features.set(features.join(", "));
                         form.no_default_features.set(*no_default_features);
                     }
+                    Build::Python { version, entry } => {
+                        form.build.set("python");
+                        form.python_version.set(version.clone().unwrap_or_default());
+                        form.python_entry.set(entry.clone());
+                    }
                     Build::Static { dir } => {
                         form.build.set("static");
                         form.static_dir.set(dir.clone());
@@ -146,6 +157,7 @@ impl SpecForm {
         }
         form.http_port.set(opt_text(spec.http_port));
         form.domains.set(spec.domains.join("\n"));
+        form.redirects.set(spec.redirects.join("\n"));
         form.ports.set(
             spec.ports
                 .iter()
@@ -154,6 +166,14 @@ impl SpecForm {
                 .join("\n"),
         );
         form.host_network.set(spec.host_network);
+        form.args.set(join_args(&spec.args));
+        form.volumes.set(
+            spec.volumes
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         form.memory.set(opt_text(spec.limits.memory_mb));
         form.cpus.set(opt_text(spec.limits.cpus));
         form.enabled.set(spec.enabled);
@@ -167,7 +187,8 @@ impl SpecForm {
         }
     }
 
-    /// Fills the build settings (and the port, if empty) from a scan candidate.
+    /// Fills the build settings (and the port and arguments, if empty) from a scan
+    /// candidate.
     fn choose(&self, index: usize) {
         let Some(candidate) = self
             .scan
@@ -197,6 +218,11 @@ impl SpecForm {
                 self.features.set(features.join(", "));
                 self.no_default_features.set(no_default_features);
             }
+            Build::Python { version, entry } => {
+                self.build.set("python");
+                self.python_version.set(version.unwrap_or_default());
+                self.python_entry.set(entry);
+            }
             Build::Static { dir } => {
                 self.build.set("static");
                 self.static_dir.set(dir);
@@ -206,6 +232,9 @@ impl SpecForm {
             && self.http_port.with_untracked(String::is_empty)
         {
             self.http_port.set(port.to_string());
+        }
+        if !candidate.args.is_empty() && self.args.with_untracked(|a| a.trim().is_empty()) {
+            self.args.set(join_args(&candidate.args));
         }
     }
 
@@ -260,8 +289,24 @@ impl SpecForm {
                 }
                 s
             }
+            "python" => format!(
+                "Python {} · {}",
+                Some(self.python_version.get())
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_PYTHON.into()),
+                self.python_entry.get()
+            ),
             "static" => format!("static files from {}", self.static_dir.get()),
             _ => format!("{} in {}", self.dockerfile.get(), self.context.get()),
+        }
+    }
+
+    /// The program comes from an image, so arguments replace its `CMD`.
+    fn uses_cmd(&self) -> bool {
+        match self.source.get() {
+            "image" => true,
+            "git" => self.build.get() == "dockerfile",
+            _ => false,
         }
     }
 
@@ -293,7 +338,6 @@ impl SpecForm {
                 sha256: artifact.sha256,
                 filename: artifact.filename,
                 arch: artifact.arch,
-                args: split_args(&self.exec_args.get_untracked())?,
             }
         } else {
             let build = match self.build.get_untracked() {
@@ -302,6 +346,10 @@ impl SpecForm {
                     bin: text(self.rust_bin),
                     features: list(self.features),
                     no_default_features: self.no_default_features.get_untracked(),
+                },
+                "python" => Build::Python {
+                    version: optional(self.python_version),
+                    entry: text(self.python_entry),
                 },
                 "static" => Build::Static {
                     dir: optional(self.static_dir).unwrap_or_else(|| ".".into()),
@@ -342,6 +390,22 @@ impl SpecForm {
                 .map(|l| l.parse::<PortMap>().map_err(|e| e.to_string()))
                 .collect::<Result<_, _>>()?
         };
+        let args = if is_static {
+            vec![]
+        } else {
+            split_args(&self.args.get_untracked())?
+        };
+        let volumes = if is_static {
+            vec![]
+        } else {
+            self.volumes
+                .get_untracked()
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(|l| l.parse::<Volume>().map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?
+        };
         let memory_mb = optional(self.memory)
             .map(|m| {
                 m.parse::<u64>()
@@ -363,8 +427,14 @@ impl SpecForm {
                 .into_iter()
                 .map(|d| d.to_lowercase())
                 .collect(),
+            redirects: list(self.redirects)
+                .into_iter()
+                .map(|d| d.to_lowercase())
+                .collect(),
             ports,
             host_network: !is_static && self.host_network.get_untracked(),
+            args,
+            volumes,
             limits: Limits { memory_mb, cpus },
             enabled: self.enabled.get_untracked(),
         };
@@ -495,11 +565,6 @@ pub fn SpecFields(
             </Show>
             <Show when=move || f.source.get() == "executable">
                 <DropZone form=f nodes=nodes/>
-                <label class="field">
-                    <span>"Arguments"</span>
-                    <input type="text" bind:value=f.exec_args placeholder="--port 8080" autocomplete="off"/>
-                    <small>"Passed to the program. Separate with spaces; put an argument containing spaces in quotes."</small>
-                </label>
             </Show>
             <Show when=move || f.source.get() == "git">
                 <div class="form-row repo-row">
@@ -529,7 +594,7 @@ pub fn SpecFields(
                     </summary>
                     <div class="build-details-body">
                         <Segmented value=f.build label="Build"
-                            options=&[("dockerfile", "Dockerfile"), ("rust", "Rust binary"), ("static", "Static site")]/>
+                            options=&[("dockerfile", "Dockerfile"), ("rust", "Rust binary"), ("python", "Python"), ("static", "Static site")]/>
                         <Show when=move || f.build.get() == "dockerfile">
                             <div class="form-row">
                                 <label class="field">
@@ -564,6 +629,20 @@ pub fn SpecFields(
                                 </label>
                             </div>
                         </Show>
+                        <Show when=move || f.build.get() == "python">
+                            <div class="form-row">
+                                <label class="field grow">
+                                    <span>"Run"</span>
+                                    <input type="text" bind:value=f.python_entry placeholder="server.py"/>
+                                    <small>"A script (server.py), a module (-m mypkg) or a command the project installs."</small>
+                                </label>
+                                <label class="field">
+                                    <span>"Python version"</span>
+                                    <input type="text" bind:value=f.python_version placeholder=DEFAULT_PYTHON/>
+                                </label>
+                            </div>
+                            <p class="muted small">"Dependencies come from requirements.txt and/or pyproject.toml."</p>
+                        </Show>
                         <Show when=move || f.build.get() == "static">
                             <label class="field">
                                 <span>"Directory to serve"</span>
@@ -573,6 +652,18 @@ pub fn SpecFields(
                         </Show>
                     </div>
                 </details>
+            </Show>
+            <Show when=move || !f.is_static()>
+                <label class="field">
+                    <span>"Arguments"</span>
+                    <input type="text" bind:value=f.args autocomplete="off"
+                        placeholder=move || if f.uses_cmd() { "(the image's CMD)" } else { "--port 8080" }/>
+                    <small>{move || if f.uses_cmd() {
+                        "Replace the image's CMD. Separate with spaces; put an argument containing spaces in quotes."
+                    } else {
+                        "Passed to the program. Separate with spaces; put an argument containing spaces in quotes."
+                    }}</small>
+                </label>
             </Show>
         </fieldset>
 
@@ -589,9 +680,14 @@ pub fn SpecFields(
                 <label class="field grow">
                     <span>"Domains"</span>
                     <textarea rows="2" bind:value=f.domains placeholder="app.example.com"></textarea>
-                    <small>"One per line. Each must point at the app's node; the Domains page shows how, and HTTPS follows on its own."</small>
+                    <small>"One per line; the first is the main domain. Each must point at the app's node; the Domains page shows how, and HTTPS follows on its own."</small>
                 </label>
             </div>
+            <label class="field">
+                <span>"Redirects"</span>
+                <textarea rows="2" bind:value=f.redirects placeholder="www.example.com"></textarea>
+                <small>"One per line. Visitors are sent to the main domain, keeping the path."</small>
+            </label>
             <Show when=move || !f.is_static()>
                 <div class="form-row">
                     <label class="field grow">
@@ -609,6 +705,14 @@ pub fn SpecFields(
         </fieldset>
 
         <Show when=move || !f.is_static()>
+            <fieldset class="form-section">
+                <legend>"Storage"</legend>
+                <label class="field">
+                    <span>"Volumes"</span>
+                    <textarea rows="2" bind:value=f.volumes placeholder="data:/data"></textarea>
+                    <small>"name:/path, one per line. These directories keep their files across deploys and restarts; they live on the app's node."</small>
+                </label>
+            </fieldset>
             <fieldset class="form-section">
                 <legend>"Limits"</legend>
                 <div class="form-row">
@@ -656,6 +760,16 @@ fn ScanResults(form: SpecForm) -> impl IntoView {
                                         "Reads " {c.env.join(", ")}
                                     </span>
                                 })}
+                                {(!c.args.is_empty()).then(|| view! {
+                                    <span class="candidate-env">
+                                        "Runs with " {join_args(&c.args)}
+                                    </span>
+                                })}
+                                {c.notes.iter().map(|n| view! {
+                                    <span class="candidate-note">
+                                        <span aria-hidden="true">"⚠ "</span>{n.clone()}
+                                    </span>
+                                }).collect_view()}
                             </button>
                         }).collect_view()}
                     </div>

@@ -94,8 +94,13 @@ An app comes from one of three sources:
 * **A git repository.** facade clones it and scans it for what can be deployed
   (`facade scan <url>` shows the list): its own Dockerfile, Rust binaries (with the
   features they need, the port they listen on and the environment variables they
-  read) or a static site. The best match is used unless you pick a build yourself
-  (`--dockerfile`, `--rust-bin`, `--static`).
+  read), Python programs (a script with a `__main__` block, a package with
+  `__main__.py` or a `pyproject.toml` command; dependencies from `requirements.txt`
+  and/or `pyproject.toml`; the version from `.python-version` or `requires-python`)
+  or a static site. The best match is used unless you pick a build yourself
+  (`--dockerfile`, `--rust-bin`, `--python`, `--static`). The scan also suggests
+  arguments: a Python server whose `--host` defaults to `127.0.0.1` gets
+  `--host 0.0.0.0`, since loopback is unreachable from outside its container.
 * **A Linux executable** you upload (`--executable`, or drag and drop in the web
   UI). It runs in a small Debian image; it must be built for the node's CPU
   (`x86_64` or `aarch64`), and a static build (`--target x86_64-unknown-linux-musl`)
@@ -104,11 +109,13 @@ An app comes from one of three sources:
 
 ```sh
 # bevy_ensemble's signalling server + TURN relay: the scan finds the server binary,
-# its `server` feature, port 9090 and the TURN_* variables
+# its `server` feature, port 9090 and the TURN_* variables. On the host network, so
+# relayed media skips Docker's NAT; --publish declares the ports it binds, so a
+# conflict is caught before it starts.
 facade app create signalling --git https://github.com/Sigma-studios/bevy_ensemble \
-  --domain signal.example.com \
+  --domain signal.example.com --host-network true \
   --publish 3478:3478/udp --publish 49160-49260:49160-49260/udp --memory 256
-facade env set signalling SIGNALLING_ADDR=0.0.0.0:9090 TURN_PUBLIC_IP=VPS_PUBLIC_IP --public
+facade env set signalling TURN_PUBLIC_IP=VPS_PUBLIC_IP --public
 facade env set signalling TURN_PASSWORD        # prompts; sensitive by default
 facade deploy signalling                      # clients connect to wss://signal.example.com/ws
 
@@ -121,7 +128,20 @@ facade app update api --executable target/x86_64-unknown-linux-musl/release/api 
 # a static landing page, and a registry image
 facade app create landing --git https://github.com/me/site --domain example.com
 facade app create whoami --image traefik/whoami --port 80 --domain whoami.example.com
+
+# a Python server (found by the scan: server.py, port 8000, args --host 0.0.0.0),
+# reached at its main domain; www. redirects there
+facade app create poker --git https://github.com/me/poker --domain poker.example.com \
+  --redirect www.poker.example.com
+
+# a site keeping a SQLite database across deploys, from a private registry
+facade auth registry ghcr.io --user me            # token with read:packages
+facade app create blog --image ghcr.io/me/blog --port 3000 --domain example.com \
+  --redirect www.example.com --volume data:/data
 ```
+
+`--arg` (repeatable) passes arguments to the program: after the executable, Rust
+binary or Python entry, or in place of the `CMD` of a Dockerfile or image.
 
 ### Teaching the scan a new language
 
@@ -140,7 +160,11 @@ template in `lang::generated_dockerfile`.
 | `facade env ls <app> [--reveal]` / `env set` / `env unset` | variables; sensitive unless `--public` |
 | `facade domain add <app> <domain>` | route a host name to an app |
 | `facade app update <app> --memory 512 --cpus 1 --node eu-2 …` | change settings (moving nodes works) |
-| `facade stop` / `start` / `restart` / `app rm` | lifecycle |
+| `facade stop` / `start` / `restart` / `app rm [--delete-data]` | lifecycle |
+| `facade volume ls` / `export` / `import` | volumes, as `.tar.gz` |
+| `facade backup ls` / `run` / `get` / `restore` / `server` | backups |
+| `facade auth registry\|git <host> --user …` / `auth ls` / `auth rm` | private registries and repositories |
+| `facade node ports <node>` | what listens on a node, and who holds each port |
 | `facade export -o facade.toml` / `facade apply -f facade.toml` | config as code |
 
 Apps run from their first `facade deploy`; until then they are only configuration.
@@ -172,6 +196,55 @@ through HTTP-01, as soon as the record resolves. Another provider can be support
 by implementing `server/dns::Provider` (five calls: list zones, set/delete an A
 record, add/delete a TXT record).
 
+### Volumes and backups
+
+`--volume data:/data` (repeatable) gives an app a directory that outlives its
+containers: deploys, restarts and configuration changes keep its contents. Volumes
+live on the app's node, as Docker volumes named `facade-<app>_<volume>`.
+
+* `facade volume export <app> <volume>` downloads one as a `.tar.gz`; the app is
+  paused for the copy, so files (a SQLite database and its WAL) are taken at one
+  instant. `facade volume import <app> <volume> <file>` replaces its contents with
+  a `.tar` or `.tar.gz` (owners and permissions kept) while the app is stopped:
+  that is how existing data comes into facade.
+* `facade app rm` keeps an app's volumes unless `--delete-data`; leftovers are
+  listed by `facade volume ls` and deleted with `facade volume rm <app> --node <node>`.
+* Moving an app with volumes to another node needs `--move-data`: the app stops,
+  its volumes are copied to the new node, then deleted from the old one. If the copy
+  fails, the app starts again where it was.
+
+The server backs up every volume once a day and keeps the last 7 (`[backups]` in
+`server.toml`), in `/var/lib/facade/backups`, together with a copy of its own
+database and master key. They are on the server's disk: take copies elsewhere with
+`facade backup get <app> <volume> <id>` and `facade backup server` (the database and
+the key to its secrets, in one file). `facade backup run [app]` backs up now and
+`facade backup restore <app> <volume> <id>` puts a backup back. A failed backup is
+an alert.
+
+### Private registries and repositories
+
+```sh
+facade auth registry ghcr.io --user me     # prompts for a token (read:packages)
+facade auth git github.com --user me       # a token that can read the repositories
+```
+
+Logins are stored encrypted on the server and sent to nodes for pulls, clones
+(`https://` URLs) and builds (a Dockerfile's `FROM` can use a private registry).
+Changing one restarts nothing.
+
+### Ports
+
+Each node reports every port listening on it and the program holding it
+(`facade node ports <node>`, or the Nodes page). facade refuses to publish or bind a
+port another app of the node declares, and refuses to deploy or start an app whose
+ports are held by something else, naming it (`port 9090/tcp is in use on node main
+by bevy_ensemble_w (pid 2115957)`). With `--host-network true`, `--publish` declares
+the ports the app binds itself (no remapping), so they are checked too.
+
+If a node's HTTP(S) entry point cannot bind 80 or 443 (another web server holds
+them), it says so in `facade status` and as an alert, and retries every 5 seconds:
+stopping the other server is enough for facade to take over.
+
 ### Alerts on Discord
 
 Create a webhook in a channel (Edit channel → Integrations → Webhooks → New Webhook),
@@ -183,8 +256,8 @@ facade alerts test
 ```
 
 A message is posted when a problem lasts a minute (node offline, app crashed or failed
-to deploy, disk ≥ 90 %, memory ≥ 95 %, app at its memory/CPU limit) and again when it
-clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
+to deploy, disk ≥ 90 %, memory ≥ 95 %, app at its memory/CPU limit, entry point unable
+to bind its port, failed backup) and again when it clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
 repeatable; copy ids with Discord's developer mode); resolutions tag nobody.
 `--no-mentions` turns tagging off. The webhook is stored encrypted on the server.
 
@@ -203,5 +276,6 @@ secrets still to set. Applying is idempotent and never deletes anything.
 ## Not there yet
 
 * Users other than admins, and per-app permissions.
-* Persistent volumes for apps (databases).
-* Private git repositories (deploy keys).
+* Backups to somewhere other than the server's disk (S3 and the like).
+* Redeploying on `git push` (webhooks).
+* Zero-downtime deploys: a changed app is stopped, then started again.

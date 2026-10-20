@@ -29,6 +29,8 @@ impl Detector for StaticSite {
                     build: Build::Static { dir: rel },
                     http_port: None,
                     env: vec![],
+                    args: vec![],
+                    notes: vec![],
                 }
             })
             .collect()

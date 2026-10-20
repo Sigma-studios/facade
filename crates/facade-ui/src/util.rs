@@ -216,14 +216,18 @@ pub fn copy_to_clipboard(text: &str) {
 }
 
 pub fn download(filename: &str, contents: &str, mime: &str) {
-    use wasm_bindgen::JsCast;
     let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from_str(contents));
     let options = web_sys::BlobPropertyBag::new();
     options.set_type(mime);
-    let Ok(blob) = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options) else {
-        return;
-    };
-    let Ok(url) = web_sys::Url::create_object_url_with_blob(&blob) else {
+    if let Ok(blob) = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options) {
+        save_blob(filename, &blob);
+    }
+}
+
+/// Hands a blob to the browser as a file download.
+pub fn save_blob(filename: &str, blob: &web_sys::Blob) {
+    use wasm_bindgen::JsCast;
+    let Ok(url) = web_sys::Url::create_object_url_with_blob(blob) else {
         return;
     };
     let document = window().document().expect("document");
@@ -233,5 +237,11 @@ pub fn download(filename: &str, contents: &str, mime: &str) {
         a.set_download(filename);
         a.click();
     }
-    let _ = web_sys::Url::revoke_object_url(&url);
+    // Revoked later: some browsers still read a large blob after the click returns.
+    set_timeout(
+        move || {
+            let _ = web_sys::Url::revoke_object_url(&url);
+        },
+        Duration::from_secs(60),
+    );
 }

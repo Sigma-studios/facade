@@ -125,6 +125,15 @@ fn conditions(server: &Server) -> HashMap<String, String> {
             }
             continue;
         }
+        if server.hub.is_connected(name) {
+            for error in &node.ingress_errors {
+                // One alert per node: the key must not depend on the message.
+                out.insert(
+                    format!("node:{name}:ingress"),
+                    format!("node {name}: {error} (its apps are unreachable there)"),
+                );
+            }
+        }
         if let Some(stats) = &node.stats {
             if stats.disk_total > 0 && stats.disk_used * 100 / stats.disk_total >= 90 {
                 out.insert(
@@ -145,6 +154,13 @@ fn conditions(server: &Server) -> HashMap<String, String> {
                 );
             }
         }
+    }
+
+    for (what, error) in server.backup_errors.read().iter() {
+        out.insert(
+            format!("backup:{what}"),
+            format!("backup of {what} failed: {error}"),
+        );
     }
 
     let apps = match server.store.list_apps() {

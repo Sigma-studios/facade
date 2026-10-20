@@ -52,7 +52,7 @@ pub fn Overview() -> impl IntoView {
                     <div class="grid-cards">
                         <For
                             each=move || status.data.get().map(|s| s.nodes).unwrap_or_default()
-                            key=|n| n.name.clone()
+                            key=|n| (n.name.clone(), n.ingress_errors.clone())
                             children=move |node| view! { <NodeCard node/> }
                         />
                     </div>
@@ -85,6 +85,15 @@ pub fn NodeCard(node: NodeView) -> impl IntoView {
                 </div>
                 <OnlineBadge online=online/>
             </header>
+            {(online && !node.ingress_errors.is_empty()).then(|| view! {
+                <div class="note note-error" role="alert">
+                    <span aria-hidden="true">"⚠ "</span>
+                    "Apps on this node are not reachable over the web: "
+                    {node.ingress_errors.join("; ")}
+                    ". Another program (a web server?) holds the port; facade keeps retrying. "
+                    "The Ports list on the Nodes page shows which."
+                </div>
+            })}
             {match stats.filter(|_| online) {
                 Some(s) => view! {
                     <div class="meters">

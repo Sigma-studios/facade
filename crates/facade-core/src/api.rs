@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::proto::{AppState, AppStats, NodeStats};
+use crate::proto::{AppState, AppStats, CredentialKind, NodeStats};
 use crate::spec::{AppSpec, Build};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +46,10 @@ pub struct NodeView {
     pub agent_version: Option<String>,
     pub last_seen: Option<u64>,
     pub stats: Option<NodeStats>,
+    /// Addresses the node's HTTP(S) entry point cannot bind (another program holds
+    /// them); it keeps retrying.
+    #[serde(default)]
+    pub ingress_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +185,63 @@ pub struct Candidate {
     pub http_port: Option<u16>,
     /// Environment variables the code reads.
     pub env: Vec<String>,
+    /// Suggested `args`, e.g. to listen on every interface instead of loopback.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Things to know before deploying it.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+/// A registry or git login. The secret is never sent back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialView {
+    pub kind: CredentialKind,
+    pub host: String,
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetCredential {
+    pub username: String,
+    pub secret: String,
+}
+
+/// A volume as the server sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeView {
+    pub app: String,
+    pub name: String,
+    pub node: String,
+    /// Mount point, if the app still declares this volume.
+    pub path: Option<String>,
+    pub size: Option<u64>,
+    /// Newest backup, as a Unix time.
+    pub last_backup: Option<u64>,
+}
+
+/// One stored backup of a volume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupView {
+    pub app: String,
+    pub volume: String,
+    /// Unix time it was taken; also its id.
+    pub id: u64,
+    pub size: u64,
+}
+
+/// `POST /api/backups`: back up now. Empty means every app with volumes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupRequest {
+    #[serde(default)]
+    pub app: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupReport {
+    pub done: Vec<BackupView>,
+    /// `app/volume: reason`
+    pub failed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

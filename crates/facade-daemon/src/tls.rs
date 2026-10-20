@@ -69,6 +69,15 @@ pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     options.open(path)?.write_all(contents)
 }
 
+/// Creates (or truncates) a file only its owner can read.
+pub async fn private_file(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).await
+}
+
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]

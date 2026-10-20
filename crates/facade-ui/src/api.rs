@@ -148,6 +148,35 @@ pub async fn upload(file: &web_sys::File) -> Result<facade_core::api::ArtifactVi
     decode(call(Method::POST, &path, body, None).await?).await
 }
 
+/// Uploads a file as the raw request body.
+pub async fn put_file(path: &str, file: &web_sys::File) -> Result<(), String> {
+    call(Method::PUT, path, Body::Raw(file.clone().into()), None)
+        .await
+        .map(|_| ())
+}
+
+/// Fetches a file (a volume archive, a backup) and saves it under the name the
+/// server suggests, or `fallback`.
+pub async fn download(path: &str, fallback: &str) -> Result<(), String> {
+    let response = call(Method::GET, path, Body::None, None).await?;
+    let filename = response
+        .headers()
+        .get("content-disposition")
+        .and_then(|d| {
+            let name = d.split_once("filename=")?.1.trim_matches('"');
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .unwrap_or_else(|| fallback.to_string());
+    let raw: web_sys::Response = response.into();
+    let blob = raw.blob().map_err(|_| "cannot read the download")?;
+    let blob: web_sys::Blob = wasm_bindgen_futures::JsFuture::from(blob)
+        .await
+        .map_err(|_| "download interrupted")?
+        .unchecked_into();
+    crate::util::save_blob(&filename, &blob);
+    Ok(())
+}
+
 /// Streams a text response chunk by chunk until it ends or `abort` fires.
 pub async fn stream_text(
     path: &str,

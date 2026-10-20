@@ -12,7 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use facade_core::api::*;
-use facade_core::{AppSpec, Build, Limits, PortMap, Source};
+use facade_core::proto::{CredentialKind, Listener};
+use facade_core::{AppSpec, Build, Limits, PortMap, Source, Volume};
 use futures_util::StreamExt;
 use reqwest::Method;
 
@@ -65,6 +66,15 @@ enum Command {
     Env(EnvCommand),
     #[command(subcommand)]
     Domain(DomainCommand),
+    /// App volumes: list, download, replace with an archive.
+    #[command(subcommand)]
+    Volume(VolumeCommand),
+    /// Volume backups (taken on a schedule; see [backups] in server.toml).
+    #[command(subcommand)]
+    Backup(BackupCommand),
+    /// Logins for private registries (image pulls, Dockerfile FROM) and git hosts.
+    #[command(subcommand)]
+    Auth(AuthCommand),
     /// Every routed domain: where it must point, whether it does, and its certificate.
     Domains,
     /// Show or set the DNS provider facade manages records with.
@@ -158,6 +168,104 @@ enum NodeCommand {
     Metrics { name: String },
     /// Set the public IP domains of this node's apps point to (`auto` to detect it).
     Ip { name: String, ip: String },
+    /// Every listening port on the node, and which program or app holds it.
+    Ports { name: String },
+}
+
+#[derive(Subcommand)]
+enum VolumeCommand {
+    /// Every volume, with its node, size and last backup.
+    #[command(alias = "ls")]
+    List,
+    /// Download a volume as a .tar.gz (the app is paused while it is copied).
+    Export {
+        app: String,
+        volume: String,
+        /// Defaults to <app>-<volume>-<time>.tar.gz.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Replace a volume's contents with a .tar or .tar.gz (the app is stopped while
+    /// its files are replaced). Use it to bring existing data into facade.
+    Import {
+        app: String,
+        volume: String,
+        file: PathBuf,
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Delete the volumes an app left on a node it no longer runs on.
+    #[command(alias = "rm")]
+    Remove {
+        app: String,
+        #[arg(long)]
+        node: String,
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Stored backups, newest first.
+    #[command(alias = "ls")]
+    List { app: Option<String> },
+    /// Back up now: one app's volumes, or every app's.
+    Run { app: Option<String> },
+    /// Download a backup.
+    Get {
+        app: String,
+        volume: String,
+        id: u64,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Replace a volume's contents with a backup.
+    Restore {
+        app: String,
+        volume: String,
+        id: u64,
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Download the server's database and master key (everything facade knows,
+    /// secrets included: keep it safe).
+    Server {
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Saved logins (secrets are never shown).
+    #[command(alias = "ls")]
+    List,
+    /// Log in to a container registry, e.g. `facade auth registry ghcr.io --user me`
+    /// with a token that can read packages. Used for image pulls and Dockerfile FROM.
+    Registry {
+        host: String,
+        #[arg(long, short)]
+        user: String,
+        /// Read the token from stdin instead of prompting.
+        #[arg(long)]
+        token_stdin: bool,
+    },
+    /// Log in to a git host for HTTPS clones, e.g. `facade auth git github.com --user me`
+    /// with a token that can read the repositories.
+    Git {
+        host: String,
+        #[arg(long, short)]
+        user: String,
+        #[arg(long)]
+        token_stdin: bool,
+    },
+    #[command(alias = "rm")]
+    Remove {
+        /// `registry` or `git`
+        kind: String,
+        host: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -178,10 +286,17 @@ enum AppCommand {
         name: String,
         #[command(flatten)]
         spec: SpecArgs,
+        /// With --node: copy the app's volumes to the new node (and delete them
+        /// from the old one once copied).
+        #[arg(long)]
+        move_data: bool,
     },
     #[command(alias = "rm")]
     Remove {
         name: String,
+        /// Also delete its volumes. Without this they stay on the node.
+        #[arg(long)]
+        delete_data: bool,
         #[arg(long, short)]
         yes: bool,
     },
@@ -198,9 +313,13 @@ struct SpecArgs {
     /// Upload and run a Linux executable (built for the node's CPU).
     #[arg(long, conflicts_with = "git")]
     executable: Option<PathBuf>,
-    /// Argument passed to the executable (repeatable).
+    /// Argument for the program (repeatable; replaces the current ones). With a
+    /// Dockerfile or image they replace its CMD.
     #[arg(long = "arg", allow_hyphen_values = true)]
     args: Vec<String>,
+    /// Remove every argument.
+    #[arg(long, conflicts_with = "args")]
+    no_args: bool,
     /// Build from a git repository. Without --dockerfile, --rust-bin or --static, the
     /// repository is scanned and the best match is used (see `facade scan`).
     #[arg(long)]
@@ -226,12 +345,30 @@ struct SpecArgs {
     /// Serve this repository directory as a static site.
     #[arg(long = "static", conflicts_with = "dockerfile")]
     static_dir: Option<String>,
+    /// Run a Python program: a script (server.py), `-m module` or a command the
+    /// project installs. Dependencies come from requirements.txt / pyproject.toml.
+    #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["dockerfile", "static_dir", "rust_bin"])]
+    python: Option<String>,
+    /// Python version for --python (default: the current stable one).
+    #[arg(long, requires = "python")]
+    python_version: Option<String>,
     /// Port the app listens on for HTTP.
     #[arg(long)]
     port: Option<u16>,
-    /// Route this domain to the app (repeatable).
+    /// Route this domain to the app (repeatable; the first is the main one).
     #[arg(long = "domain")]
     domains: Vec<String>,
+    /// Redirect this domain to the main domain, e.g. www.example.com (repeatable).
+    #[arg(long = "redirect")]
+    redirects: Vec<String>,
+    #[arg(long, conflicts_with = "redirects")]
+    no_redirects: bool,
+    /// Keep a directory across deploys: `data:/data` (repeatable; replaces the list).
+    #[arg(long = "volume", short = 'v')]
+    volumes: Vec<Volume>,
+    /// Remove every volume from the app (their data stays on the node).
+    #[arg(long, conflicts_with = "volumes")]
+    no_volumes: bool,
     /// Publish raw ports: `3478:3478/udp`, `49160-49260:49160-49260/udp` (repeatable).
     #[arg(long = "publish", short = 'p')]
     ports: Vec<PortMap>,
@@ -264,22 +401,6 @@ impl SpecArgs {
                 sha256: artifact.sha256.clone(),
                 filename: artifact.filename.clone(),
                 arch: artifact.arch.clone(),
-                args: self.args.clone(),
-            }));
-        }
-        if let Some(Source::Executable {
-            sha256,
-            filename,
-            arch,
-            ..
-        }) = current
-            && !self.args.is_empty()
-        {
-            return Ok(Some(Source::Executable {
-                sha256: sha256.clone(),
-                filename: filename.clone(),
-                arch: arch.clone(),
-                args: self.args.clone(),
             }));
         }
         let touches_git = self.git.is_some()
@@ -287,7 +408,8 @@ impl SpecArgs {
             || self.dockerfile.is_some()
             || self.context.is_some()
             || self.rust_bin.is_some()
-            || self.static_dir.is_some();
+            || self.static_dir.is_some()
+            || self.python.is_some();
         if !touches_git {
             return Ok(None);
         }
@@ -313,6 +435,11 @@ impl SpecArgs {
             }
         } else if let Some(dir) = &self.static_dir {
             Build::Static { dir: dir.clone() }
+        } else if let Some(entry) = &self.python {
+            Build::Python {
+                version: self.python_version.clone(),
+                entry: entry.clone(),
+            }
         } else if self.dockerfile.is_some() || self.context.is_some() {
             let (df, ctx) = match build {
                 Build::Dockerfile {
@@ -341,6 +468,7 @@ impl SpecArgs {
             && self.context.is_none()
             && self.rust_bin.is_none()
             && self.static_dir.is_none()
+            && self.python.is_none()
     }
 
     fn apply(&self, spec: &mut AppSpec, uploaded: Option<&ArtifactView>) -> anyhow::Result<()> {
@@ -354,7 +482,25 @@ impl SpecArgs {
             spec.http_port = (port != 0).then_some(port);
         }
         if !self.domains.is_empty() {
-            spec.domains = self.domains.clone();
+            spec.domains = self.domains.iter().map(|d| d.to_lowercase()).collect();
+        }
+        if !self.redirects.is_empty() {
+            spec.redirects = self.redirects.iter().map(|d| d.to_lowercase()).collect();
+        }
+        if self.no_redirects {
+            spec.redirects.clear();
+        }
+        if !self.args.is_empty() {
+            spec.args = self.args.clone();
+        }
+        if self.no_args {
+            spec.args.clear();
+        }
+        if !self.volumes.is_empty() {
+            spec.volumes = self.volumes.clone();
+        }
+        if self.no_volumes {
+            spec.volumes.clear();
         }
         if !self.ports.is_empty() {
             spec.ports = self.ports.clone();
@@ -642,6 +788,9 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
         Command::Node(cmd) => node(api, cmd, json).await?,
         Command::App(cmd) => app(api, cmd, json).await?,
         Command::Env(cmd) => env(api, cmd, json).await?,
+        Command::Volume(cmd) => volume(api, cmd, json).await?,
+        Command::Backup(cmd) => backup(api, cmd, json).await?,
+        Command::Auth(cmd) => auth(api, cmd, json).await?,
         Command::Domain(cmd) => {
             let (name, domain, add) = match cmd {
                 DomainCommand::Add { app, domain } => (app, domain, true),
@@ -845,6 +994,12 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 if !c.env.is_empty() {
                     println!("   reads {}", c.env.join(", "));
                 }
+                if !c.args.is_empty() {
+                    println!("   suggested args: {}", c.args.join(" "));
+                }
+                for note in &c.notes {
+                    println!("   note: {note}");
+                }
             }
         }
         Command::Metrics { app } => {
@@ -999,6 +1154,27 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
             .await?;
             eprintln!("updated {name}; DNS records follow");
         }
+        NodeCommand::Ports { name } => {
+            let ports: Vec<Listener> = api.get(&format!("/api/nodes/{name}/ports")).await?;
+            if json {
+                return print_json(&ports);
+            }
+            table(
+                &["PORT", "ADDRESS", "PROCESS", "APP"],
+                ports.iter().map(|l| {
+                    vec![
+                        format!("{}/{}", l.port, l.protocol),
+                        l.address.clone(),
+                        match (&l.process, l.pid) {
+                            (Some(p), Some(pid)) => format!("{p} ({pid})"),
+                            (Some(p), None) => p.clone(),
+                            _ => "?".into(),
+                        },
+                        l.app.clone().unwrap_or_default(),
+                    ]
+                }),
+            );
+        }
         NodeCommand::Metrics { name } => {
             let metrics: Vec<NodeMetric> = api.get(&format!("/api/nodes/{name}/metrics")).await?;
             if json {
@@ -1056,6 +1232,7 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 .source(None, uploaded.as_ref())?
                 .context("give a source: --git <url>, --executable <file> or --image <ref>")?;
             let mut http_port = None;
+            let mut suggested_args = vec![];
             if let Source::Git {
                 repo,
                 branch,
@@ -1073,8 +1250,12 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                         eprintln!("it reads: {}", best.env.join(", "));
                     }
                 }
+                for note in &best.notes {
+                    eprintln!("note: {note}");
+                }
                 *build = best.build;
                 http_port = best.http_port;
+                suggested_args = best.args;
             }
             let mut spec = AppSpec {
                 name,
@@ -1082,12 +1263,21 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 source,
                 http_port,
                 domains: vec![],
+                redirects: vec![],
                 ports: vec![],
                 host_network: false,
+                args: vec![],
+                volumes: vec![],
                 limits: Limits::default(),
                 enabled: true,
             };
             args.apply(&mut spec, None)?;
+            if spec.args.is_empty() && !args.no_args && !suggested_args.is_empty() {
+                if !json {
+                    eprintln!("with args: {}", suggested_args.join(" "));
+                }
+                spec.args = suggested_args;
+            }
             if spec.is_static() {
                 spec.http_port = None;
             }
@@ -1105,7 +1295,11 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 view.spec.name
             );
         }
-        AppCommand::Update { name, spec: args } => {
+        AppCommand::Update {
+            name,
+            spec: args,
+            move_data,
+        } => {
             let view: AppView = api.get(&format!("/api/apps/{name}")).await?;
             let mut spec = view.spec;
             let uploaded = match &args.executable {
@@ -1116,6 +1310,7 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
             let view: AppView = api
                 .json(
                     api.request(Method::PUT, &format!("/api/apps/{name}"))
+                        .query(&[("move_data", move_data)])
                         .json(&spec),
                 )
                 .await?;
@@ -1124,16 +1319,316 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
             }
             eprintln!("updated {name}");
         }
-        AppCommand::Remove { name, yes } => {
-            if !yes && !confirm(&format!("Delete {name}, its container and its variables?"))? {
+        AppCommand::Remove {
+            name,
+            delete_data,
+            yes,
+        } => {
+            let question = if delete_data {
+                format!("Delete {name}, its container, its variables AND ITS VOLUMES' DATA?")
+            } else {
+                format!("Delete {name}, its container and its variables (its volumes are kept)?")
+            };
+            if !yes && !confirm(&question)? {
                 bail!("aborted");
             }
-            api.send(api.request(Method::DELETE, &format!("/api/apps/{name}")))
-                .await?;
+            let view: AppView = api.get(&format!("/api/apps/{name}")).await?;
+            api.send(
+                api.request(Method::DELETE, &format!("/api/apps/{name}"))
+                    .query(&[("delete_data", delete_data)]),
+            )
+            .await?;
             eprintln!("{name} deleted");
+            if !delete_data && !view.spec.volumes.is_empty() {
+                eprintln!(
+                    "its volumes stay on {}; delete them with `facade volume rm {name} --node {0}`",
+                    view.spec.node
+                );
+            }
         }
     }
     Ok(())
+}
+
+async fn volume(api: &Api, cmd: VolumeCommand, json: bool) -> anyhow::Result<()> {
+    match cmd {
+        VolumeCommand::List => {
+            let volumes: Vec<VolumeView> = api.get("/api/volumes").await?;
+            if json {
+                return print_json(&volumes);
+            }
+            if volumes.is_empty() {
+                println!(
+                    "no volumes; give an app one with `facade app update <app> --volume data:/data`"
+                );
+            }
+            table(
+                &["APP", "VOLUME", "PATH", "NODE", "SIZE", "LAST BACKUP"],
+                volumes.iter().map(|v| {
+                    vec![
+                        v.app.clone(),
+                        v.name.clone(),
+                        v.path
+                            .clone()
+                            .unwrap_or_else(|| "(left over: no longer used)".into()),
+                        v.node.clone(),
+                        v.size.map(bytes).unwrap_or_else(|| "-".into()),
+                        v.last_backup
+                            .map(output::ago)
+                            .unwrap_or_else(|| "never".into()),
+                    ]
+                }),
+            );
+        }
+        VolumeCommand::Export {
+            app,
+            volume,
+            output,
+        } => {
+            let path = output.unwrap_or_else(|| {
+                PathBuf::from(format!("{app}-{volume}-{}.tar.gz", facade_core::now()))
+            });
+            let resp = api
+                .send(api.request(
+                    Method::GET,
+                    &format!("/api/apps/{app}/volumes/{volume}/archive"),
+                ))
+                .await?;
+            let size = download(resp, &path).await?;
+            eprintln!("saved {} ({})", path.display(), bytes(size));
+        }
+        VolumeCommand::Import {
+            app,
+            volume,
+            file,
+            yes,
+        } => {
+            if !yes
+                && !confirm(&format!(
+                    "Replace everything in {app}/{volume} with {}? ({app} is stopped meanwhile)",
+                    file.display()
+                ))?
+            {
+                bail!("aborted");
+            }
+            let f = tokio::fs::File::open(&file)
+                .await
+                .with_context(|| format!("opening {}", file.display()))?;
+            let size = f.metadata().await?.len();
+            eprintln!("uploading {} ({})", file.display(), bytes(size));
+            api.send(
+                api.request(
+                    Method::PUT,
+                    &format!("/api/apps/{app}/volumes/{volume}/archive"),
+                )
+                .header("content-length", size)
+                .body(reqwest::Body::wrap_stream(
+                    tokio_util::io::ReaderStream::new(f),
+                )),
+            )
+            .await?;
+            eprintln!("{app}/{volume} replaced");
+        }
+        VolumeCommand::Remove { app, node, yes } => {
+            if !yes && !confirm(&format!("Delete every volume of {app} on {node}?"))? {
+                bail!("aborted");
+            }
+            api.send(api.request(Method::DELETE, &format!("/api/nodes/{node}/volumes/{app}")))
+                .await?;
+            eprintln!("deleted {app}'s volumes on {node}");
+        }
+    }
+    Ok(())
+}
+
+async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()> {
+    match cmd {
+        BackupCommand::List { app } => {
+            let mut req = api.request(Method::GET, "/api/backups");
+            if let Some(app) = &app {
+                req = req.query(&[("app", app)]);
+            }
+            let list: Vec<BackupView> = api.json(req).await?;
+            if json {
+                return print_json(&list);
+            }
+            if list.is_empty() {
+                println!("no backups yet");
+            }
+            table(
+                &["APP", "VOLUME", "ID", "TAKEN", "SIZE"],
+                list.iter().map(|b| {
+                    vec![
+                        b.app.clone(),
+                        b.volume.clone(),
+                        b.id.to_string(),
+                        output::date(b.id),
+                        bytes(b.size),
+                    ]
+                }),
+            );
+        }
+        BackupCommand::Run { app } => {
+            let report: BackupReport = api
+                .json(
+                    api.request(Method::POST, "/api/backups")
+                        .json(&BackupRequest { app }),
+                )
+                .await?;
+            if json {
+                return print_json(&report);
+            }
+            for b in &report.done {
+                println!(
+                    "saved {}/{} ({}), id {}",
+                    b.app,
+                    b.volume,
+                    bytes(b.size),
+                    b.id
+                );
+            }
+            for f in &report.failed {
+                println!("FAILED {f}");
+            }
+            if report.done.is_empty() && report.failed.is_empty() {
+                println!("nothing to back up (no deployed app has volumes)");
+            }
+            if !report.failed.is_empty() {
+                bail!("{} backup(s) failed", report.failed.len());
+            }
+        }
+        BackupCommand::Get {
+            app,
+            volume,
+            id,
+            output,
+        } => {
+            let path =
+                output.unwrap_or_else(|| PathBuf::from(format!("{app}-{volume}-{id}.tar.gz")));
+            let resp = api
+                .send(api.request(Method::GET, &format!("/api/backups/{app}/{volume}/{id}")))
+                .await?;
+            let size = download(resp, &path).await?;
+            eprintln!("saved {} ({})", path.display(), bytes(size));
+        }
+        BackupCommand::Restore {
+            app,
+            volume,
+            id,
+            yes,
+        } => {
+            if !yes
+                && !confirm(&format!(
+                    "Replace everything in {app}/{volume} with backup {id} ({})?",
+                    output::date(id)
+                ))?
+            {
+                bail!("aborted");
+            }
+            api.send(api.request(
+                Method::POST,
+                &format!("/api/backups/{app}/{volume}/{id}/restore"),
+            ))
+            .await?;
+            eprintln!("{app}/{volume} restored from backup {id}");
+        }
+        BackupCommand::Server { output } => {
+            let path = output.unwrap_or_else(|| {
+                PathBuf::from(format!("facade-server-{}.tar.gz", facade_core::now()))
+            });
+            let resp = api
+                .send(api.request(Method::GET, "/api/server-backup"))
+                .await?;
+            let size = download(resp, &path).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            eprintln!(
+                "saved {} ({}): the database and the key to its secrets, keep it private",
+                path.display(),
+                bytes(size)
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn auth(api: &Api, cmd: AuthCommand, json: bool) -> anyhow::Result<()> {
+    let (kind, host, user, token_stdin) = match cmd {
+        AuthCommand::List => {
+            let list: Vec<CredentialView> = api.get("/api/credentials").await?;
+            if json {
+                return print_json(&list);
+            }
+            if list.is_empty() {
+                println!("no logins; add one with `facade auth registry ghcr.io --user <you>`");
+            }
+            table(
+                &["KIND", "HOST", "USER"],
+                list.iter()
+                    .map(|c| vec![c.kind.to_string(), c.host.clone(), c.username.clone()]),
+            );
+            return Ok(());
+        }
+        AuthCommand::Remove { kind, host } => {
+            api.send(api.request(Method::DELETE, &format!("/api/credentials/{kind}/{host}")))
+                .await?;
+            eprintln!("removed the {kind} login for {host}");
+            return Ok(());
+        }
+        AuthCommand::Registry {
+            host,
+            user,
+            token_stdin,
+        } => (CredentialKind::Registry, host, user, token_stdin),
+        AuthCommand::Git {
+            host,
+            user,
+            token_stdin,
+        } => (CredentialKind::Git, host, user, token_stdin),
+    };
+    let secret = if token_stdin {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        s.trim().to_string()
+    } else {
+        rpassword::prompt_password(format!("token for {user}@{host}: "))?
+    };
+    api.send(
+        api.request(Method::PUT, &format!("/api/credentials/{kind}/{host}"))
+            .json(&SetCredential {
+                username: user.clone(),
+                secret,
+            }),
+    )
+    .await?;
+    eprintln!("saved the {kind} login for {host} (as {user})");
+    Ok(())
+}
+
+/// Streams a response body to a file, returning its size.
+async fn download(resp: reqwest::Response, path: &std::path::Path) -> anyhow::Result<u64> {
+    use tokio::io::AsyncWriteExt;
+    let partial = path.with_extension("partial");
+    let mut file = tokio::fs::File::create(&partial)
+        .await
+        .with_context(|| format!("creating {}", partial.display()))?;
+    let mut body = resp.bytes_stream();
+    let mut size = 0;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.context("download interrupted")?;
+        size += chunk.len() as u64;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    if size == 0 {
+        let _ = tokio::fs::remove_file(&partial).await;
+        bail!("the server sent nothing (see the node's log)");
+    }
+    tokio::fs::rename(&partial, path).await?;
+    Ok(size)
 }
 
 /// Uploads an executable, returning what the server made of it.
@@ -1252,6 +1747,15 @@ async fn env(api: &Api, cmd: EnvCommand, json: bool) -> anyhow::Result<()> {
 }
 
 fn print_nodes(nodes: &[NodeView]) {
+    print_node_table(nodes);
+    for n in nodes {
+        for e in &n.ingress_errors {
+            println!("warning: node {}: {e}", n.name);
+        }
+    }
+}
+
+fn print_node_table(nodes: &[NodeView]) {
     table(
         &[
             "NODE",
@@ -1321,19 +1825,9 @@ fn print_app_detail(view: &AppView) {
     println!("revision:  {}", view.revision);
     match &spec.source {
         Source::Image { image } => println!("source:    image {image}"),
-        Source::Executable {
-            filename,
-            arch,
-            args,
-            ..
-        } => println!(
-            "source:    executable {filename} ({arch}){}",
-            if args.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", args.join(" "))
-            }
-        ),
+        Source::Executable { filename, arch, .. } => {
+            println!("source:    executable {filename} ({arch})")
+        }
         Source::Git {
             repo,
             branch,
@@ -1371,14 +1865,30 @@ fn print_app_detail(view: &AppView) {
                     }
                 ),
                 Build::Static { dir } => println!("build:     static files from {dir}"),
+                Build::Python { version, entry } => println!(
+                    "build:     python {} {entry}",
+                    version.as_deref().unwrap_or(facade_core::DEFAULT_PYTHON)
+                ),
             }
         }
     }
     if let Some(port) = spec.http_port {
         println!("http port: {port}");
     }
+    if !spec.args.is_empty() {
+        println!("args:      {}", spec.args.join(" "));
+    }
     for domain in &spec.domains {
         println!("domain:    {domain}");
+    }
+    for domain in &spec.redirects {
+        println!(
+            "redirect:  {domain} → {}",
+            spec.domains.first().map(String::as_str).unwrap_or("?")
+        );
+    }
+    for volume in &spec.volumes {
+        println!("volume:    {} at {}", volume.name, volume.path);
     }
     for port in &spec.ports {
         println!("publish:   {port}");

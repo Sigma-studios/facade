@@ -11,6 +11,7 @@
 
 pub mod dockerfile;
 pub mod executable;
+pub mod python;
 pub mod rust;
 pub mod static_site;
 
@@ -30,6 +31,7 @@ pub fn detectors() -> Vec<Box<dyn Detector>> {
     vec![
         Box::new(dockerfile::Dockerfiles),
         Box::new(rust::Cargo),
+        Box::new(python::Python),
         Box::new(static_site::StaticSite),
     ]
 }
@@ -53,6 +55,7 @@ pub fn generated_dockerfile(app: &str, build: &Build) -> Option<String> {
             features,
             *no_default_features,
         )),
+        Build::Python { version, entry } => python::dockerfile(version.as_deref(), entry).ok(),
         Build::Dockerfile { .. } | Build::Static { .. } => None,
     }
 }
@@ -92,17 +95,21 @@ pub fn env_hints(source: &str) -> Vec<String> {
             names.push(name.to_string());
         }
     };
-    for pattern in [
-        "var(\"",
-        "var_os(\"",
-        "getenv(\"",
-        "environ[\"",
-        "Getenv(\"",
+    for call in [
+        "var(",
+        "var_os(",
+        "getenv(",
+        "environ[",
+        "environ.get(",
+        "Getenv(",
     ] {
-        for (i, _) in source.match_indices(pattern) {
-            let rest = &source[i + pattern.len()..];
-            if let Some(end) = rest.find('"') {
-                push(&rest[..end]);
+        for quote in ['"', '\''] {
+            let pattern = format!("{call}{quote}");
+            for (i, _) in source.match_indices(&pattern) {
+                let rest = &source[i + pattern.len()..];
+                if let Some(end) = rest.find(quote) {
+                    push(&rest[..end]);
+                }
             }
         }
     }

@@ -3,8 +3,10 @@
 
 mod build;
 mod ingress;
+mod ports;
 mod runtime;
 mod stats;
+mod volumes;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -77,6 +79,8 @@ pub struct Agent {
     certs: Arc<ingress::Certs>,
     routing: ingress::Routing,
     ingress: IngressOptions,
+    /// Entry point addresses that cannot be bound yet, by address.
+    ingress_errors: Mutex<std::collections::BTreeMap<std::net::SocketAddr, String>>,
 }
 
 impl Agent {
@@ -97,6 +101,7 @@ impl Agent {
             certs,
             routing: Default::default(),
             ingress,
+            ingress_errors: Default::default(),
         }))
     }
 
@@ -167,8 +172,11 @@ impl Agent {
                     let agent = self.clone();
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        let error = agent.handle(req).await.err().map(|e| format!("{e:#}"));
-                        let _ = tx.send(AgentMsg::Response { id, error }).await;
+                        let (data, error) = match agent.handle(req).await {
+                            Ok(data) => (data, None),
+                            Err(e) => (None, Some(format!("{e:#}"))),
+                        };
+                        let _ = tx.send(AgentMsg::Response { id, error, data }).await;
                     });
                 }
             }
@@ -190,8 +198,11 @@ impl Agent {
     }
 
     /// Requests answer quickly; long work (builds) runs in the background and
-    /// reports through events.
-    async fn handle(self: &Arc<Self>, req: AgentRequest) -> anyhow::Result<()> {
+    /// reports through events. Some requests answer with data.
+    async fn handle(
+        self: &Arc<Self>,
+        req: AgentRequest,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
         match req {
             AgentRequest::Sync { workloads } => {
                 let map: HashMap<_, _> = workloads
@@ -210,11 +221,14 @@ impl Agent {
                     .insert(workload.spec.name.clone(), workload.clone());
                 tokio::spawn(self.clone().converge(workload, deployment));
             }
-            AgentRequest::Remove { app } => {
+            AgentRequest::Remove {
+                app,
+                delete_volumes,
+            } => {
                 self.workloads.lock().remove(&app);
                 let lock = self.lock_for(&app);
                 let _held = lock.lock().await;
-                self.runtime.remove(&app).await?;
+                self.runtime.remove(&app, delete_volumes).await?;
             }
             AgentRequest::Restart { app } => self.runtime.restart(&app).await?,
             AgentRequest::Ingress { certs, proxies } => {
@@ -245,8 +259,68 @@ impl Agent {
                     }
                 });
             }
+            AgentRequest::Volumes => {
+                return Ok(Some(serde_json::to_value(
+                    self.runtime.list_volumes().await?,
+                )?));
+            }
+            AgentRequest::VolumeExport {
+                tunnel,
+                app,
+                volume,
+            } => {
+                let stream = self.dial_data(tunnel).await?;
+                let agent = self.clone();
+                tokio::spawn(async move {
+                    // Exports and imports wait for deploys of the app, and the
+                    // reverse, so a container is never recreated mid-copy.
+                    let lock = agent.lock_for(&app);
+                    let _held = lock.lock().await;
+                    if let Err(e) = agent.runtime.export_volume(&app, &volume, stream).await {
+                        warn!("exporting volume {volume} of {app}: {e:#}");
+                    }
+                });
+            }
+            AgentRequest::VolumeImport {
+                tunnel,
+                app,
+                volume,
+            } => {
+                let stream = self.dial_data(tunnel).await?;
+                let agent = self.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut stream = stream;
+                    let lock = agent.lock_for(&app);
+                    let _held = lock.lock().await;
+                    let result = async {
+                        let size: u64 = crate::framing::read_line_unbuffered(&mut stream)
+                            .await?
+                            .trim()
+                            .parse()?;
+                        let upload = (&mut stream).take(size);
+                        agent
+                            .runtime
+                            .import_volume(&app, &volume, upload, size)
+                            .await
+                    }
+                    .await;
+                    let answer = match result {
+                        Ok(()) => {
+                            info!("restored volume {volume} of {app}");
+                            "ok\n".to_string()
+                        }
+                        Err(e) => {
+                            warn!("importing volume {volume} of {app}: {e:#}");
+                            format!("error {}\n", format!("{e:#}").replace('\n', " "))
+                        }
+                    };
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn converge(self: Arc<Self>, workload: Workload, deployment: Option<Uuid>) {
@@ -293,7 +367,7 @@ impl Agent {
                     info!("removing {app}: no longer assigned to this node");
                     let lock = self.lock_for(&app);
                     let _held = lock.lock().await;
-                    if let Err(e) = self.runtime.remove(&app).await {
+                    if let Err(e) = self.runtime.remove(&app, false).await {
                         warn!("removing {app}: {e:#}");
                     }
                 }
@@ -331,9 +405,22 @@ impl Agent {
         loop {
             tick.tick().await;
             let workloads: Vec<Workload> = self.workloads.lock().values().cloned().collect();
+            let listeners = match self.runtime.port_owners().await {
+                Ok((containers, published)) => {
+                    tokio::task::spawn_blocking(move || ports::scan(&containers, &published))
+                        .await
+                        .unwrap_or_default()
+                }
+                Err(e) => {
+                    warn!("listing containers for port owners: {e:#}");
+                    vec![]
+                }
+            };
             let report = NodeReport {
                 node: sampler.sample(),
                 apps: self.runtime.app_stats(&workloads).await,
+                listeners,
+                ingress_errors: self.ingress_errors.lock().values().cloned().collect(),
             };
             if tx
                 .send(AgentMsg::Event {

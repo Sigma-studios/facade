@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::Context;
 use facade_core::AppSpec;
 use facade_core::api::{DeploymentStatus, DeploymentView};
+use facade_core::proto::CredentialKind;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -76,6 +77,13 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS credentials (
+    kind TEXT NOT NULL,
+    host TEXT NOT NULL,
+    username TEXT NOT NULL,
+    secret BLOB NOT NULL,
+    PRIMARY KEY (kind, host)
+);
 "#;
 
 /// `ALTER TABLE … ADD COLUMN`, once.
@@ -117,6 +125,13 @@ pub struct EnvRow {
     pub key: String,
     pub sealed: Vec<u8>,
     pub sensitive: bool,
+}
+
+pub struct CredentialRow {
+    pub kind: CredentialKind,
+    pub host: String,
+    pub username: String,
+    pub sealed_secret: Vec<u8>,
 }
 
 pub struct CertRow {
@@ -616,5 +631,71 @@ impl Store {
             .lock()
             .execute("DELETE FROM dns_records WHERE domain = ?1", [domain])?;
         Ok(())
+    }
+
+    // ---- registry and git logins
+
+    pub fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRow>> {
+        let conn = self.0.lock();
+        let mut stmt = conn
+            .prepare("SELECT kind, host, username, secret FROM credentials ORDER BY kind, host")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(kind, host, username, sealed_secret)| {
+                Some(CredentialRow {
+                    kind: parse_kind(&kind)?,
+                    host,
+                    username,
+                    sealed_secret,
+                })
+            })
+            .collect())
+    }
+
+    pub fn put_credential(
+        &self,
+        kind: CredentialKind,
+        host: &str,
+        username: &str,
+        sealed_secret: &[u8],
+    ) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "INSERT OR REPLACE INTO credentials (kind, host, username, secret) VALUES (?1, ?2, ?3, ?4)",
+            params![kind.to_string(), host, username, sealed_secret],
+        )?;
+        Ok(())
+    }
+
+    /// Whether there was one to delete.
+    pub fn delete_credential(&self, kind: CredentialKind, host: &str) -> anyhow::Result<bool> {
+        Ok(self.0.lock().execute(
+            "DELETE FROM credentials WHERE kind = ?1 AND host = ?2",
+            params![kind.to_string(), host],
+        )? > 0)
+    }
+
+    /// A consistent copy of the whole database, safe while the server runs.
+    pub fn snapshot(&self, dest: &Path) -> anyhow::Result<()> {
+        let dest = dest.to_str().context("backup path is not UTF-8")?;
+        self.0.lock().execute("VACUUM INTO ?1", [dest])?;
+        Ok(())
+    }
+}
+
+fn parse_kind(s: &str) -> Option<CredentialKind> {
+    match s {
+        "registry" => Some(CredentialKind::Registry),
+        "git" => Some(CredentialKind::Git),
+        _ => None,
     }
 }

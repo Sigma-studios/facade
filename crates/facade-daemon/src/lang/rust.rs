@@ -76,6 +76,8 @@ impl Detector for Cargo {
                         },
                         http_port,
                         env,
+                        args: vec![],
+                        notes: vec![],
                     },
                 ));
             }
@@ -250,7 +252,7 @@ pub fn dockerfile(
         args += &format!(" --features {}", features.join(","));
     }
     format!(
-        r#"FROM rust:1-slim-bookworm AS build
+        r#"FROM docker.io/library/rust:1-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
@@ -258,10 +260,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=facade-cargo-registry
     --mount=type=cache,target=/src/target,id=facade-{app}-target \
     cargo build --release{args} && cp target/release/{bin} /facade-app
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 tzdata && rm -rf /var/lib/apt/lists/*
 COPY --from=build /facade-app /usr/local/bin/{bin}
-CMD ["/usr/local/bin/{bin}"]
+ENTRYPOINT ["/usr/local/bin/{bin}"]
 "#
     )
 }

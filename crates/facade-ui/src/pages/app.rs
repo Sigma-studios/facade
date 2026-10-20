@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AppMetric, AppView, DeploymentStatus, DeploymentView, DomainStatus, EnvPatch, EnvView,
-    NodeView, SetEnv,
+    AppMetric, AppView, BackupReport, BackupRequest, BackupView, DeploymentStatus, DeploymentView,
+    DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, VolumeView,
 };
 use facade_core::proto::AppState;
 use facade_core::{Build, Source};
@@ -16,13 +16,14 @@ use super::domains::DomainTable;
 use super::spec_form::{SpecFields, SpecForm};
 use crate::api;
 use crate::components::{ErrorNote, Loading, Modal, Sparkline, StateBadge};
-use crate::util::{ago, bytes, polled, run, strip_ansi, toasts};
+use crate::util::{ago, bytes, clock, date, polled, run, strip_ansi, toasts};
 
 const TABS: &[(&str, &str)] = &[
     ("overview", "Overview"),
     ("logs", "Logs"),
     ("deployments", "Deployments"),
     ("env", "Environment"),
+    ("volumes", "Volumes"),
     ("settings", "Settings"),
 ];
 
@@ -86,14 +87,20 @@ pub fn AppPage() -> impl IntoView {
 
     let confirm_delete = RwSignal::new(false);
     let typed = RwSignal::new(String::new());
+    let delete_data = RwSignal::new(false);
     let delete = {
         let navigate = navigate.clone();
         move |_| {
             let navigate = navigate.clone();
             let n = name.get_untracked();
+            let path = if delete_data.get_untracked() {
+                format!("/api/apps/{n}?delete_data=true")
+            } else {
+                format!("/api/apps/{n}")
+            };
             run(
                 format!("{n} deleted"),
-                async move { api::delete(&format!("/api/apps/{n}")).await },
+                async move { api::delete(&path).await },
                 move || navigate("/apps", Default::default()),
             );
         }
@@ -103,6 +110,10 @@ pub fn AppPage() -> impl IntoView {
     let state = Signal::derive(move || view_of().map(|a| a.state).unwrap_or(AppState::Unknown));
     let enabled = move || view_of().is_some_and(|a| a.spec.enabled);
     let deployed = move || view_of().is_some_and(|a| a.revision > 0);
+    let has_volumes = Memo::new(move |_| {
+        app.data
+            .with(|a| a.as_ref().is_some_and(|a| !a.spec.volumes.is_empty()))
+    });
 
     view! {
         <div class="page">
@@ -153,7 +164,7 @@ pub fn AppPage() -> impl IntoView {
             })}
 
             <div class="tabs" role="tablist">
-                {TABS.iter().map(|(key, label)| {
+                {move || TABS.iter().filter(|(key, _)| *key != "volumes" || has_volumes.get()).map(|(key, label)| {
                     let key = *key;
                     let set_tab = set_tab.clone();
                     view! {
@@ -171,6 +182,7 @@ pub fn AppPage() -> impl IntoView {
                     "logs" => view! { <LogsTab name=name/> }.into_any(),
                     "deployments" => view! { <DeploymentsTab name=name selected=selected_deployment/> }.into_any(),
                     "env" => view! { <EnvTab name=name deployed=Signal::derive(deployed)/> }.into_any(),
+                    "volumes" => view! { <VolumesTab name=name/> }.into_any(),
                     "settings" => view! {
                         <SettingsTab app=app.data.get_untracked().expect("loaded")
                             on_saved=move || app.reload() on_delete=move || confirm_delete.set(true)/>
@@ -181,6 +193,22 @@ pub fn AppPage() -> impl IntoView {
 
             <Modal open=confirm_delete title="Delete app">
                 <p>"This removes the container, its image and all its environment variables. It cannot be undone."</p>
+                <Show when=move || has_volumes.get()>
+                    <label class="check">
+                        <input type="checkbox" bind:checked=delete_data/>
+                        "Also delete its volumes' data"
+                    </label>
+                    <p class="muted small">
+                        {move || if delete_data.get() {
+                            "The volumes and their files are deleted with the app. Backups are kept.".to_string()
+                        } else {
+                            format!(
+                                "Unchecked, the volumes and their files stay on {}.",
+                                view_of().map(|a| a.spec.node).unwrap_or_default()
+                            )
+                        }}
+                    </p>
+                </Show>
                 <label class="field">
                     <span>"Type " <code>{move || name.get()}</code> " to confirm"</span>
                     <input type="text" bind:value=typed autocomplete="off"/>
@@ -204,6 +232,7 @@ fn subtitle(app: &AppView) -> String {
             let kind = match build {
                 Build::Dockerfile { .. } => "Dockerfile",
                 Build::Rust { .. } => "Rust",
+                Build::Python { .. } => "Python",
                 Build::Static { .. } => "static site",
             };
             format!("{} · {kind}", repo.trim_start_matches("https://"))
@@ -300,18 +329,27 @@ fn OverviewTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) -
                     <dt>"Source"</dt>
                     <dd>{match &s.source {
                         Source::Image { image } => format!("Docker image {image}"),
-                        Source::Executable { filename, arch, args, .. } => format!(
-                            "Executable {filename} ({arch}){}",
-                            if args.is_empty() { String::new() } else { format!(", run with {}", args.join(" ")) }
-                        ),
+                        Source::Executable { filename, arch, .. } => format!("Executable {filename} ({arch})"),
                         Source::Git { repo, branch, .. } => format!("{repo} ({})", branch.clone().unwrap_or_else(|| "default branch".into())),
                     }}</dd>
+                    {(!s.args.is_empty()).then(|| view! {
+                        <dt>"Arguments"</dt>
+                        <dd><code>{s.args.join(" ")}</code></dd>
+                    })}
                     <dt>"HTTP port"</dt>
                     <dd>{s.http_port.map(|p| p.to_string()).unwrap_or_else(|| "—".into())}</dd>
                     <dt>"Published ports"</dt>
                     <dd>{if s.host_network { "node network".to_string() } else if s.ports.is_empty() { "—".into() } else {
                         s.ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
                     }}</dd>
+                    {(!s.redirects.is_empty()).then(|| view! {
+                        <dt>"Redirects"</dt>
+                        <dd>{format!("{} → {}", s.redirects.join(", "), s.domains.first().cloned().unwrap_or_default())}</dd>
+                    })}
+                    {(!s.volumes.is_empty()).then(|| view! {
+                        <dt>"Volumes"</dt>
+                        <dd>{s.volumes.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")}</dd>
+                    })}
                 </dl>
             })}
         </section>
@@ -751,6 +789,257 @@ fn EnvTab(name: Memo<String>, #[prop(into)] deployed: Signal<bool>) -> impl Into
     }
 }
 
+// ---------------------------------------------------------------- volumes
+
+#[component]
+fn VolumesTab(name: Memo<String>) -> impl IntoView {
+    let volumes = polled(Some(Duration::from_secs(30)), move || {
+        let name = name.get();
+        async move {
+            let all = api::get::<Vec<VolumeView>>("/api/volumes").await?;
+            Ok(all
+                .into_iter()
+                .filter(|v| v.app == name)
+                .collect::<Vec<_>>())
+        }
+    });
+    let backups = polled(None, move || {
+        let name = name.get();
+        async move { api::get::<Vec<BackupView>>(&format!("/api/backups?app={name}")).await }
+    });
+
+    let backing_up = RwSignal::new(false);
+    let back_up = move |_| {
+        backing_up.set(true);
+        let body = BackupRequest {
+            app: Some(name.get_untracked()),
+        };
+        spawn_local(async move {
+            match api::post::<_, BackupReport>("/api/backups", &body).await {
+                Ok(report) => {
+                    if !report.done.is_empty() {
+                        let n = report.done.len();
+                        toasts().ok(format!(
+                            "{n} volume{} backed up",
+                            if n == 1 { "" } else { "s" }
+                        ));
+                    }
+                    for failure in report.failed {
+                        toasts().err(failure);
+                    }
+                    backups.reload();
+                    volumes.reload();
+                }
+                Err(e) => toasts().err(e),
+            }
+            backing_up.try_set(false);
+        });
+    };
+    let download = move |path: String, fallback: String| {
+        toasts().ok("Download starting…");
+        spawn_local(async move {
+            if let Err(e) = api::download(&path, &fallback).await {
+                toasts().err(e);
+            }
+        });
+    };
+
+    // Replacing a volume's contents from an uploaded archive.
+    let replace_open = RwSignal::new(false);
+    let replace_target = RwSignal::new(None::<VolumeView>);
+    let replace_file = StoredValue::new_local(None::<web_sys::File>);
+    let replace_name = RwSignal::new(None::<String>);
+    let replacing = RwSignal::new(false);
+    let file_input = NodeRef::<leptos::html::Input>::new();
+    let open_replace = move |v: VolumeView| {
+        replace_target.set(Some(v));
+        replace_file.set_value(None);
+        replace_name.set(None);
+        replace_open.set(true);
+    };
+    let replace = move |_| {
+        let (Some(v), Some(file)) = (replace_target.get_untracked(), replace_file.get_value())
+        else {
+            return;
+        };
+        replacing.set(true);
+        let path = format!("/api/apps/{}/volumes/{}/archive", v.app, v.name);
+        spawn_local(async move {
+            match api::put_file(&path, &file).await {
+                Ok(()) => {
+                    toasts().ok(format!("{} replaced; the app is starting again", v.name));
+                    replace_open.try_set(false);
+                    volumes.reload();
+                }
+                Err(e) => toasts().err(e),
+            }
+            replacing.try_set(false);
+        });
+    };
+
+    let restore_open = RwSignal::new(false);
+    let restore_target = RwSignal::new(None::<BackupView>);
+    let restore = move |_| {
+        let Some(b) = restore_target.get_untracked() else {
+            return;
+        };
+        run(
+            format!("{} restored; the app is starting again", b.volume),
+            async move {
+                api::act(&format!(
+                    "/api/backups/{}/{}/{}/restore",
+                    b.app, b.volume, b.id
+                ))
+                .await
+            },
+            move || {
+                restore_open.set(false);
+                volumes.reload();
+            },
+        );
+    };
+
+    view! {
+        <div class="toolbar">
+            <button class="button button-primary" disabled=backing_up on:click=back_up>
+                {move || if backing_up.get() { "Backing up…" } else { "Back up now" }}
+            </button>
+            <span class="muted small">"The server also backs volumes up on a schedule (daily by default) and keeps the copies on its disk."</span>
+        </div>
+        <ErrorNote error=volumes.error/>
+        <Show when=move || volumes.loaded() fallback=Loading>
+            <div class="table-wrap">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>"Volume"</th>
+                            <th>"Mounted at"</th>
+                            <th class="num">"Size"</th>
+                            <th>"Last backup"</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <For each=move || volumes.data.get().unwrap_or_default()
+                            key=|v| (v.name.clone(), v.path.clone(), v.size, v.last_backup)
+                            let:v>
+                            {
+                                let export = format!("/api/apps/{}/volumes/{}/archive", v.app, v.name);
+                                let fallback = format!("{}-{}.tar.gz", v.app, v.name);
+                                let target = v.clone();
+                                view! {
+                                    <tr>
+                                        <td><code>{v.name.clone()}</code></td>
+                                        <td>{match v.path.clone() {
+                                            Some(p) => view! { <code>{p}</code> }.into_any(),
+                                            None => view! { <span class="muted">"not used any more"</span> }.into_any(),
+                                        }}</td>
+                                        <td class="num">{v.size.map(bytes).unwrap_or_else(|| "—".into())}</td>
+                                        <td class="muted">{v.last_backup.map(ago).unwrap_or_else(|| "never".into())}</td>
+                                        <td class="row-actions">
+                                            <button class="link-button"
+                                                on:click=move |_| download(export.clone(), fallback.clone())>"Download"</button>
+                                            <button class="link-button danger"
+                                                on:click=move |_| open_replace(target.clone())>"Replace…"</button>
+                                        </td>
+                                    </tr>
+                                }
+                            }
+                        </For>
+                    </tbody>
+                </table>
+            </div>
+        </Show>
+
+        <section class="app-backups">
+            <h2 class="section-title">"Backups"</h2>
+            <ErrorNote error=backups.error/>
+            <Show when=move || backups.data.with(|b| b.as_ref().is_some_and(|b| !b.is_empty()))
+                fallback=|| view! { <div class="empty"><p>"No backups yet."</p></div> }>
+                <div class="table-wrap">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>"Taken"</th>
+                                <th>"Volume"</th>
+                                <th class="num">"Size"</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <For each=move || backups.data.get().unwrap_or_default()
+                                key=|b| (b.volume.clone(), b.id)
+                                let:b>
+                                {
+                                    let path = format!("/api/backups/{}/{}/{}", b.app, b.volume, b.id);
+                                    let fallback = format!("{}-{}-{}.tar.gz", b.app, b.volume, b.id);
+                                    let target = b.clone();
+                                    view! {
+                                        <tr>
+                                            <td>
+                                                {format!("{} {}", date(b.id), clock(b.id))}
+                                                <span class="muted small">{format!(" · {}", ago(b.id))}</span>
+                                            </td>
+                                            <td><code>{b.volume.clone()}</code></td>
+                                            <td class="num">{bytes(b.size)}</td>
+                                            <td class="row-actions">
+                                                <button class="link-button"
+                                                    on:click=move |_| download(path.clone(), fallback.clone())>"Download"</button>
+                                                <button class="link-button danger" on:click=move |_| {
+                                                    restore_target.set(Some(target.clone()));
+                                                    restore_open.set(true);
+                                                }>"Restore…"</button>
+                                            </td>
+                                        </tr>
+                                    }
+                                }
+                            </For>
+                        </tbody>
+                    </table>
+                </div>
+            </Show>
+        </section>
+
+        <Modal open=replace_open title="Replace volume contents">
+            <p>
+                "The app is stopped, everything in "
+                <code>{move || replace_target.get().and_then(|v| v.path.or(Some(v.name))).unwrap_or_default()}</code>
+                " is replaced by the archive's files, then the app starts again. Download a copy first if you may need the current files."
+            </p>
+            <label class="field">
+                <span>"Archive (.tar or .tar.gz)"</span>
+                <input type="file" node_ref=file_input accept=".tar,.tar.gz,.tgz,application/gzip,application/x-tar"
+                    on:change=move |_| {
+                        let file = file_input.get().and_then(|el| el.files()).and_then(|f| f.get(0));
+                        replace_name.set(file.as_ref().map(|f| f.name()));
+                        replace_file.set_value(file);
+                    }/>
+            </label>
+            <div class="form-actions">
+                <button class="button" on:click=move |_| replace_open.set(false)>"Cancel"</button>
+                <button class="button button-danger"
+                    disabled=move || replacing.get() || replace_name.with(Option::is_none)
+                    on:click=replace>
+                    {move || if replacing.get() { "Replacing…" } else { "Replace" }}
+                </button>
+            </div>
+        </Modal>
+
+        <Modal open=restore_open title="Restore backup">
+            <p>
+                {move || restore_target.get().map(|b| format!(
+                    "Restore {} to its state of {} {}? The app is stopped and the volume's current files are replaced by this backup.",
+                    b.volume, date(b.id), clock(b.id)
+                ))}
+            </p>
+            <div class="form-actions">
+                <button class="button" on:click=move |_| restore_open.set(false)>"Cancel"</button>
+                <button class="button button-danger" on:click=restore>"Restore"</button>
+            </div>
+        </Modal>
+    }
+}
+
 // ---------------------------------------------------------------- settings
 
 #[component]
@@ -765,6 +1054,11 @@ fn SettingsTab(
     let form = SpecForm::from_spec(&app.spec);
     let error = RwSignal::new(None::<String>);
     let name = app.spec.name.clone();
+    // Volumes only follow the app to another node when asked to.
+    let old_node = StoredValue::new(app.spec.node.clone());
+    let had_volumes = !app.spec.volumes.is_empty();
+    let move_data = RwSignal::new(false);
+    let moving = move || had_volumes && form.node.with(|n| old_node.with_value(|o| n != o));
     let submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let spec = match form.to_spec() {
@@ -772,7 +1066,11 @@ fn SettingsTab(
             Err(e) => return error.set(Some(e)),
         };
         error.set(None);
-        let path = format!("/api/apps/{name}");
+        let path = if moving() && move_data.get_untracked() {
+            format!("/api/apps/{name}?move_data=true")
+        } else {
+            format!("/api/apps/{name}")
+        };
         let on_saved = on_saved.clone();
         run(
             "Settings saved",
@@ -783,6 +1081,20 @@ fn SettingsTab(
     view! {
         <form class="card form" on:submit=submit>
             <SpecFields form nodes=Signal::derive(move || nodes.data.get().unwrap_or_default()) editing=true/>
+            <Show when=moving>
+                <div class="note">
+                    <label class="check">
+                        <input type="checkbox" bind:checked=move_data/>
+                        "Copy its volumes to the new node"
+                    </label>
+                    <div class="small">
+                        {move || format!(
+                            "The app keeps data on {}. Its volumes are copied over, then deleted from {0}. Without this, the move is refused.",
+                            old_node.get_value()
+                        )}
+                    </div>
+                </div>
+            </Show>
             <ErrorNote error=error/>
             <div class="form-actions">
                 <button class="button button-primary" type="submit">"Save changes"</button>
@@ -794,7 +1106,7 @@ fn SettingsTab(
         <section class="card danger-zone">
             <div>
                 <h2 class="section-title">"Delete this app"</h2>
-                <p class="muted small">"Removes its container, image and variables."</p>
+                <p class="muted small">"Removes its container, image and variables. Its volumes are kept unless you choose otherwise."</p>
             </div>
             <button class="button button-danger" on:click=move |_| on_delete()>"Delete app…"</button>
         </section>
