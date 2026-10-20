@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use bollard::Docker;
@@ -36,6 +37,8 @@ const LABEL_APP: &str = "facade.app";
 const LABEL_RUN: &str = "facade.run";
 const LABEL_NODE: &str = "facade.node";
 const LABEL_VOLUME: &str = "facade.volume";
+/// How long a deployment waits for another program to free its ports.
+const PORT_WAIT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone)]
 pub struct Runtime(Arc<Inner>);
@@ -192,6 +195,9 @@ impl Runtime {
             Err(e) => return Err(e.into()),
         }
 
+        if log.is_deployment() {
+            self.wait_for_ports(w, log).await?;
+        }
         self.create(w, &image, &run_key).await?;
         self.start(&name).await?;
         log.line(format!("started {name} from {image}"));
@@ -323,6 +329,67 @@ impl Runtime {
                 result?;
                 Ok(tag)
             }
+        }
+    }
+
+    /// Waits until no other program holds the ports the app takes, so a service
+    /// being moved into facade keeps running while its replacement builds, and
+    /// the replacement starts as soon as the old one is stopped.
+    async fn wait_for_ports(&self, w: &Workload, log: &DeployLog) -> anyhow::Result<()> {
+        let wanted = w.spec.host_ports();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let mut last_said = None::<std::time::Instant>;
+        loop {
+            let (containers, published) = self.port_owners().await?;
+            let listeners =
+                tokio::task::spawn_blocking(move || super::ports::scan(&containers, &published))
+                    .await?;
+            let busy: Vec<String> = listeners
+                .iter()
+                .filter(|l| l.app.as_deref() != Some(w.spec.name.as_str()))
+                .filter(|l| {
+                    wanted
+                        .iter()
+                        .any(|p| p.protocol == l.protocol && p.contains(l.port))
+                })
+                .map(|l| {
+                    let holder = match (&l.app, &l.process, l.pid) {
+                        (Some(app), _, _) => format!("app {app}"),
+                        (None, Some(p), Some(pid)) => format!("{p} (pid {pid})"),
+                        _ => "another program".into(),
+                    };
+                    format!("{}/{} held by {holder}", l.port, l.protocol)
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if busy.is_empty() {
+                if last_said.is_some() {
+                    log.line("ports are free, starting");
+                }
+                return Ok(());
+            }
+            if started.elapsed() > PORT_WAIT {
+                bail!(
+                    "gave up after {} minutes waiting for {}",
+                    PORT_WAIT.as_secs() / 60,
+                    busy.join(", ")
+                );
+            }
+            if last_said.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
+                let message = format!(
+                    "built; waiting for {} (stop it and {} starts within a second)",
+                    busy.join(", "),
+                    w.spec.name
+                );
+                log.line(&message);
+                log.state_with(AppState::Pending, Some(message));
+                last_said = Some(std::time::Instant::now());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
