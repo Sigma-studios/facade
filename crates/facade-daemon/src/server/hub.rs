@@ -32,9 +32,12 @@ pub struct Hub {
     next_id: AtomicU64,
 }
 
+/// An agent's answer: an error, or data for requests that return some.
+type Answer = Result<Option<serde_json::Value>, String>;
+
 pub struct NodeConn {
     tx: mpsc::Sender<ServerMsg>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
 }
 
 impl Hub {
@@ -48,6 +51,27 @@ impl Hub {
 
     /// Sends a request and waits for the agent's acknowledgement.
     pub async fn request(&self, node: &str, req: AgentRequest) -> anyhow::Result<()> {
+        self.ask(node, req).await.map(drop)
+    }
+
+    /// Sends a request whose answer carries data, and decodes it.
+    pub async fn query<T: serde::de::DeserializeOwned>(
+        &self,
+        node: &str,
+        req: AgentRequest,
+    ) -> anyhow::Result<T> {
+        let data = self
+            .ask(node, req)
+            .await?
+            .ok_or_else(|| anyhow!("node {node} sent no answer (is its agent up to date?)"))?;
+        Ok(serde_json::from_value(data)?)
+    }
+
+    async fn ask(
+        &self,
+        node: &str,
+        req: AgentRequest,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
         let conn = self
             .connection(node)
             .ok_or_else(|| anyhow!("node {node} is offline"))?;
@@ -59,8 +83,8 @@ impl Hub {
             bail!("node {node} disconnected");
         }
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(None)) => Ok(()),
-            Ok(Ok(Some(error))) => Err(anyhow!(error)),
+            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Err(error))) => Err(anyhow!(error)),
             Ok(Err(_)) => Err(anyhow!("node {node} disconnected")),
             Err(_) => {
                 conn.pending.lock().remove(&id);
@@ -88,6 +112,55 @@ impl Hub {
         .await;
         self.tunnels.lock().remove(&tunnel);
         result
+    }
+
+    /// A stream of the volume as a gzipped tar.
+    pub async fn open_volume_export(
+        &self,
+        node: &str,
+        app: &str,
+        volume: &str,
+    ) -> anyhow::Result<DataStream> {
+        let (app, volume) = (app.to_string(), volume.to_string());
+        self.dial_back(node, |tunnel| AgentRequest::VolumeExport {
+            tunnel,
+            app,
+            volume,
+        })
+        .await
+    }
+
+    /// Replaces the volume's contents with the archive at `path`, waiting for the
+    /// agent to finish.
+    pub async fn import_volume(
+        &self,
+        node: &str,
+        app: &str,
+        volume: &str,
+        path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let (a, v) = (app.to_string(), volume.to_string());
+        let mut stream = self
+            .dial_back(node, |tunnel| AgentRequest::VolumeImport {
+                tunnel,
+                app: a,
+                volume: v,
+            })
+            .await?;
+        let mut file = tokio::fs::File::open(path).await?;
+        let size = file.metadata().await?.len();
+        stream.write_all(format!("{size}\n").as_bytes()).await?;
+        tokio::io::copy(&mut file, &mut stream).await?;
+        stream.flush().await?;
+        let answer = read_line_unbuffered(&mut stream)
+            .await
+            .context("the agent hung up while restoring")?;
+        match answer.split_once(' ') {
+            _ if answer == "ok" => Ok(()),
+            Some(("error", message)) => bail!("{message}"),
+            _ => bail!("unexpected answer from agent: {answer}"),
+        }
     }
 
     pub async fn open_logs(
@@ -271,9 +344,12 @@ async fn control(
                 .context("agent went silent")??;
             let Some(msg) = msg else { return Ok(()) };
             match msg {
-                AgentMsg::Response { id, error } => {
+                AgentMsg::Response { id, error, data } => {
                     if let Some(waiter) = conn.pending.lock().remove(&id) {
-                        let _ = waiter.send(error);
+                        let _ = waiter.send(match error {
+                            Some(e) => Err(e),
+                            None => Ok(data),
+                        });
                     }
                 }
                 AgentMsg::Pong => server.store.touch_node(&node)?,

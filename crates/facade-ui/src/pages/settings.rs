@@ -1,10 +1,11 @@
-use facade_core::api::{ApplyReport, ChangePassword};
+use facade_core::api::{ApplyReport, ChangePassword, CredentialView, SetCredential};
+use facade_core::proto::CredentialKind;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
-use crate::components::{CopyField, ErrorNote};
-use crate::util::{download, run, toasts};
+use crate::components::{CopyField, ErrorNote, Loading, Modal};
+use crate::util::{download, polled, run, toasts};
 
 #[component]
 pub fn Settings() -> impl IntoView {
@@ -12,6 +13,7 @@ pub fn Settings() -> impl IntoView {
         <div class="page page-narrow">
             <header class="page-head"><h1>"Settings"</h1></header>
             <Password/>
+            <Credentials/>
             <Export/>
             <Apply/>
         </div>
@@ -63,6 +65,140 @@ fn Password() -> impl IntoView {
                 </div>
             </form>
         </section>
+    }
+}
+
+#[component]
+fn Credentials() -> impl IntoView {
+    let list = polled(None, || async {
+        api::get::<Vec<CredentialView>>("/api/credentials").await
+    });
+    let kind = RwSignal::new("registry".to_string());
+    let host = RwSignal::new(String::new());
+    let username = RwSignal::new(String::new());
+    let secret = RwSignal::new(String::new());
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let path = format!(
+            "/api/credentials/{}/{}",
+            kind.get_untracked(),
+            host.get_untracked().trim().to_lowercase()
+        );
+        let body = SetCredential {
+            username: username.get_untracked().trim().to_string(),
+            secret: secret.get_untracked(),
+        };
+        run(
+            "Login saved",
+            async move { api::put_empty(&path, &body).await },
+            move || {
+                host.set(String::new());
+                username.set(String::new());
+                secret.set(String::new());
+                list.reload();
+            },
+        );
+    };
+    let remove_open = RwSignal::new(false);
+    let remove_target = RwSignal::new(None::<CredentialView>);
+    let remove = move |_| {
+        let Some(c) = remove_target.get_untracked() else {
+            return;
+        };
+        run(
+            format!("Login for {} removed", c.host),
+            async move { api::delete(&format!("/api/credentials/{}/{}", c.kind, c.host)).await },
+            move || {
+                remove_open.set(false);
+                list.reload();
+            },
+        );
+    };
+    view! {
+        <section class="card form">
+            <h2 class="section-title">"Registry & git logins"</h2>
+            <p class="muted small">
+                "Registry logins are used to pull private images and the images a Dockerfile's FROM names "
+                "(e.g. ghcr.io, with a token that can read packages). Git logins are used to clone private "
+                "repositories over HTTPS (e.g. github.com, with a token that can read the repository)."
+            </p>
+            <ErrorNote error=list.error/>
+            <Show when=move || list.loaded() fallback=Loading>
+                <Show when=move || list.data.with(|l| l.as_ref().is_some_and(|l| !l.is_empty()))
+                    fallback=|| view! { <p class="muted small">"No logins yet."</p> }>
+                    <div class="table-wrap">
+                        <table class="table">
+                            <thead><tr><th>"Kind"</th><th>"Host"</th><th>"Username"</th><th></th></tr></thead>
+                            <tbody>
+                                <For each=move || list.data.get().unwrap_or_default()
+                                    key=|c| (c.kind, c.host.clone(), c.username.clone())
+                                    let:c>
+                                    {
+                                        let target = c.clone();
+                                        view! {
+                                            <tr>
+                                                <td>{c.kind.to_string()}</td>
+                                                <td><code>{c.host.clone()}</code></td>
+                                                <td>{c.username.clone()}</td>
+                                                <td class="row-actions">
+                                                    <button class="link-button danger" on:click=move |_| {
+                                                        remove_target.set(Some(target.clone()));
+                                                        remove_open.set(true);
+                                                    }>"Remove"</button>
+                                                </td>
+                                            </tr>
+                                        }
+                                    }
+                                </For>
+                            </tbody>
+                        </table>
+                    </div>
+                </Show>
+            </Show>
+            <form class="form" on:submit=submit>
+                <div class="form-row">
+                    <label class="field">
+                        <span>"Kind"</span>
+                        <select on:change=move |ev| kind.set(event_target_value(&ev)) prop:value=move || kind.get()>
+                            <option value=CredentialKind::Registry.to_string()>"Registry"</option>
+                            <option value=CredentialKind::Git.to_string()>"Git"</option>
+                        </select>
+                    </label>
+                    <label class="field">
+                        <span>"Host"</span>
+                        <input type="text" bind:value=host required autocomplete="off"
+                            placeholder=move || if kind.get() == "git" { "github.com" } else { "ghcr.io" }/>
+                    </label>
+                </div>
+                <div class="form-row">
+                    <label class="field">
+                        <span>"Username"</span>
+                        <input type="text" bind:value=username required autocomplete="off"/>
+                    </label>
+                    <label class="field">
+                        <span>"Token"</span>
+                        <input type="password" bind:value=secret required autocomplete="new-password"/>
+                        <small>"Or password. Stored encrypted, never shown again."</small>
+                    </label>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="button button-primary">"Save login"</button>
+                </div>
+            </form>
+        </section>
+
+        <Modal open=remove_open title="Remove login">
+            <p>
+                {move || remove_target.get().map(|c| format!(
+                    "Remove the {} login for {}? Pulls and clones that need it will fail.",
+                    c.kind, c.host
+                ))}
+            </p>
+            <div class="form-actions">
+                <button class="button" on:click=move |_| remove_open.set(false)>"Cancel"</button>
+                <button class="button button-danger" on:click=remove>"Remove"</button>
+            </div>
+        </Modal>
     }
 }
 

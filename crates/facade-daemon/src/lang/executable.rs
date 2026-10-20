@@ -22,15 +22,14 @@ pub fn elf_arch(header: &[u8]) -> Result<&'static str, String> {
 }
 
 /// Runs the executable in a small, recent Debian (glibc 2.41), so binaries linked
-/// against glibc work as well as static ones.
-pub fn dockerfile(filename: &str, args: &[String]) -> String {
-    let cmd = serde_json::to_string(args).expect("strings serialize");
+/// against glibc work as well as static ones. Its arguments are the app's `args`,
+/// given when the container is created, so changing them needs no rebuild.
+pub fn dockerfile(filename: &str) -> String {
     format!(
-        r#"FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+        r#"FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
 COPY --chmod=755 app /usr/local/bin/{filename}
 ENTRYPOINT ["/usr/local/bin/{filename}"]
-CMD {cmd}
 "#
     )
 }

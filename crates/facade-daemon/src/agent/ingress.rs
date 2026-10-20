@@ -4,6 +4,10 @@
 //!
 //! Certificates and ACME HTTP-01 answers come from the server. They are kept on
 //! disk too, so apps stay reachable over HTTPS while the server is away.
+//!
+//! An address that is taken (another web server on 80/443) is retried every few
+//! seconds and reported to the server, so facade takes over as soon as the other
+//! program stops.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -123,26 +127,14 @@ pub async fn run(agent: Arc<Agent>, options: IngressOptions) {
         .pool_idle_timeout(Duration::from_secs(60))
         .build(HttpConnector::new());
     let ingress = Arc::new(Ingress { agent, client });
-
-    if let Some(addr) = options.http {
-        match TcpListener::bind(addr).await {
-            Ok(listener) => {
-                info!("serving http://{addr}");
-                tokio::spawn(ingress.clone().accept(listener, false));
-            }
-            Err(e) => warn!("cannot listen on {addr}: {e} (apps will not be reachable over HTTP)"),
-        }
-    }
-    if let Some(addr) = options.https {
-        match TcpListener::bind(addr).await {
-            Ok(listener) => {
-                info!("serving https://{addr}");
-                tokio::spawn(ingress.accept(listener, true));
-            }
-            Err(e) => warn!("cannot listen on {addr}: {e} (apps will not be reachable over HTTPS)"),
+    for (addr, tls) in [(options.http, false), (options.https, true)] {
+        if let Some(addr) = addr {
+            tokio::spawn(ingress.clone().listen(addr, tls));
         }
     }
 }
+
+const BIND_RETRY: Duration = Duration::from_secs(5);
 
 struct Ingress {
     agent: Arc<Agent>,
@@ -155,6 +147,31 @@ enum Target {
 }
 
 impl Ingress {
+    /// Binds `addr`, retrying while another program holds it.
+    async fn listen(self: Arc<Self>, addr: SocketAddr, tls: bool) {
+        let scheme = if tls { "https" } else { "http" };
+        let mut warned = false;
+        let listener = loop {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => break listener,
+                Err(e) => {
+                    let message = format!("cannot listen on {addr} ({scheme}): {e}");
+                    if !warned {
+                        warn!(
+                            "{message}; apps are not reachable over {scheme} until it is free, retrying"
+                        );
+                        warned = true;
+                    }
+                    self.agent.ingress_errors.lock().insert(addr, message);
+                    tokio::time::sleep(BIND_RETRY).await;
+                }
+            }
+        };
+        self.agent.ingress_errors.lock().remove(&addr);
+        info!("serving {scheme}://{addr}");
+        self.accept(listener, tls).await;
+    }
+
     async fn accept(self: Arc<Self>, listener: TcpListener, tls: bool) {
         let acceptor = tls.then(|| {
             let mut config = rustls::ServerConfig::builder()
@@ -218,6 +235,20 @@ impl Ingress {
                 None => text(StatusCode::NOT_FOUND, "unknown challenge"),
             };
         }
+        if let Some(main) = self.redirect_for(&host) {
+            let scheme = if tls || self.agent.certs.find(&main).is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            return redirect(format!(
+                "{scheme}://{main}{}",
+                req.uri()
+                    .path_and_query()
+                    .map(|p| p.as_str())
+                    .unwrap_or("/")
+            ));
+        }
         if !tls && self.agent.certs.find(&host).is_some() {
             let target = format!(
                 "https://{host}{}",
@@ -226,11 +257,7 @@ impl Ingress {
                     .map(|p| p.as_str())
                     .unwrap_or("/")
             );
-            return Response::builder()
-                .status(StatusCode::PERMANENT_REDIRECT)
-                .header(header::LOCATION, target)
-                .body(Body::empty())
-                .expect("valid response");
+            return redirect(target);
         }
 
         let proxy = routing
@@ -263,6 +290,16 @@ impl Ingress {
                 format!("{name} is unavailable right now\n"),
             )
         })
+    }
+
+    /// The main domain `host` redirects to, if it is one of an app's redirects.
+    fn redirect_for(&self, host: &str) -> Option<String> {
+        self.agent
+            .workloads
+            .lock()
+            .values()
+            .find(|w| w.spec.enabled && w.spec.redirects.iter().any(|d| d == host))
+            .and_then(|w| w.spec.domains.first().cloned())
     }
 
     fn workload_for(&self, host: &str) -> Option<Workload> {
@@ -355,6 +392,14 @@ async fn serve_static(req: Request<Incoming>, root: PathBuf) -> anyhow::Result<R
         .not_found_service(not_found);
     let response = service.oneshot(req).await?;
     Ok(response.map(Body::new))
+}
+
+fn redirect(location: String) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::PERMANENT_REDIRECT)
+        .header(header::LOCATION, location)
+        .body(Body::empty())
+        .expect("valid response")
 }
 
 fn text(status: StatusCode, body: impl Into<String>) -> Response<Body> {

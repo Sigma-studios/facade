@@ -1,5 +1,5 @@
-//! The HTTP API used by the CLI (and later the web UI). Served on `api_listen` with
-//! the server's pinned certificate, and on `api_domain` through the ingress.
+//! The HTTP API used by the CLI and the web UI. Served on `api_listen` with the
+//! server's pinned certificate, and on `api_domain` through the ingress.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,8 +18,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use facade_core::api::*;
 use facade_core::manifest::{AppManifest, EnvEntry, Manifest, NodeDecl};
-use facade_core::proto::{AgentRequest, AppState};
-use facade_core::{AppSpec, validate_name};
+use facade_core::proto::{AgentRequest, AppState, CredentialKind, Listener, VolumeInfo};
+use facade_core::{AppSpec, PortMap, Protocol, validate_name};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -50,6 +50,30 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/nodes/{name}/token", post(rotate_node_token))
         .route("/api/nodes/{name}/metrics", get(node_metrics))
         .route("/api/nodes/{name}/ip", put(set_node_ip))
+        .route("/api/nodes/{name}/ports", get(node_ports))
+        .route(
+            "/api/nodes/{name}/volumes/{app}",
+            axum::routing::delete(delete_leftover_volumes),
+        )
+        .route("/api/credentials", get(list_credentials))
+        .route(
+            "/api/credentials/{kind}/{host}",
+            put(set_credential).delete(delete_credential),
+        )
+        .route("/api/volumes", get(list_volumes))
+        .route(
+            "/api/apps/{name}/volumes/{volume}/archive",
+            get(export_volume)
+                .put(import_volume)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route("/api/backups", get(list_backups).post(run_backups))
+        .route("/api/backups/{app}/{volume}/{id}", get(download_backup))
+        .route(
+            "/api/backups/{app}/{volume}/{id}/restore",
+            post(restore_backup),
+        )
+        .route("/api/server-backup", get(server_backup))
         .route("/api/dns", get(dns_settings).put(update_dns))
         .route("/api/domains", get(domains))
         .route("/api/apps", get(list_apps).post(create_app))
@@ -285,7 +309,14 @@ fn node_views(server: &Server) -> anyhow::Result<Vec<NodeView>> {
         .into_iter()
         .map(|n| {
             let conn = server.hub.connection(&n.name);
+            let ingress_errors = live
+                .nodes
+                .get(&n.name)
+                .filter(|_| conn.is_some())
+                .map(|l| l.ingress_errors.clone())
+                .unwrap_or_default();
             NodeView {
+                ingress_errors,
                 public_ip_manual: n.public_ip.is_some(),
                 public_ip: server.node_ip(&n.name),
                 connected: conn.is_some(),
@@ -543,18 +574,122 @@ fn check_spec(server: &Server, spec: &AppSpec) -> ApiResult<()> {
     if !server.store.node_exists(&spec.node)? {
         return Err(bad_request(format!("no node named {}", spec.node)));
     }
-    let routes = server.routes.read();
-    for domain in &spec.domains {
-        if server.cfg.api_domain.as_deref() == Some(domain.as_str()) {
-            return Err(conflict(format!("{domain} is the API domain")));
-        }
-        if let Some(owner) = routes.domains.get(domain)
-            && *owner != spec.name
-        {
-            return Err(conflict(format!("{domain} is already used by {owner}")));
+    {
+        let routes = server.routes.read();
+        for domain in spec.domains.iter().chain(&spec.redirects) {
+            if server.cfg.api_domain.as_deref() == Some(domain.as_str()) {
+                return Err(conflict(format!("{domain} is the API domain")));
+            }
+            if let Some(owner) = routes.domains.get(domain)
+                && *owner != spec.name
+            {
+                return Err(conflict(format!("{domain} is already used by {owner}")));
+            }
         }
     }
+    // A deployed, enabled app restarts with the change: the ports must be free now.
+    let starts = spec.enabled
+        && server
+            .store
+            .get_app(&spec.name)?
+            .is_some_and(|row| row.revision > 0);
+    if let Some(problem) = port_conflict(server, spec, starts)? {
+        return Err(conflict(problem));
+    }
     Ok(())
+}
+
+/// Ports `spec` takes on its node's network: its published ports, or on the host
+/// network the ports it declares and its HTTP port.
+fn host_ports(spec: &AppSpec) -> Vec<PortMap> {
+    let mut out = spec.ports.clone();
+    if spec.host_network
+        && let Some(port) = spec.http_port
+    {
+        out.push(PortMap {
+            host: port,
+            container: port,
+            count: 1,
+            protocol: Protocol::Tcp,
+        });
+    }
+    out
+}
+
+/// Why `spec` cannot have its ports on its node: another app of the node declares
+/// them, or (with `listening`) something is listening on them right now. A port
+/// held by the app itself is fine.
+fn port_conflict(
+    server: &Server,
+    spec: &AppSpec,
+    listening: bool,
+) -> anyhow::Result<Option<String>> {
+    let wanted = host_ports(spec);
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    for other in server.store.list_apps()? {
+        let other = other.spec;
+        if other.name == spec.name || other.node != spec.node {
+            continue;
+        }
+        for a in &wanted {
+            if let Some(b) = host_ports(&other)
+                .iter()
+                .find(|b| a.protocol == b.protocol && a.overlaps(b))
+            {
+                return Ok(Some(format!(
+                    "{a} overlaps {b}, which app {} uses on node {}",
+                    other.name, spec.node
+                )));
+            }
+        }
+    }
+    if !listening {
+        return Ok(None);
+    }
+    let live = server.live.read();
+    let Some(node) = live.nodes.get(&spec.node) else {
+        return Ok(None);
+    };
+    for l in &node.listeners {
+        if l.app.as_deref() == Some(spec.name.as_str()) {
+            continue;
+        }
+        if wanted
+            .iter()
+            .any(|w| w.protocol == l.protocol && w.contains(l.port))
+        {
+            return Ok(Some(format!(
+                "port {}/{} is in use on node {} by {} (listening on {}); stop it first, or see `facade node ports {}`",
+                l.port,
+                l.protocol,
+                spec.node,
+                holder(l),
+                l.address,
+                spec.node
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn holder(l: &Listener) -> String {
+    match (&l.app, &l.process, l.pid) {
+        (Some(app), _, _) if app == "facade" => "facade itself".into(),
+        (Some(app), _, _) => format!("app {app}"),
+        (None, Some(process), Some(pid)) => format!("{process} (pid {pid})"),
+        (None, Some(process), None) => process.clone(),
+        _ => "another program".into(),
+    }
+}
+
+/// Before (re)starting an app by hand: its ports must be free.
+fn check_ports_free(server: &Server, spec: &AppSpec) -> ApiResult<()> {
+    match port_conflict(server, spec, true)? {
+        Some(problem) => Err(conflict(problem)),
+        None => Ok(()),
+    }
 }
 
 async fn list_apps(State(server): S, _: User) -> ApiResult<Json<Vec<AppView>>> {
@@ -581,10 +716,18 @@ async fn create_app(
     Ok((StatusCode::CREATED, Json(app_view(&server, spec, 0))))
 }
 
+#[derive(Deserialize)]
+struct UpdateQuery {
+    /// Copy the app's volumes when it moves to another node.
+    #[serde(default)]
+    move_data: bool,
+}
+
 async fn update_app(
     State(server): S,
     _: User,
     Path(name): Path<String>,
+    Query(q): Query<UpdateQuery>,
     Json(spec): Json<AppSpec>,
 ) -> ApiResult<Json<AppView>> {
     if spec.name != name {
@@ -592,21 +735,40 @@ async fn update_app(
     }
     let old = load_app(&server, &name)?;
     check_spec(&server, &spec)?;
-    save_spec(&server, &old.spec, &spec).await?;
+    save_spec(&server, &old.spec, &spec, q.move_data).await?;
     Ok(Json(app_view(&server, spec, old.revision)))
 }
 
-/// Stores a changed spec and moves the app between nodes if needed.
-async fn save_spec(server: &Server, old: &AppSpec, new: &AppSpec) -> ApiResult<()> {
+/// Stores a changed spec and moves the app between nodes if needed. An app with
+/// volumes only moves with `move_data`: its data is copied to the new node first,
+/// and deleted from the old one once the copy succeeded.
+async fn save_spec(
+    server: &Server,
+    old: &AppSpec,
+    new: &AppSpec,
+    move_data: bool,
+) -> ApiResult<()> {
+    let moving = old.node != new.node;
+    let copied = moving && !old.volumes.is_empty();
+    if copied {
+        if !move_data {
+            return Err(conflict(format!(
+                "{} keeps data in volumes on {}: move it with --move-data (copies the volumes to {}, then deletes them from {})",
+                new.name, old.node, new.node, old.node
+            )));
+        }
+        move_volumes(server, old, new).await?;
+    }
     server.store.put_app(new)?;
     server.refresh_routes()?;
-    if old.node != new.node && server.hub.is_connected(&old.node) {
+    if moving && !copied && server.hub.is_connected(&old.node) {
         server
             .hub
             .request(
                 &old.node,
                 AgentRequest::Remove {
                     app: new.name.clone(),
+                    delete_volumes: false,
                 },
             )
             .await
@@ -618,14 +780,120 @@ async fn save_spec(server: &Server, old: &AppSpec, new: &AppSpec) -> ApiResult<(
     Ok(())
 }
 
-async fn delete_app(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<StatusCode> {
+/// Stops the app on its old node and copies each volume it keeps to the new one.
+/// On failure the app is started again where it was.
+async fn move_volumes(server: &Server, old: &AppSpec, new: &AppSpec) -> ApiResult<()> {
+    for node in [&old.node, &new.node] {
+        if !server.hub.is_connected(node) {
+            return Err(unavailable(format!(
+                "node {node} is offline: both nodes must be connected to move data"
+            )));
+        }
+    }
+    let app = &new.name;
+    server
+        .hub
+        .request(
+            &old.node,
+            AgentRequest::Remove {
+                app: app.clone(),
+                delete_volumes: false,
+            },
+        )
+        .await
+        .map_err(|e| unavailable(format!("stopping {app} on {}: {e:#}", old.node)))?;
+    let result: anyhow::Result<()> = async {
+        for volume in old
+            .volumes
+            .iter()
+            .filter(|v| new.volumes.iter().any(|n| n.name == v.name))
+        {
+            info!(%app, volume = %volume.name, from = %old.node, to = %new.node, "copying volume");
+            let tmp = scratch_path(server)?;
+            let copied = async {
+                let mut stream = server
+                    .hub
+                    .open_volume_export(&old.node, app, &volume.name)
+                    .await?;
+                let mut file = tls::private_file(&tmp).await?;
+                tokio::io::copy(&mut stream, &mut file).await?;
+                file.sync_all().await?;
+                server
+                    .hub
+                    .import_volume(&new.node, app, &volume.name, &tmp)
+                    .await
+            }
+            .await;
+            let _ = tokio::fs::remove_file(&tmp).await;
+            copied.with_context(|| format!("copying volume {}", volume.name))?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        // Back where it was, untouched.
+        if let Err(again) = server.push(app).await {
+            warn!(%app, "restarting on {} after a failed move: {again:#}", old.node);
+        }
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            format!("{e:#}; {app} stays on {}", old.node),
+        ));
+    }
+    if let Err(e) = server
+        .hub
+        .request(
+            &old.node,
+            AgentRequest::Remove {
+                app: app.clone(),
+                delete_volumes: true,
+            },
+        )
+        .await
+    {
+        warn!(%app, "deleting the moved volumes from {}: {e:#}", old.node);
+    }
+    Ok(())
+}
+
+/// A fresh temporary file path on the server.
+fn scratch_path(server: &Server) -> anyhow::Result<std::path::PathBuf> {
+    let dir = server.cfg.data_dir.join("tmp");
+    tls::create_private_dir(&dir)?;
+    Ok(dir.join(Uuid::new_v4().to_string()))
+}
+
+#[derive(Deserialize)]
+struct DeleteQuery {
+    /// Also delete the app's volumes. Without it they stay on the node.
+    #[serde(default)]
+    delete_data: bool,
+}
+
+async fn delete_app(
+    State(server): S,
+    _: User,
+    Path(name): Path<String>,
+    Query(q): Query<DeleteQuery>,
+) -> ApiResult<StatusCode> {
     let row = load_app(&server, &name)?;
     if server.hub.is_connected(&row.spec.node) {
         server
             .hub
-            .request(&row.spec.node, AgentRequest::Remove { app: name.clone() })
+            .request(
+                &row.spec.node,
+                AgentRequest::Remove {
+                    app: name.clone(),
+                    delete_volumes: q.delete_data,
+                },
+            )
             .await
             .map_err(|e| unavailable(format!("{e:#}")))?;
+    } else if q.delete_data && !row.spec.volumes.is_empty() {
+        return Err(unavailable(format!(
+            "node {} is offline: its volumes cannot be deleted now",
+            row.spec.node
+        )));
     }
     // An offline node drops the app when it reconnects and syncs.
     server.store.delete_app(&name)?;
@@ -643,6 +911,7 @@ async fn deploy_app(
     if !server.hub.is_connected(&row.spec.node) {
         return Err(unavailable(format!("node {} is offline", row.spec.node)));
     }
+    check_ports_free(&server, &row.spec)?;
     let revision = server.store.bump_revision(&name)?;
     let id = Uuid::new_v4();
     server.store.create_deployment(id, &name, revision)?;
@@ -685,7 +954,10 @@ async fn set_enabled(server: &Server, name: &str, enabled: bool) -> ApiResult<St
     let row = load_app(server, name)?;
     let mut spec = row.spec.clone();
     spec.enabled = enabled;
-    save_spec(server, &row.spec, &spec).await?;
+    if enabled && !row.spec.enabled {
+        check_ports_free(server, &spec)?;
+    }
+    save_spec(server, &row.spec, &spec, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -892,7 +1164,7 @@ async fn apply(State(server): S, _: User, body: String) -> ApiResult<Json<ApplyR
     {
         let mut seen = std::collections::HashMap::new();
         for app in &manifest.apps {
-            for domain in &app.spec.domains {
+            for domain in app.spec.domains.iter().chain(&app.spec.redirects) {
                 if let Some(other) = seen.insert(domain.clone(), app.spec.name.clone()) {
                     return Err(conflict(format!(
                         "{domain} is claimed by both {other} and {}",
@@ -968,7 +1240,7 @@ async fn apply(State(server): S, _: User, body: String) -> ApiResult<Json<ApplyR
                 report.created.push(name);
             }
             Some(old) if changed => {
-                save_spec(&server, &old.spec, &app.spec).await?;
+                save_spec(&server, &old.spec, &app.spec, false).await?;
                 report.updated.push(name);
             }
             Some(_) => report.unchanged.push(name),
@@ -991,17 +1263,397 @@ fn check_spec_for_apply(
             spec.name, spec.node
         )));
     }
-    let routes = server.routes.read();
-    for domain in &spec.domains {
-        if server.cfg.api_domain.as_deref() == Some(domain.as_str()) {
-            return Err(conflict(format!("{domain} is the API domain")));
-        }
-        if let Some(owner) = routes.domains.get(domain)
-            && *owner != spec.name
-            && !manifest_apps.contains(owner.as_str())
-        {
-            return Err(conflict(format!("{domain} is already used by {owner}")));
+    {
+        let routes = server.routes.read();
+        for domain in spec.domains.iter().chain(&spec.redirects) {
+            if server.cfg.api_domain.as_deref() == Some(domain.as_str()) {
+                return Err(conflict(format!("{domain} is the API domain")));
+            }
+            if let Some(owner) = routes.domains.get(domain)
+                && *owner != spec.name
+                && !manifest_apps.contains(owner.as_str())
+            {
+                return Err(conflict(format!("{domain} is already used by {owner}")));
+            }
         }
     }
+    let starts = spec.enabled
+        && server
+            .store
+            .get_app(&spec.name)?
+            .is_some_and(|row| row.revision > 0);
+    if let Some(problem) = port_conflict(server, spec, starts)? {
+        return Err(conflict(format!("{}: {problem}", spec.name)));
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------- node ports
+
+async fn node_ports(
+    State(server): S,
+    _: User,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Vec<Listener>>> {
+    if !server.store.node_exists(&name)? {
+        return Err(not_found(format!("no node named {name}")));
+    }
+    if !server.hub.is_connected(&name) {
+        return Err(unavailable(format!("node {name} is offline")));
+    }
+    let live = server.live.read();
+    Ok(Json(
+        live.nodes
+            .get(&name)
+            .map(|n| n.listeners.clone())
+            .unwrap_or_default(),
+    ))
+}
+
+// ---------------------------------------------------------------- credentials
+
+fn parse_kind(kind: &str) -> ApiResult<CredentialKind> {
+    match kind {
+        "registry" => Ok(CredentialKind::Registry),
+        "git" => Ok(CredentialKind::Git),
+        other => Err(bad_request(format!(
+            "unknown credential kind `{other}` (registry or git)"
+        ))),
+    }
+}
+
+fn valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || ".-:".contains(c))
+        && !host.starts_with(['-', '.'])
+}
+
+async fn list_credentials(State(server): S, _: User) -> ApiResult<Json<Vec<CredentialView>>> {
+    Ok(Json(
+        server
+            .store
+            .list_credentials()?
+            .into_iter()
+            .map(|c| CredentialView {
+                kind: c.kind,
+                host: c.host,
+                username: c.username,
+            })
+            .collect(),
+    ))
+}
+
+async fn set_credential(
+    State(server): S,
+    _: User,
+    Path((kind, host)): Path<(String, String)>,
+    Json(req): Json<SetCredential>,
+) -> ApiResult<StatusCode> {
+    let kind = parse_kind(&kind)?;
+    let host = host.trim().to_ascii_lowercase();
+    if !valid_host(&host) {
+        return Err(bad_request(format!(
+            "`{host}` is not a host name like ghcr.io or github.com"
+        )));
+    }
+    if req.username.trim().is_empty() || req.secret.is_empty() {
+        return Err(bad_request("a username and a token are required"));
+    }
+    server.store.put_credential(
+        kind,
+        &host,
+        req.username.trim(),
+        &server.secrets.seal(req.secret.as_bytes()),
+    )?;
+    info!(%kind, %host, "login saved");
+    resync_nodes(&server).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_credential(
+    State(server): S,
+    _: User,
+    Path((kind, host)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    let kind = parse_kind(&kind)?;
+    if !server
+        .store
+        .delete_credential(kind, &host.to_ascii_lowercase())?
+    {
+        return Err(not_found(format!("no {kind} login for {host}")));
+    }
+    resync_nodes(&server).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sends every connected node its workloads again (with current credentials).
+/// Running containers are not restarted by this.
+async fn resync_nodes(server: &Server) {
+    let Ok(nodes) = server.store.list_nodes() else {
+        return;
+    };
+    for node in nodes {
+        if !server.hub.is_connected(&node.name) {
+            continue;
+        }
+        let result = match server.node_workloads(&node.name) {
+            Ok(workloads) => {
+                server
+                    .hub
+                    .request(&node.name, AgentRequest::Sync { workloads })
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            warn!(node = %node.name, "resync failed: {e:#}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- volumes
+
+async fn list_volumes(State(server): S, _: User) -> ApiResult<Json<Vec<VolumeView>>> {
+    let apps = server.store.list_apps()?;
+    let backups = super::backups::list(&server, None)?;
+    let last_backup = |app: &str, volume: &str| {
+        backups
+            .iter()
+            .filter(|b| b.app == app && b.volume == volume)
+            .map(|b| b.id)
+            .max()
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for node in server.store.list_nodes()? {
+        if !server.hub.is_connected(&node.name) {
+            continue;
+        }
+        let found: Vec<VolumeInfo> = match server.hub.query(&node.name, AgentRequest::Volumes).await
+        {
+            Ok(found) => found,
+            Err(e) => {
+                warn!(node = %node.name, "listing volumes: {e:#}");
+                continue;
+            }
+        };
+        for v in found {
+            let path = apps
+                .iter()
+                .find(|a| a.spec.name == v.app && a.spec.node == node.name)
+                .and_then(|a| a.spec.volumes.iter().find(|d| d.name == v.name))
+                .map(|d| d.path.clone());
+            seen.insert((v.app.clone(), v.name.clone()));
+            out.push(VolumeView {
+                last_backup: last_backup(&v.app, &v.name),
+                app: v.app,
+                name: v.name,
+                node: node.name.clone(),
+                path,
+                size: v.size,
+            });
+        }
+    }
+    // Declared but not created yet (never deployed), or on an offline node.
+    for app in &apps {
+        for v in &app.spec.volumes {
+            if !seen.contains(&(app.spec.name.clone(), v.name.clone())) {
+                out.push(VolumeView {
+                    app: app.spec.name.clone(),
+                    name: v.name.clone(),
+                    node: app.spec.node.clone(),
+                    path: Some(v.path.clone()),
+                    size: None,
+                    last_backup: last_backup(&app.spec.name, &v.name),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.app, &a.name).cmp(&(&b.app, &b.name)));
+    Ok(Json(out))
+}
+
+/// The node an app's declared volume lives on.
+fn volume_node(server: &Server, app: &str, volume: &str) -> ApiResult<String> {
+    let row = load_app(server, app)?;
+    if !row.spec.volumes.iter().any(|v| v.name == volume) {
+        return Err(not_found(format!("{app} has no volume named {volume}")));
+    }
+    if !server.hub.is_connected(&row.spec.node) {
+        return Err(unavailable(format!("node {} is offline", row.spec.node)));
+    }
+    Ok(row.spec.node)
+}
+
+async fn export_volume(
+    State(server): S,
+    _: User,
+    Path((app, volume)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let node = volume_node(&server, &app, &volume)?;
+    let stream = server
+        .hub
+        .open_volume_export(&node, &app, &volume)
+        .await
+        .map_err(|e| unavailable(format!("{e:#}")))?;
+    let filename = format!("{app}-{volume}-{}.tar.gz", facade_core::now());
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        Body::from_stream(tokio_util::io::ReaderStream::new(stream)),
+    )
+        .into_response())
+}
+
+/// Replaces a volume's contents with the uploaded tar (gzipped or not). The app is
+/// stopped while its files are replaced, then started again.
+async fn import_volume(
+    State(server): S,
+    _: User,
+    Path((app, volume)): Path<(String, String)>,
+    body: Body,
+) -> ApiResult<StatusCode> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let node = volume_node(&server, &app, &volume)?;
+    let tmp = scratch_path(&server)?;
+    let result = async {
+        let mut file = tls::private_file(&tmp).await?;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            file.write_all(&chunk?).await?;
+        }
+        file.sync_all().await?;
+        server.hub.import_volume(&node, &app, &volume, &tmp).await
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    result.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    info!(%app, %volume, "volume replaced from an upload");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes the volumes an app left on a node it no longer runs on (after `app rm`
+/// without `--delete-data`, or a move while the old node was offline).
+async fn delete_leftover_volumes(
+    State(server): S,
+    _: User,
+    Path((node, app)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    if let Some(row) = server.store.get_app(&app)?
+        && row.spec.node == node
+    {
+        return Err(conflict(format!(
+            "{app} still runs on {node}: delete the app with `facade app rm {app} --delete-data`"
+        )));
+    }
+    if !server.hub.is_connected(&node) {
+        return Err(unavailable(format!("node {node} is offline")));
+    }
+    server
+        .hub
+        .request(
+            &node,
+            AgentRequest::Remove {
+                app,
+                delete_volumes: true,
+            },
+        )
+        .await
+        .map_err(|e| unavailable(format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------- backups
+
+#[derive(Deserialize)]
+struct BackupQuery {
+    app: Option<String>,
+}
+
+async fn list_backups(
+    State(server): S,
+    _: User,
+    Query(q): Query<BackupQuery>,
+) -> ApiResult<Json<Vec<BackupView>>> {
+    Ok(Json(super::backups::list(&server, q.app.as_deref())?))
+}
+
+async fn run_backups(
+    State(server): S,
+    _: User,
+    Json(req): Json<BackupRequest>,
+) -> ApiResult<Json<BackupReport>> {
+    if let Some(app) = &req.app {
+        let row = load_app(&server, app)?;
+        if row.spec.volumes.is_empty() {
+            return Err(bad_request(format!("{app} has no volumes")));
+        }
+    }
+    Ok(Json(
+        super::backups::backup_all(&server, req.app.as_deref()).await,
+    ))
+}
+
+async fn download_backup(
+    State(server): S,
+    _: User,
+    Path((app, volume, id)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    let path = super::backups::path(&server, &app, &volume, id).map_err(not_found)?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .context("opening backup")?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{app}-{volume}-{id}.tar.gz\""),
+            ),
+        ],
+        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+    )
+        .into_response())
+}
+
+async fn restore_backup(
+    State(server): S,
+    _: User,
+    Path((app, volume, id)): Path<(String, String, u64)>,
+) -> ApiResult<StatusCode> {
+    volume_node(&server, &app, &volume)?;
+    super::backups::restore(&server, &app, &volume, id)
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    info!(%app, %volume, id, "volume restored from backup");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A fresh copy of the server's database and master key, as a gzipped tar. With
+/// both, `apply` is not even needed: put them in a new data_dir and start.
+async fn server_backup(State(server): S, _: User) -> ApiResult<Response> {
+    let bytes = super::backups::server_archive(&server).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"facade-server-{}.tar.gz\"",
+                    facade_core::now()
+                ),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }

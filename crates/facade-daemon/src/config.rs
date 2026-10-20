@@ -28,6 +28,7 @@ pub struct ServerConfig {
     /// Serve the API on this domain through the ingress too, with a real certificate.
     pub api_domain: Option<String>,
     pub acme: AcmeConfig,
+    pub backups: BackupConfig,
 }
 
 impl Default for ServerConfig {
@@ -43,6 +44,7 @@ impl Default for ServerConfig {
             local_node: "main".into(),
             api_domain: None,
             acme: AcmeConfig::default(),
+            backups: BackupConfig::default(),
         }
     }
 }
@@ -72,6 +74,28 @@ impl Default for AcmeConfig {
             directory: None,
             root_ca: None,
             dns_propagation_secs: 60,
+        }
+    }
+}
+
+/// Copies of every app volume, and of the server's own database and key, kept in
+/// `<data_dir>/backups`. They sit on the server's disk: download them elsewhere
+/// (`facade backup get`, `facade backup server`) to survive losing the machine.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackupConfig {
+    pub enabled: bool,
+    pub every_hours: u64,
+    /// Backups kept per volume (and of the server itself).
+    pub keep: usize,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            every_hours: 24,
+            keep: 7,
         }
     }
 }

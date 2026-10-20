@@ -9,29 +9,33 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
 use bollard::Docker;
+use bollard::auth::DockerCredentials;
 use bollard::models::{
-    ContainerCreateBody, HostConfig, HostConfigLogConfig, NetworkCreateRequest, PortBinding,
-    RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, HostConfig, HostConfigLogConfig, Mount, MountType, NetworkCreateRequest,
+    PortBinding, RestartPolicy, RestartPolicyNameEnum, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
-    ListImagesOptions, LogsOptions, RemoveContainerOptions, RemoveImageOptions,
-    RestartContainerOptions, StartContainerOptions, StatsOptions, StopContainerOptions,
+    ListImagesOptions, ListVolumesOptions, LogsOptions, RemoveContainerOptions, RemoveImageOptions,
+    RemoveVolumeOptions, RestartContainerOptions, StartContainerOptions, StatsOptions,
+    StopContainerOptions,
 };
-use facade_core::proto::{AppState, AppStats, JoinToken, Workload};
+use facade_core::proto::{AppState, AppStats, CredentialKind, JoinToken, VolumeInfo, Workload};
 use facade_core::{Build, Protocol, Source};
 use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::DeployLog;
 use super::build;
+use super::volumes;
 use crate::lang;
 
 const LABEL_APP: &str = "facade.app";
 const LABEL_RUN: &str = "facade.run";
 const LABEL_NODE: &str = "facade.node";
+const LABEL_VOLUME: &str = "facade.volume";
 
 #[derive(Clone)]
 pub struct Runtime(Arc<Inner>);
@@ -54,6 +58,11 @@ fn network(app: &str) -> String {
 
 fn image_repo(app: &str) -> String {
     format!("facade-{app}")
+}
+
+/// `_` cannot appear in app or volume names, so this never collides.
+fn volume_name(app: &str, volume: &str) -> String {
+    format!("facade-{app}_{volume}")
 }
 
 fn short_hash(value: &impl Serialize) -> String {
@@ -118,7 +127,7 @@ impl Runtime {
         }
 
         let image = self.ensure_image(w, log).await?;
-        let run_key = short_hash(&(w, &image));
+        let run_key = short_hash(&(w.run_identity(), &image));
         let name = container(app);
         match self
             .docker()
@@ -179,14 +188,29 @@ impl Runtime {
                 // An explicit deploy re-pulls, so moving tags like `latest` update.
                 if !present || log.is_deployment() {
                     log.state(AppState::Building);
-                    log.line(format!("pulling {image}"));
+                    let registry = facade_core::image_registry(image);
+                    let credentials = w.credential(CredentialKind::Registry, &registry).map(|c| {
+                        DockerCredentials {
+                            username: Some(c.username.clone()),
+                            password: Some(c.secret.clone()),
+                            serveraddress: Some(registry.clone()),
+                            ..Default::default()
+                        }
+                    });
+                    log.line(match &credentials {
+                        Some(c) => format!(
+                            "pulling {image} (logged in to {registry} as {})",
+                            c.username.as_deref().unwrap_or_default()
+                        ),
+                        None => format!("pulling {image}"),
+                    });
                     let mut pull = self.docker().create_image(
                         Some(CreateImageOptions {
                             from_image: Some(image.clone()),
                             ..Default::default()
                         }),
                         None,
-                        None,
+                        credentials,
                     );
                     while let Some(progress) = pull.next().await {
                         let progress = progress.with_context(|| format!("pulling {image}"))?;
@@ -203,7 +227,6 @@ impl Runtime {
                 sha256,
                 filename,
                 arch,
-                args,
             } => {
                 let key = short_hash(&(&w.spec.source, w.revision));
                 let tag = format!("{}:{key}", image_repo(&w.spec.name));
@@ -228,9 +251,8 @@ impl Runtime {
                     log.line(format!("downloading {filename}"));
                     super::fetch_artifact(&self.0.token, sha256, &workdir.join("app")).await?;
                     let dockerfile = workdir.join("Dockerfile");
-                    tokio::fs::write(&dockerfile, lang::executable::dockerfile(filename, args))
-                        .await?;
-                    build::docker_build(&w.spec.name, &tag, &dockerfile, &workdir, log).await
+                    tokio::fs::write(&dockerfile, lang::executable::dockerfile(filename)).await?;
+                    build::docker_build(&w.spec.name, &tag, &dockerfile, &workdir, w, log).await
                 }
                 .await;
                 let _ = tokio::fs::remove_dir_all(&workdir).await;
@@ -255,7 +277,7 @@ impl Runtime {
                     .join(format!("{}-{key}", w.spec.name));
                 let _ = tokio::fs::remove_dir_all(&workdir).await;
                 let result = async {
-                    build::git_checkout(repo, branch.as_deref(), &workdir, log).await?;
+                    build::git_checkout(repo, branch.as_deref(), &workdir, w, log).await?;
                     let (dockerfile, context) = match build {
                         Build::Dockerfile {
                             dockerfile,
@@ -270,7 +292,7 @@ impl Runtime {
                             (path, workdir.clone())
                         }
                     };
-                    build::docker_build(&w.spec.name, &tag, &dockerfile, &context, log).await
+                    build::docker_build(&w.spec.name, &tag, &dockerfile, &context, w, log).await
                 }
                 .await;
                 let _ = tokio::fs::remove_dir_all(&workdir).await;
@@ -278,6 +300,219 @@ impl Runtime {
                 Ok(tag)
             }
         }
+    }
+
+    /// Creates the app's volumes that do not exist yet.
+    async fn ensure_volumes(&self, w: &Workload) -> anyhow::Result<Vec<Mount>> {
+        let mut mounts = Vec::new();
+        for volume in &w.spec.volumes {
+            let name = self.ensure_volume(&w.spec.name, &volume.name).await?;
+            mounts.push(Mount {
+                target: Some(volume.path.clone()),
+                source: Some(name),
+                typ: Some(MountType::VOLUME),
+                ..Default::default()
+            });
+        }
+        Ok(mounts)
+    }
+
+    async fn ensure_volume(&self, app: &str, volume: &str) -> anyhow::Result<String> {
+        let name = volume_name(app, volume);
+        if self.docker().inspect_volume(&name).await.is_ok() {
+            return Ok(name);
+        }
+        self.docker()
+            .create_volume(VolumeCreateRequest {
+                name: Some(name.clone()),
+                labels: Some(HashMap::from([
+                    (LABEL_APP.to_string(), app.to_string()),
+                    (LABEL_VOLUME.to_string(), volume.to_string()),
+                    (LABEL_NODE.to_string(), self.0.token.node.clone()),
+                ])),
+                ..Default::default()
+            })
+            .await
+            .with_context(|| format!("creating volume {name}"))?;
+        Ok(name)
+    }
+
+    /// The directory holding a volume's files on this machine.
+    async fn volume_dir(&self, app: &str, volume: &str) -> anyhow::Result<PathBuf> {
+        let name = self.ensure_volume(app, volume).await?;
+        let info = self.docker().inspect_volume(&name).await?;
+        let dir = PathBuf::from(info.mountpoint);
+        if !dir.is_dir() {
+            bail!(
+                "volume {name} is at {}, which this agent cannot reach (is it running as root, next to Docker?)",
+                dir.display()
+            );
+        }
+        Ok(dir)
+    }
+
+    /// Every facade volume of this node, with its size.
+    pub async fn list_volumes(&self) -> anyhow::Result<Vec<VolumeInfo>> {
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![format!("{LABEL_NODE}={}", self.0.token.node)],
+        )]);
+        let list = self
+            .docker()
+            .list_volumes(Some(ListVolumesOptions {
+                filters: Some(filters),
+            }))
+            .await?;
+        let mut out = Vec::new();
+        for v in list.volumes.unwrap_or_default() {
+            let (Some(app), Some(name)) = (v.labels.get(LABEL_APP), v.labels.get(LABEL_VOLUME))
+            else {
+                continue;
+            };
+            let dir = PathBuf::from(&v.mountpoint);
+            let size =
+                tokio::task::spawn_blocking(move || dir.is_dir().then(|| volumes::size(&dir)))
+                    .await
+                    .ok()
+                    .flatten();
+            out.push(VolumeInfo {
+                app: app.clone(),
+                name: name.clone(),
+                size,
+            });
+        }
+        out.sort_by(|a, b| (&a.app, &a.name).cmp(&(&b.app, &b.name)));
+        Ok(out)
+    }
+
+    /// Writes a gzipped tar of the volume to `out`. A running app is paused while
+    /// the archive is made, so its files are captured at one instant (enough for
+    /// SQLite and its WAL), then resumed before the archive is sent.
+    pub async fn export_volume<W: AsyncWrite + Unpin>(
+        &self,
+        app: &str,
+        volume: &str,
+        mut out: W,
+    ) -> anyhow::Result<()> {
+        let dir = self.volume_dir(app, volume).await?;
+        let tmp = self.scratch_file("export");
+        let name = container(app);
+        let running = self.is_running(&name).await;
+        if running {
+            self.docker().pause_container(&name).await?;
+        }
+        let result = {
+            let (dir, tmp) = (dir.clone(), tmp.clone());
+            tokio::task::spawn_blocking(move || volumes::archive(&dir, &tmp)).await?
+        };
+        if running && let Err(e) = self.docker().unpause_container(&name).await {
+            tracing::error!("unpausing {name} after a volume export: {e}");
+        }
+        let sent = async {
+            result?;
+            let mut file = tokio::fs::File::open(&tmp).await?;
+            tokio::io::copy(&mut file, &mut out).await?;
+            out.shutdown().await?;
+            anyhow::Ok(())
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        sent
+    }
+
+    /// Replaces the volume's contents with the tar read from `input`. The upload is
+    /// received in full before the app is touched; the app is stopped while the
+    /// files are replaced and started again if it was running.
+    pub async fn import_volume<R: AsyncRead + Unpin>(
+        &self,
+        app: &str,
+        volume: &str,
+        mut input: R,
+        size: u64,
+    ) -> anyhow::Result<()> {
+        let dir = self.volume_dir(app, volume).await?;
+        let tmp = self.scratch_file("import");
+        let result = async {
+            let mut file = tokio::fs::File::create(&tmp).await?;
+            let received = tokio::io::copy(&mut input, &mut file).await?;
+            if received != size {
+                bail!("upload interrupted ({received} of {size} bytes)");
+            }
+            file.sync_all().await?;
+            let name = container(app);
+            let running = self.is_running(&name).await;
+            if running {
+                self.stop(app).await?;
+            }
+            let restored = {
+                let (dir, tmp) = (dir.clone(), tmp.clone());
+                tokio::task::spawn_blocking(move || volumes::restore(&tmp, &dir)).await?
+            };
+            if running {
+                self.start(&name).await?;
+            }
+            restored
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        result
+    }
+
+    fn scratch_file(&self, what: &str) -> PathBuf {
+        self.0
+            .dir
+            .join("builds")
+            .join(format!(".{what}-{}.tar", uuid::Uuid::new_v4()))
+    }
+
+    async fn is_running(&self, name: &str) -> bool {
+        self.docker()
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+            .ok()
+            .and_then(|c| c.state)
+            .and_then(|s| s.running)
+            .unwrap_or(false)
+    }
+
+    /// Which app each managed container and each published host port belongs to,
+    /// to name the owners of listening sockets.
+    pub async fn port_owners(
+        &self,
+    ) -> anyhow::Result<(HashMap<String, String>, HashMap<(Protocol, u16), String>)> {
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![format!("{LABEL_NODE}={}", self.0.token.node)],
+        )]);
+        let containers = self
+            .docker()
+            .list_containers(Some(ListContainersOptions {
+                all: false,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await?;
+        let mut by_container = HashMap::new();
+        let mut by_port = HashMap::new();
+        for c in containers {
+            let Some(app) = c.labels.as_ref().and_then(|l| l.get(LABEL_APP)).cloned() else {
+                continue;
+            };
+            for port in c.ports.unwrap_or_default() {
+                let Some(public) = port.public_port else {
+                    continue;
+                };
+                let proto = match port.typ.map(|t| t.to_string()).as_deref() {
+                    Some("udp") => Protocol::Udp,
+                    _ => Protocol::Tcp,
+                };
+                by_port.insert((proto, public), app.clone());
+            }
+            if let Some(id) = c.id {
+                by_container.insert(id, app);
+            }
+        }
+        Ok((by_container, by_port))
     }
 
     async fn create(&self, w: &Workload, image: &str, run_key: &str) -> anyhow::Result<()> {
@@ -324,10 +559,12 @@ impl Runtime {
             self.ensure_network(app).await?;
             network(app)
         };
+        let mounts = self.ensure_volumes(w).await?;
 
         let host_config = HostConfig {
             port_bindings: Some(bindings),
             network_mode: Some(network_mode),
+            mounts: (!mounts.is_empty()).then_some(mounts),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
@@ -349,6 +586,7 @@ impl Runtime {
 
         let body = ContainerCreateBody {
             image: Some(image.to_string()),
+            cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
             env: Some(w.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
             exposed_ports: Some(exposed),
             labels: Some(HashMap::from([
@@ -435,7 +673,9 @@ impl Runtime {
             .with_context(|| format!("restarting {app}"))
     }
 
-    pub async fn remove(&self, app: &str) -> anyhow::Result<()> {
+    /// Removes the app's container, network, images and static files. Its volumes
+    /// stay unless `delete_volumes`: data is only ever deleted on purpose.
+    pub async fn remove(&self, app: &str, delete_volumes: bool) -> anyhow::Result<()> {
         match self
             .docker()
             .remove_container(
@@ -460,6 +700,18 @@ impl Runtime {
         let dir = self.static_dir(app);
         if dir.exists() {
             tokio::fs::remove_dir_all(dir).await?;
+        }
+        if delete_volumes {
+            for volume in self.list_volumes().await? {
+                if volume.app == app {
+                    let name = volume_name(app, &volume.name);
+                    self.docker()
+                        .remove_volume(&name, Some(RemoveVolumeOptions { force: true }))
+                        .await
+                        .with_context(|| format!("deleting volume {name}"))?;
+                    tracing::info!("deleted volume {name}");
+                }
+            }
         }
         Ok(())
     }
@@ -566,7 +818,7 @@ impl Runtime {
             .join("static")
             .join(format!(".{}-{key}", w.spec.name));
         let _ = tokio::fs::remove_dir_all(&staging).await;
-        build::git_checkout(repo, branch.as_deref(), &staging, log).await?;
+        build::git_checkout(repo, branch.as_deref(), &staging, w, log).await?;
         let _ = tokio::fs::remove_dir_all(staging.join(".git")).await;
         tokio::fs::write(staging.join(".facade-key"), &key).await?;
         let _ = tokio::fs::remove_dir_all(&dir).await;

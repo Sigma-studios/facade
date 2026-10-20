@@ -56,6 +56,8 @@ impl Detector for Dockerfiles {
                     },
                     http_port,
                     env: vec![],
+                    args: vec![],
+                    notes: vec![],
                 })
             })
             .collect()

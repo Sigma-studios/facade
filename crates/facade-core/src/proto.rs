@@ -7,7 +7,7 @@
 //! * one **control** connection per agent, carrying newline-delimited JSON
 //!   [`ServerMsg`] / [`AgentMsg`] in both directions;
 //! * short-lived **data** connections, dialed when the server asks for a tunnel
-//!   (HTTP traffic for an app, a log stream). After the hello line they carry raw bytes.
+//!   (a log stream, a volume archive). After the hello line they carry raw bytes.
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::spec::AppSpec;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -49,6 +49,62 @@ pub struct Workload {
     pub env: Vec<(String, String)>,
     /// Bumped by every explicit deploy. A new revision forces a fresh build.
     pub revision: u64,
+    /// Logins for private registries and git hosts, used by pulls, clones and
+    /// builds. Every configured one is sent: a Dockerfile's `FROM` can name any
+    /// registry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<Credential>,
+}
+
+impl Workload {
+    /// What the running container depends on: credentials only matter while
+    /// fetching, so changing them does not restart anything.
+    pub fn run_identity(&self) -> (&AppSpec, &Vec<(String, String)>, u64) {
+        (&self.spec, &self.env, self.revision)
+    }
+
+    pub fn credential(&self, kind: CredentialKind, host: &str) -> Option<&Credential> {
+        self.credentials
+            .iter()
+            .find(|c| c.kind == kind && c.host.eq_ignore_ascii_case(host))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    /// A container registry (`ghcr.io`, `docker.io`).
+    Registry,
+    /// A git host, for HTTPS clones (`github.com`).
+    Git,
+}
+
+impl std::fmt::Display for CredentialKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CredentialKind::Registry => "registry",
+            CredentialKind::Git => "git",
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Credential {
+    pub kind: CredentialKind,
+    pub host: String,
+    pub username: String,
+    /// Token or password.
+    pub secret: String,
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Credential({} {} as {})",
+            self.kind, self.host, self.username
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,8 +136,11 @@ pub enum AgentRequest {
         workload: Workload,
         deployment: Option<Uuid>,
     },
+    /// Remove the app's container (and with `delete_volumes`, its data).
     Remove {
         app: String,
+        #[serde(default)]
+        delete_volumes: bool,
     },
     Restart {
         app: String,
@@ -104,6 +163,23 @@ pub enum AgentRequest {
         tail: u32,
         follow: bool,
     },
+    /// Every facade volume on the node, with sizes. Answers `Vec<VolumeInfo>`.
+    Volumes,
+    /// Dial a data connection and write a gzipped tar of the volume to it. A running
+    /// app is paused meanwhile, so files are copied as they were at one instant.
+    VolumeExport {
+        tunnel: Uuid,
+        app: String,
+        volume: String,
+    },
+    /// Dial a data connection, read `<size>\n` and then that many bytes of a tar
+    /// (gzipped or not), replace the volume's contents with it, and answer `ok\n`
+    /// or `error <message>\n` on the same connection. The app is stopped meanwhile.
+    VolumeImport {
+        tunnel: Uuid,
+        app: String,
+        volume: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +189,9 @@ pub enum AgentMsg {
         id: u64,
         #[serde(default)]
         error: Option<String>,
+        /// The answer, for requests that have one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
     },
     Event {
         event: AgentEvent,
@@ -172,6 +251,37 @@ impl std::fmt::Display for AppState {
 pub struct NodeReport {
     pub node: NodeStats,
     pub apps: Vec<AppStats>,
+    /// Every listening socket on the machine, facade's or not.
+    #[serde(default)]
+    pub listeners: Vec<Listener>,
+    /// Addresses the HTTP(S) entry point wants but cannot bind (still retrying).
+    #[serde(default)]
+    pub ingress_errors: Vec<String>,
+}
+
+/// A TCP socket in LISTEN state or a bound UDP socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listener {
+    pub protocol: crate::spec::Protocol,
+    pub address: String,
+    pub port: u16,
+    /// Process name, when it could be found.
+    #[serde(default)]
+    pub process: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// The facade app the socket belongs to; `facade` for facade itself.
+    #[serde(default)]
+    pub app: Option<String>,
+}
+
+/// A volume on a node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VolumeInfo {
+    pub app: String,
+    pub name: String,
+    /// Bytes used, when it could be measured.
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

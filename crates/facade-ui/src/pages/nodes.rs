@@ -1,8 +1,10 @@
 use std::time::Duration;
 
 use facade_core::api::{CreateNode, CreatedNode, NodeView, SetNodeIp};
+use facade_core::proto::Listener;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use leptos_router::components::A;
 
 use super::overview::NodeCard;
 use crate::api;
@@ -68,6 +70,15 @@ pub fn Nodes() -> impl IntoView {
             },
         );
     };
+    // Whose listening sockets the Ports section shows; the first node until one is picked.
+    let ports_node = RwSignal::new(None::<String>);
+    let ports_of = Memo::new(move |_| {
+        ports_node.get().or_else(|| {
+            nodes
+                .data
+                .with(|n| n.as_ref().and_then(|n| n.first().map(|n| n.name.clone())))
+        })
+    });
     let ip_open = RwSignal::new(false);
     let ip_target = RwSignal::new(None::<String>);
     let ip_value = RwSignal::new(String::new());
@@ -113,12 +124,13 @@ pub fn Nodes() -> impl IntoView {
             <Show when=move || nodes.loaded() fallback=Loading>
                 <div class="grid-cards">
                     <For each=move || nodes.data.get().unwrap_or_default()
-                        key=|n| (n.name.clone(), n.connected, n.last_seen, n.public_ip.clone(), n.stats.as_ref().map(|s| s.mem_used))
+                        key=|n| (n.name.clone(), n.connected, n.last_seen, n.public_ip.clone(), n.stats.as_ref().map(|s| s.mem_used), n.ingress_errors.clone())
                         let:node>
                         {
                             let name = node.name.clone();
                             let name2 = node.name.clone();
                             let name3 = node.name.clone();
+                            let name4 = node.name.clone();
                             let current_ip = node.public_ip.clone().unwrap_or_default();
                             let local = node.local;
                             view! {
@@ -130,6 +142,7 @@ pub fn Nodes() -> impl IntoView {
                                             ip_value.set(current_ip.clone());
                                             ip_open.set(true);
                                         }>"Public IP"</button>
+                                        <button class="link-button" on:click=move |_| ports_node.set(Some(name4.clone()))>"Ports"</button>
                                         <Show when=move || !local>
                                             <button class="link-button" on:click={
                                                 let name = name.clone();
@@ -149,6 +162,12 @@ pub fn Nodes() -> impl IntoView {
                         }
                     </For>
                 </div>
+                <Show when=move || ports_of.with(Option::is_some)>
+                    <Ports
+                        node=Signal::derive(move || ports_of.get().unwrap_or_default())
+                        nodes=Signal::derive(move || nodes.data.get().unwrap_or_default().into_iter().map(|n| n.name).collect::<Vec<_>>())
+                        on_pick=move |n| ports_node.set(Some(n))/>
+                </Show>
             </Show>
         </div>
 
@@ -213,5 +232,86 @@ pub fn Nodes() -> impl IntoView {
                 <button class="button button-danger" on:click=remove>"Remove"</button>
             </div>
         </Modal>
+    }
+}
+
+/// What listens on a node, and which app (or facade itself) holds each port.
+#[component]
+fn Ports(
+    #[prop(into)] node: Signal<String>,
+    #[prop(into)] nodes: Signal<Vec<String>>,
+    on_pick: impl Fn(String) + Send + Sync + 'static,
+) -> impl IntoView {
+    let listeners = polled(Some(Duration::from_secs(10)), move || {
+        let node = node.get();
+        async move { api::get::<Vec<Listener>>(&format!("/api/nodes/{node}/ports")).await }
+    });
+    view! {
+        <section class="node-ports">
+            <div class="toolbar">
+                <h2 class="section-title">"Ports"</h2>
+                <label class="inline-field">
+                    "on"
+                    <select on:change=move |ev| on_pick(event_target_value(&ev))
+                        prop:value=move || node.get()>
+                        <For each=move || nodes.get() key=|n| n.clone() let:n>
+                            <option value=n.clone()
+                                selected={
+                                    let name = n.clone();
+                                    move || node.with(|x| *x == name)
+                                }>{n.clone()}</option>
+                        </For>
+                    </select>
+                </label>
+            </div>
+            <p class="muted small">"Every TCP and UDP port open on the node, facade's or not. A port held by another program cannot be published by an app."</p>
+            <ErrorNote error=listeners.error/>
+            <Show when=move || listeners.loaded() fallback=Loading>
+                <Show when=move || listeners.data.with(|l| l.as_ref().is_some_and(|l| !l.is_empty()))
+                    fallback=|| view! { <div class="empty"><p>"Nothing is listening."</p></div> }>
+                    <div class="table-wrap">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th class="num">"Port"</th>
+                                    <th>"Protocol"</th>
+                                    <th>"Address"</th>
+                                    <th>"Process"</th>
+                                    <th>"Used by"</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <For each=move || listeners.data.get().unwrap_or_default()
+                                    key=|l| (l.protocol, l.address.clone(), l.port, l.pid, l.app.clone())
+                                    let:l>
+                                    <tr>
+                                        <td class="num">{l.port}</td>
+                                        <td>{l.protocol.to_string()}</td>
+                                        <td><code>{l.address.clone()}</code></td>
+                                        <td class="muted">
+                                            {match (l.process.clone(), l.pid) {
+                                                (Some(p), Some(pid)) => format!("{p} ({pid})"),
+                                                (Some(p), None) => p,
+                                                (None, Some(pid)) => format!("pid {pid}"),
+                                                (None, None) => "—".into(),
+                                            }}
+                                        </td>
+                                        <td>
+                                            {match l.app.clone() {
+                                                Some(app) if app == "facade" => view! { <span>"facade"</span> }.into_any(),
+                                                Some(app) => view! {
+                                                    <A href=format!("/apps/{app}") attr:class="strong-link">{app.clone()}</A>
+                                                }.into_any(),
+                                                None => view! { <span class="muted">"another program"</span> }.into_any(),
+                                            }}
+                                        </td>
+                                    </tr>
+                                </For>
+                            </tbody>
+                        </table>
+                    </div>
+                </Show>
+            </Show>
+        </section>
     }
 }
