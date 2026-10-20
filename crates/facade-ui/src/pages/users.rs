@@ -2,14 +2,14 @@
 
 use std::time::Duration;
 
-use facade_core::api::{CreateUser, OneTimePassword, UpdateUser, UserView};
+use facade_core::api::{CreateUser, NodeView, OneTimePassword, UpdateUser, UserView};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
 
 use crate::api;
-use crate::components::{CopyField, ErrorNote, Loading, Modal};
-use crate::util::{cpus, me, polled, run, toasts};
+use crate::components::{Amount, AmountSlider, CopyField, ErrorNote, Loading, Modal};
+use crate::util::{bytes, cpus, me, polled, run, toasts};
 
 /// Form values for a role and caps, shared by "Add user" and "Edit".
 #[derive(Clone, Copy)]
@@ -59,8 +59,27 @@ impl CapsForm {
     }
 }
 
+/// Memory (MB) and cores of every node that reports them, which bound the caps.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Totals {
+    memory_mb: Option<f64>,
+    cpus: Option<f64>,
+}
+
+impl Totals {
+    fn of(nodes: &[NodeView]) -> Self {
+        let stats = nodes.iter().filter_map(|n| n.stats.as_ref());
+        let memory: u64 = stats.clone().map(|s| s.mem_total).sum();
+        let cpus: usize = stats.map(|s| s.cpus).sum();
+        Self {
+            memory_mb: Some((memory / (1024 * 1024)) as f64).filter(|m| *m > 0.0),
+            cpus: Some(cpus as f64).filter(|c| *c > 0.0),
+        }
+    }
+}
+
 #[component]
-fn CapsFields(form: CapsForm) -> impl IntoView {
+fn CapsFields(form: CapsForm, #[prop(into)] totals: Signal<Totals>) -> impl IntoView {
     let member = move || form.role.with(|r| r == "member");
     view! {
         <label class="field">
@@ -77,16 +96,12 @@ fn CapsFields(form: CapsForm) -> impl IntoView {
             }}</small>
         </label>
         <Show when=member>
-            <div class="form-row">
-                <label class="field">
-                    <span>"Memory cap (MB)"</span>
-                    <input type="number" min="16" bind:value=form.memory placeholder="no limit"/>
-                </label>
-                <label class="field">
-                    <span>"CPU cap"</span>
-                    <input type="number" min="0.1" step="0.1" bind:value=form.cpus placeholder="no limit"/>
-                </label>
-            </div>
+            <AmountSlider label="Memory cap" amount=Amount::Memory value=form.memory
+                total=Signal::derive(move || totals.get().memory_mb)
+                optional=true none_label="No cap" available=Signal::derive(|| None)/>
+            <AmountSlider label="CPU cap" amount=Amount::Cpus value=form.cpus
+                total=Signal::derive(move || totals.get().cpus)
+                optional=true none_label="No cap" available=Signal::derive(|| None)/>
             <p class="muted small">
                 "Shared by all their apps. With a cap, each of their apps needs its own limit."
             </p>
@@ -99,6 +114,14 @@ pub fn Users() -> impl IntoView {
     let me = me();
     let users = polled(Some(Duration::from_secs(15)), || async {
         api::get::<Vec<UserView>>("/api/users").await
+    });
+    let nodes = polled(None, || async {
+        api::get::<Vec<NodeView>>("/api/nodes").await
+    });
+    let totals = Memo::new(move |_| {
+        nodes
+            .data
+            .with(|n| n.as_deref().map(Totals::of).unwrap_or_default())
     });
     // The one-time password of a new or reset account, shown once.
     let issued = RwSignal::new(None::<OneTimePassword>);
@@ -271,11 +294,15 @@ pub fn Users() -> impl IntoView {
                                                 })}
                                             </td>
                                             <td>{u.role.clone()}</td>
-                                            <td>{if member {
-                                                usage(format!("{} MB", u.memory_allocated_mb), u.memory_cap_mb.map(|c| format!("{c} MB")))
+                                            <td>{move || if member {
+                                                usage(
+                                                    format!("{} MB", u.memory_allocated_mb),
+                                                    u.memory_cap_mb.map(|c| bytes(c * 1024 * 1024)),
+                                                    share(u.memory_cap_mb.map(|c| c as f64), totals.get().memory_mb),
+                                                )
                                             } else { "—".into() }}</td>
-                                            <td>{if member {
-                                                usage(cpus(u.cpus_allocated), u.cpu_cap.map(cpus))
+                                            <td>{move || if member {
+                                                usage(cpus(u.cpus_allocated), u.cpu_cap.map(cpus), share(u.cpu_cap, totals.get().cpus))
                                             } else { "—".into() }}</td>
                                             <td><AppLinks apps=u.apps.clone()/></td>
                                             <td><AppLinks apps=u.shared_apps.clone()/></td>
@@ -308,7 +335,7 @@ pub fn Users() -> impl IntoView {
                         pattern="[a-z0-9]([a-z0-9\\-]*[a-z0-9])?" autocomplete="off"/>
                     <small>"Lowercase letters, digits and dashes. Used to sign in."</small>
                 </label>
-                <CapsFields form=add_form/>
+                <CapsFields form=add_form totals=totals/>
                 <ErrorNote error=add_error/>
                 <div class="form-actions">
                     <button type="button" class="button" on:click=move |_| add_open.set(false)>"Cancel"</button>
@@ -320,7 +347,7 @@ pub fn Users() -> impl IntoView {
         <Modal open=edit_open title="Edit user">
             <form class="form" on:submit=save_edit>
                 <p class="muted small">{move || edit_target.get().unwrap_or_default()}</p>
-                <CapsFields form=edit_form/>
+                <CapsFields form=edit_form totals=totals/>
                 <ErrorNote error=edit_error/>
                 <div class="form-actions">
                     <button type="button" class="button" on:click=move |_| edit_open.set(false)>"Cancel"</button>
@@ -367,12 +394,18 @@ pub fn Users() -> impl IntoView {
     }
 }
 
-/// `used of cap`, or just `used` without a cap.
-fn usage(used: String, cap: Option<String>) -> String {
-    match cap {
-        Some(cap) => format!("{used} of {cap}"),
-        None => format!("{used}, no cap"),
+/// `used of cap (share)`, or just `used` without a cap.
+fn usage(used: String, cap: Option<String>, share: Option<String>) -> String {
+    match (cap, share) {
+        (Some(cap), Some(share)) => format!("{used} of {cap} ({share})"),
+        (Some(cap), None) => format!("{used} of {cap}"),
+        (None, _) => format!("{used}, no cap"),
     }
+}
+
+/// A cap as a percentage of what all the nodes have.
+fn share(cap: Option<f64>, total: Option<f64>) -> Option<String> {
+    Some(format!("{:.0} %", cap? * 100.0 / total?))
 }
 
 #[component]
