@@ -76,6 +76,23 @@ impl AppSpec {
         )
     }
 
+    /// Ports the app takes on its node's network: its published ports, or on
+    /// the host network the ports it declares and its HTTP port.
+    pub fn host_ports(&self) -> Vec<PortMap> {
+        let mut out = self.ports.clone();
+        if self.host_network
+            && let Some(port) = self.http_port
+        {
+            out.push(PortMap {
+                host: port,
+                container: port,
+                count: 1,
+                protocol: Protocol::Tcp,
+            });
+        }
+        out
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         validate_name("app name", &self.name)?;
         validate_name("node name", &self.node)?;

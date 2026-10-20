@@ -281,9 +281,15 @@ Changing one restarts nothing.
 
 Each node reports every port listening on it and the program holding it
 (`facade node ports <node>`, or the Nodes page). facade refuses to publish or bind a
-port another app of the node declares, and refuses to deploy or start an app whose
-ports are held by something else, naming it (`port 9090/tcp is in use on node main
-by bevy_ensemble_w (pid 2115957)`). With `--host-network true`, `--publish` declares
+port another app of the node declares, and refuses to start an app whose ports are
+held by something else, naming it (`port 9090/tcp is in use on node main by
+bevy_ensemble_w (pid 2115957)`).
+
+A deploy whose ports another program holds builds first, then waits (up to 30
+minutes) and says so in its log: `built; waiting for 9090/tcp held by
+bevy_ensemble_w (pid 2115957)`. That is how a service moves into facade: deploy it
+while the old one still serves, stop the old one once the build is done, and the
+new one starts within a second. With `--host-network true`, `--publish` declares
 the ports the app binds itself (no remapping), so they are checked too.
 
 If a node's HTTP(S) entry point cannot bind 80 or 443 (another web server holds

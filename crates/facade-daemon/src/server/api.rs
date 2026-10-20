@@ -19,7 +19,7 @@ use axum::routing::{get, post, put};
 use facade_core::api::*;
 use facade_core::manifest::{AppManifest, EnvEntry, Manifest, NodeDecl};
 use facade_core::proto::{AgentRequest, AppState, CredentialKind, Listener, VolumeInfo};
-use facade_core::{AppSpec, PortMap, Protocol, validate_name};
+use facade_core::{AppSpec, validate_name};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -724,23 +724,6 @@ fn check_spec(server: &Server, spec: &AppSpec) -> ApiResult<()> {
     Ok(())
 }
 
-/// Ports `spec` takes on its node's network: its published ports, or on the host
-/// network the ports it declares and its HTTP port.
-fn host_ports(spec: &AppSpec) -> Vec<PortMap> {
-    let mut out = spec.ports.clone();
-    if spec.host_network
-        && let Some(port) = spec.http_port
-    {
-        out.push(PortMap {
-            host: port,
-            container: port,
-            count: 1,
-            protocol: Protocol::Tcp,
-        });
-    }
-    out
-}
-
 /// Why `spec` cannot have its ports on its node: another app of the node declares
 /// them, or (with `listening`) something is listening on them right now. A port
 /// held by the app itself is fine.
@@ -749,7 +732,7 @@ fn port_conflict(
     spec: &AppSpec,
     listening: bool,
 ) -> anyhow::Result<Option<String>> {
-    let wanted = host_ports(spec);
+    let wanted = spec.host_ports();
     if wanted.is_empty() {
         return Ok(None);
     }
@@ -759,7 +742,8 @@ fn port_conflict(
             continue;
         }
         for a in &wanted {
-            if let Some(b) = host_ports(&other)
+            if let Some(b) = other
+                .host_ports()
                 .iter()
                 .find(|b| a.protocol == b.protocol && a.overlaps(b))
             {
@@ -812,7 +796,7 @@ fn holder(l: &Listener) -> String {
 /// Before (re)starting an app by hand: its ports must be free, as the node sees
 /// them now (an old program stopped a second ago no longer counts).
 async fn check_ports_free(server: &Server, spec: &AppSpec) -> ApiResult<()> {
-    if !host_ports(spec).is_empty()
+    if !spec.host_ports().is_empty()
         && let Ok(listeners) = server
             .hub
             .query::<Vec<Listener>>(&spec.node, AgentRequest::Ports)
@@ -1052,7 +1036,12 @@ async fn deploy_app(
     if !server.hub.is_connected(&row.spec.node) {
         return Err(unavailable(format!("node {} is offline", row.spec.node)));
     }
-    check_ports_free(&server, &row.spec).await?;
+    // Another app declaring the ports is a mistake; another program holding
+    // them is usually the old version being replaced: the agent builds first,
+    // then waits for them (see the deployment log).
+    if let Some(problem) = port_conflict(&server, &row.spec, false)? {
+        return Err(conflict(problem));
+    }
     let revision = server.store.bump_revision(&name)?;
     let id = Uuid::new_v4();
     server.store.create_deployment(id, &name, revision)?;

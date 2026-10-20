@@ -573,10 +573,14 @@ impl DeployLog {
     }
 
     pub fn state(&self, state: AppState) {
+        self.state_with(state, None);
+    }
+
+    pub fn state_with(&self, state: AppState, message: Option<String>) {
         self.agent.emit(AgentEvent::AppState {
             app: self.app.clone(),
             state,
-            message: None,
+            message,
         });
     }
 
