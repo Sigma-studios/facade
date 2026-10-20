@@ -1,7 +1,7 @@
 [Unit]
 Description=facade server
 After=network-online.target docker.service
-Wants=network-online.target
+Wants=network-online.target facaded-ingress.service
 Requires=docker.service
 
 [Service]

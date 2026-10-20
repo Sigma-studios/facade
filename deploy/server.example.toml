@@ -10,6 +10,12 @@ public_host = "203.0.113.10"
 # https_listen = "0.0.0.0:443"
 # local_node = "main"             # name of this machine as a node
 
+# Where this machine's entry point runs: "external" (facaded-ingress.service, so
+# updating facaded never drops traffic; what install.sh sets up) or "embedded"
+# (inside facaded, simplest for development).
+# ingress = "embedded"
+# ingress_control = "/run/facade/ingress.sock"
+
 # Also serve the API and web UI at this domain (from this machine, with a real certificate).
 # Like [acme] email, only the starting value: `facade server set` changes it later.
 # api_domain = "facade.example.com"

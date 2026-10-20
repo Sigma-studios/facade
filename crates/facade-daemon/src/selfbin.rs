@@ -1,0 +1,48 @@
+//! The running `facaded` executable: a fingerprint to tell builds apart, and the
+//! path it is installed at (where an update puts the next one).
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone)]
+pub struct Binary {
+    /// SHA-256 of the executable, hex.
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// The running executable, read once. `/proc/self/exe` still reads the running
+/// file after it was replaced on disk.
+pub fn current() -> Option<&'static Binary> {
+    static CURRENT: OnceLock<Option<Binary>> = OnceLock::new();
+    CURRENT
+        .get_or_init(|| {
+            use sha2::{Digest, Sha256};
+            let bytes = std::fs::read("/proc/self/exe").ok()?;
+            Some(Binary {
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                size: bytes.len() as u64,
+            })
+        })
+        .as_ref()
+}
+
+/// Where this executable was started from, even if it has been replaced since
+/// (the running copy then shows as "… (deleted)").
+pub fn installed_path() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let path = exe.to_string_lossy();
+    Ok(PathBuf::from(
+        path.strip_suffix(" (deleted)").unwrap_or(&path).to_string(),
+    ))
+}
+
+/// The running executable's contents.
+pub async fn open() -> std::io::Result<tokio::fs::File> {
+    tokio::fs::File::open("/proc/self/exe").await
+}
+
+/// The first characters of a fingerprint, for logs.
+pub fn short(sha256: &str) -> &str {
+    sha256.get(..12).unwrap_or(sha256)
+}

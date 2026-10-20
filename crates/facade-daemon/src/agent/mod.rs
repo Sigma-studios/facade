@@ -2,8 +2,8 @@
 //! desired workloads, and dials data connections on request.
 
 mod build;
-mod ingress;
 mod ports;
+mod routes;
 mod runtime;
 mod stats;
 mod volumes;
@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use facade_core::proto::{
-    AgentEvent, AgentMsg, AgentRequest, AppState, Hello, JoinToken, NodeReport, PROTOCOL_VERSION,
-    ServerMsg, Workload,
+    AgentEvent, AgentMsg, AgentRequest, AppState, CertBundle, Hello, JoinToken, NodeReport,
+    PROTOCOL_VERSION, ProxyRoute, ServerMsg, Workload,
 };
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -25,8 +25,9 @@ use uuid::Uuid;
 
 use crate::framing::{JsonLines, write_json};
 use crate::tls;
-pub use ingress::IngressOptions;
+pub use routes::IngressMode;
 use runtime::Runtime;
+pub use runtime::{planned_image, run_key};
 
 const REPORT_EVERY: Duration = Duration::from_secs(15);
 /// Re-check every app this often, so a removed or dead container comes back
@@ -39,7 +40,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(70);
 pub async fn run_standalone(
     join: Option<String>,
     data_dir: PathBuf,
-    ingress: IngressOptions,
+    ingress: IngressMode,
 ) -> anyhow::Result<()> {
     tls::create_private_dir(&data_dir)?;
     let saved = data_dir.join("join-token");
@@ -76,20 +77,20 @@ pub struct Agent {
     /// Workloads whose last convergence failed, by hash. Periodic healing skips
     /// them so a broken build is not retried every two minutes.
     failed: Mutex<HashMap<String, String>>,
-    certs: Arc<ingress::Certs>,
-    routing: ingress::Routing,
-    ingress: IngressOptions,
-    /// Entry point addresses that cannot be bound yet, by address.
-    ingress_errors: Mutex<std::collections::BTreeMap<std::net::SocketAddr, String>>,
+    /// What the server sent for the entry point.
+    certs: Mutex<Vec<CertBundle>>,
+    proxies: Mutex<Vec<ProxyRoute>>,
+    challenges: Mutex<std::collections::BTreeMap<String, String>>,
+    link: routes::Link,
 }
 
 impl Agent {
     pub async fn new(
         token: JoinToken,
         data_dir: PathBuf,
-        ingress: IngressOptions,
+        ingress: IngressMode,
     ) -> anyhow::Result<Arc<Self>> {
-        let certs = Arc::new(ingress::Certs::load(&data_dir)?);
+        let link = routes::Link::new(ingress, &data_dir)?;
         let runtime = Runtime::new(data_dir, token.clone()).await?;
         Ok(Arc::new(Self {
             token,
@@ -98,16 +99,16 @@ impl Agent {
             locks: Default::default(),
             outbox: Default::default(),
             failed: Default::default(),
-            certs,
-            routing: Default::default(),
-            ingress,
-            ingress_errors: Default::default(),
+            certs: Default::default(),
+            proxies: Default::default(),
+            challenges: Default::default(),
+            link,
         }))
     }
 
     pub async fn run(self: Arc<Self>) {
         // Apps stay reachable while the server is away.
-        ingress::run(self.clone(), self.ingress).await;
+        self.start_routing();
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = std::time::Instant::now();
@@ -135,6 +136,8 @@ impl Agent {
                 protocol: PROTOCOL_VERSION,
                 agent_version: env!("CARGO_PKG_VERSION").into(),
                 hostname: sysinfo::System::host_name().unwrap_or_default(),
+                binary: crate::selfbin::current().map(|b| b.sha256.clone()),
+                arch: Some(std::env::consts::ARCH.into()),
             },
         )
         .await?;
@@ -226,24 +229,29 @@ impl Agent {
                 delete_volumes,
             } => {
                 self.workloads.lock().remove(&app);
+                self.refresh_routes().await;
                 let lock = self.lock_for(&app);
                 let _held = lock.lock().await;
                 self.runtime.remove(&app, delete_volumes).await?;
             }
             AgentRequest::Restart { app } => self.runtime.restart(&app).await?,
             AgentRequest::Ingress { certs, proxies } => {
-                self.certs.replace(&certs);
-                *self.routing.proxies.write() = proxies;
+                *self.certs.lock() = certs;
+                *self.proxies.lock() = proxies;
+                self.refresh_routes().await;
             }
             AgentRequest::Challenge {
                 token,
                 key_authorization,
             } => {
-                let mut challenges = self.routing.challenges.write();
-                match key_authorization {
-                    Some(key) => challenges.insert(token, key),
-                    None => challenges.remove(&token),
-                };
+                {
+                    let mut challenges = self.challenges.lock();
+                    match key_authorization {
+                        Some(key) => challenges.insert(token, key),
+                        None => challenges.remove(&token),
+                    };
+                }
+                self.refresh_routes().await;
             }
             AgentRequest::Logs {
                 tunnel,
@@ -262,6 +270,7 @@ impl Agent {
             AgentRequest::Ports => {
                 return Ok(Some(serde_json::to_value(self.listeners().await)?));
             }
+            AgentRequest::Upgrade { sha256 } => self.upgrade(sha256).await?,
             AgentRequest::Volumes => {
                 return Ok(Some(serde_json::to_value(
                     self.runtime.list_volumes().await?,
@@ -337,6 +346,8 @@ impl Agent {
             commit: Default::default(),
         };
         let result = self.runtime.converge(&workload, &log).await;
+        // A new container listens on a new local port.
+        self.refresh_routes().await;
         let hash = workload_hash(&workload);
         match &result {
             Ok(_) => self.failed.lock().remove(&app),
@@ -415,7 +426,7 @@ impl Agent {
                 node: sampler.sample(),
                 apps: self.runtime.app_stats(&workloads).await,
                 listeners,
-                ingress_errors: self.ingress_errors.lock().values().cloned().collect(),
+                ingress_errors: self.link.errors(),
             };
             if tx
                 .send(AgentMsg::Event {
@@ -441,6 +452,46 @@ impl Agent {
                 vec![]
             }
         }
+    }
+
+    /// Installs the server's binary in place of this one, hands the entry point
+    /// over to it, and exits so the service manager starts the new one. Apps keep
+    /// running throughout: they belong to Docker.
+    async fn upgrade(&self, sha256: String) -> anyhow::Result<()> {
+        if crate::selfbin::current().is_some_and(|b| b.sha256 == sha256) {
+            return Ok(());
+        }
+        let path = crate::selfbin::installed_path()?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "facaded".into());
+        let tmp = path.with_file_name(format!(".{name}.new"));
+        fetch_artifact(&self.token, &sha256, &tmp)
+            .await
+            .context("downloading the server's binary")?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        }
+        // The previous build stays next to it, for going back by hand.
+        if let Err(e) = std::fs::copy(&path, path.with_file_name(format!("{name}.prev"))) {
+            warn!("keeping the previous binary: {e}");
+        }
+        std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
+        info!(
+            "installed facaded {} at {}; handing over the entry point and restarting",
+            crate::selfbin::short(&sha256),
+            path.display()
+        );
+        self.link.request_upgrade();
+        tokio::spawn(async {
+            // Time to answer the server and pass the request to the entry point.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            // EX_TEMPFAIL: restarted under Restart=always and Restart=on-failure.
+            std::process::exit(75);
+        });
+        Ok(())
     }
 
     async fn dial_data(&self, tunnel: Uuid) -> anyhow::Result<tls::ClientStream> {

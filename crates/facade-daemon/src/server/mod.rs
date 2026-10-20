@@ -3,14 +3,14 @@
 mod acme;
 mod api;
 mod artifacts;
-mod backups;
+pub mod backups;
 mod dns;
 mod hub;
 mod inspect;
 mod monitor;
-mod secrets;
+pub mod secrets;
 mod settings;
-mod store;
+pub mod store;
 mod ui;
 mod updates;
 
@@ -57,6 +57,8 @@ pub struct Server {
     /// Last failed backups, `app/volume` → why. Cleared by the next success.
     pub backup_errors: RwLock<HashMap<String, String>>,
     pub settings: settings::SettingsCell,
+    /// Last binary sent to each node to update its agent, and when.
+    pub upgrade_attempts: parking_lot::Mutex<HashMap<String, (String, u64)>>,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -104,6 +106,39 @@ pub struct Routes {
     pub nodes: HashMap<String, String>,
 }
 
+/// The full workload of an app, secrets decrypted.
+pub fn load_workload(store: &Store, secrets: &SecretBox, app: &str) -> anyhow::Result<Workload> {
+    let row = store
+        .get_app(app)?
+        .ok_or_else(|| anyhow!("no app named {app}"))?;
+    let env = store
+        .list_env(app)?
+        .into_iter()
+        .map(|e| Ok((e.key, secrets.open_string(&e.sealed)?)))
+        .collect::<anyhow::Result<_>>()?;
+    Ok(Workload {
+        spec: row.spec,
+        env,
+        revision: row.revision,
+        credentials: load_credentials(store, secrets)?,
+    })
+}
+
+fn load_credentials(store: &Store, secrets: &SecretBox) -> anyhow::Result<Vec<Credential>> {
+    store
+        .list_credentials()?
+        .into_iter()
+        .map(|c| {
+            Ok(Credential {
+                kind: c.kind,
+                host: c.host,
+                username: c.username,
+                secret: secrets.open_string(&c.sealed_secret)?,
+            })
+        })
+        .collect()
+}
+
 pub fn hash_secret(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
 }
@@ -124,38 +159,12 @@ fn push_capped<T>(deque: &mut VecDeque<T>, item: T) {
 impl Server {
     /// The full workload for an app, secrets decrypted.
     pub fn workload(&self, app: &str) -> anyhow::Result<Workload> {
-        let row = self
-            .store
-            .get_app(app)?
-            .ok_or_else(|| anyhow!("no app named {app}"))?;
-        let env = self
-            .store
-            .list_env(app)?
-            .into_iter()
-            .map(|e| Ok((e.key, self.secrets.open_string(&e.sealed)?)))
-            .collect::<anyhow::Result<_>>()?;
-        Ok(Workload {
-            spec: row.spec,
-            env,
-            revision: row.revision,
-            credentials: self.credentials()?,
-        })
+        load_workload(&self.store, &self.secrets, app)
     }
 
     /// Every registry and git login, decrypted.
     pub fn credentials(&self) -> anyhow::Result<Vec<Credential>> {
-        self.store
-            .list_credentials()?
-            .into_iter()
-            .map(|c| {
-                Ok(Credential {
-                    kind: c.kind,
-                    host: c.host,
-                    username: c.username,
-                    secret: self.secrets.open_string(&c.sealed_secret)?,
-                })
-            })
-            .collect()
+        load_credentials(&self.store, &self.secrets)
     }
 
     /// Apps run from their first deploy on; before that they are only configuration.
@@ -291,6 +300,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         notifier,
         backup_errors: Default::default(),
         settings,
+        upgrade_attempts: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -339,13 +349,20 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tasks.spawn(backups::run(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
-    let ingress = crate::agent::IngressOptions {
-        http: Some(server.cfg.http_listen),
-        https: Some(server.cfg.https_listen),
+    let ingress = match server.cfg.ingress {
+        crate::config::IngressSetting::Embedded => crate::agent::IngressMode::Embedded {
+            http: Some(server.cfg.http_listen),
+            https: Some(server.cfg.https_listen),
+        },
+        crate::config::IngressSetting::External => crate::agent::IngressMode::External {
+            control: server.cfg.ingress_control.clone(),
+        },
     };
     tokio::spawn(async move {
         loop {
-            match crate::agent::Agent::new(local_token.clone(), agent_dir.clone(), ingress).await {
+            match crate::agent::Agent::new(local_token.clone(), agent_dir.clone(), ingress.clone())
+                .await
+            {
                 Ok(agent) => return agent.run().await,
                 Err(e) => {
                     error!("local agent cannot start, retrying in 30s: {e:#}");

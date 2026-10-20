@@ -1,11 +1,13 @@
 [Unit]
 Description=facade agent
 After=network-online.target docker.service
-Wants=network-online.target
+Wants=network-online.target facaded-ingress.service
 Requires=docker.service
 
 [Service]
-ExecStart=/usr/local/bin/facaded agent --data-dir /var/lib/facade-agent
+# The node's entry point runs on its own (facaded-ingress.service), so updating
+# the agent never drops traffic.
+ExecStart=/usr/local/bin/facaded agent --data-dir /var/lib/facade-agent --ingress-control /run/facade/ingress.sock
 Restart=always
 RestartSec=3
 Environment=RUST_LOG=info

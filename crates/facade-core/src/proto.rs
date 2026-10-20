@@ -15,7 +15,10 @@ use uuid::Uuid;
 
 use crate::spec::AppSpec;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+/// The oldest agent protocol the server still talks to. Agents in between are
+/// sent the server's binary and update themselves.
+pub const MIN_AGENT_PROTOCOL: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -26,14 +29,21 @@ pub enum Hello {
         protocol: u32,
         agent_version: String,
         hostname: String,
+        /// SHA-256 of the agent's executable, to tell builds apart.
+        #[serde(default)]
+        binary: Option<String>,
+        /// CPU architecture the agent runs on.
+        #[serde(default)]
+        arch: Option<String>,
     },
     Data {
         node: String,
         secret: String,
         tunnel: Uuid,
     },
-    /// Download an uploaded executable. The server answers `ok <size>\n` then the
-    /// bytes, or `error <message>\n`.
+    /// Download an uploaded executable, or the server's own binary (by its
+    /// SHA-256). The server answers `ok <size>\n` then the bytes, or
+    /// `error <message>\n`.
     Fetch {
         node: String,
         secret: String,
@@ -162,6 +172,11 @@ pub enum AgentRequest {
         app: String,
         tail: u32,
         follow: bool,
+    },
+    /// Replace the agent's executable with the server's (fetched by its SHA-256),
+    /// hand the node's entry point over to it, and restart.
+    Upgrade {
+        sha256: String,
     },
     /// Every facade volume on the node, with sizes. Answers `Vec<VolumeInfo>`.
     Volumes,

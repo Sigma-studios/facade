@@ -23,6 +23,12 @@ pub struct ServerConfig {
     /// Where this machine serves its apps.
     pub http_listen: SocketAddr,
     pub https_listen: SocketAddr,
+    /// `embedded`: the entry point runs inside `facaded server`. `external`: in
+    /// `facaded ingress` (its own service), so updating the server never touches
+    /// traffic.
+    pub ingress: IngressSetting,
+    /// Control socket of `facaded ingress`.
+    pub ingress_control: PathBuf,
     /// Name of the node the server itself runs apps on.
     pub local_node: String,
     /// Serve the API on this domain through the ingress too, with a real certificate.
@@ -41,6 +47,8 @@ impl Default for ServerConfig {
             api_loopback: "127.0.0.1:7702".parse().unwrap(),
             http_listen: "0.0.0.0:80".parse().unwrap(),
             https_listen: "0.0.0.0:443".parse().unwrap(),
+            ingress: IngressSetting::Embedded,
+            ingress_control: DEFAULT_INGRESS_CONTROL.into(),
             local_node: "main".into(),
             api_domain: None,
             acme: AcmeConfig::default(),
@@ -76,6 +84,15 @@ impl Default for AcmeConfig {
             dns_propagation_secs: 60,
         }
     }
+}
+
+pub const DEFAULT_INGRESS_CONTROL: &str = "/run/facade/ingress.sock";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IngressSetting {
+    Embedded,
+    External,
 }
 
 /// Copies of every app volume, and of the server's own database and key, kept in

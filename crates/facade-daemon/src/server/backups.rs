@@ -151,7 +151,17 @@ pub async fn backup_volume(server: &Server, app: &str, volume: &str) -> anyhow::
 /// Copies the database (consistently, while the server runs) and the key that
 /// decrypts its secrets.
 pub async fn backup_server(server: &Server) -> anyhow::Result<PathBuf> {
-    let base = root(server).join(SERVER_DIR);
+    snapshot_state(&server.cfg.data_dir, &server.store, server.cfg.backups.keep)
+}
+
+/// Copies the database and master key of the server in `data_dir` to
+/// `backups/_server/<time>`, keeping the `keep` newest copies.
+pub fn snapshot_state(
+    data_dir: &Path,
+    store: &super::store::Store,
+    keep: usize,
+) -> anyhow::Result<PathBuf> {
+    let base = data_dir.join("backups").join(SERVER_DIR);
     create_dirs(&base)?;
     let dir = base.join(facade_core::now().to_string());
     if dir.exists() {
@@ -160,11 +170,11 @@ pub async fn backup_server(server: &Server) -> anyhow::Result<PathBuf> {
     let partial = base.join(".partial");
     let _ = std::fs::remove_dir_all(&partial);
     tls::create_private_dir(&partial)?;
-    server.store.snapshot(&partial.join("facade.db"))?;
-    let key = std::fs::read(server.cfg.data_dir.join("master.key"))?;
+    store.snapshot(&partial.join("facade.db"))?;
+    let key = std::fs::read(data_dir.join("master.key"))?;
     tls::write_private(&partial.join("master.key"), &key)?;
     std::fs::rename(&partial, &dir)?;
-    prune(&base, server.cfg.backups.keep.max(1));
+    prune(&base, keep.max(1));
     Ok(dir)
 }
 

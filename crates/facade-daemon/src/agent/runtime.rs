@@ -65,6 +65,30 @@ fn volume_name(app: &str, volume: &str) -> String {
     format!("facade-{app}_{volume}")
 }
 
+/// The image an app runs: its registry reference, or the tag its build gets
+/// (named after its source and revision, so it is reused until either changes).
+/// `None` for static sites.
+pub fn planned_image(w: &Workload) -> Option<String> {
+    match &w.spec.source {
+        Source::Image { image } => Some(facade_core::image_with_tag(image)),
+        Source::Git {
+            build: Build::Static { .. },
+            ..
+        } => None,
+        Source::Executable { .. } | Source::Git { .. } => Some(format!(
+            "{}:{}",
+            image_repo(&w.spec.name),
+            short_hash(&(&w.spec.source, w.revision))
+        )),
+    }
+}
+
+/// Fingerprint of everything a container is created from. A container whose
+/// `facade.run` label differs is replaced.
+pub fn run_key(w: &Workload, image: &str) -> String {
+    short_hash(&(w.run_identity(), image))
+}
+
 fn short_hash(value: &impl Serialize) -> String {
     let json = serde_json::to_vec(value).expect("serializable");
     hex::encode(&Sha256::digest(json)[..8])
@@ -127,7 +151,7 @@ impl Runtime {
         }
 
         let image = self.ensure_image(w, log).await?;
-        let run_key = short_hash(&(w.run_identity(), &image));
+        let run_key = run_key(w, &image);
         let name = container(app);
         match self
             .docker()
@@ -228,8 +252,8 @@ impl Runtime {
                 filename,
                 arch,
             } => {
-                let key = short_hash(&(&w.spec.source, w.revision));
-                let tag = format!("{}:{key}", image_repo(&w.spec.name));
+                let tag = planned_image(w).expect("built sources have an image");
+                let key = tag.rsplit(':').next().unwrap_or_default().to_string();
                 if self.docker().inspect_image(&tag).await.is_ok() {
                     return Ok(tag);
                 }
@@ -264,8 +288,8 @@ impl Runtime {
                 branch,
                 build,
             } => {
-                let key = short_hash(&(&w.spec.source, w.revision));
-                let tag = format!("{}:{key}", image_repo(&w.spec.name));
+                let tag = planned_image(w).expect("built sources have an image");
+                let key = tag.rsplit(':').next().unwrap_or_default().to_string();
                 if self.docker().inspect_image(&tag).await.is_ok() {
                     return Ok(tag);
                 }

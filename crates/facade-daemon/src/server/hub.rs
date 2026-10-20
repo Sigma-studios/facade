@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use facade_core::proto::{AgentEvent, AgentMsg, AgentRequest, Hello, PROTOCOL_VERSION, ServerMsg};
+use facade_core::proto::{
+    AgentEvent, AgentMsg, AgentRequest, Hello, MIN_AGENT_PROTOCOL, PROTOCOL_VERSION, ServerMsg,
+};
 use parking_lot::{Mutex, RwLock};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
@@ -249,18 +251,39 @@ async fn accept(
             protocol,
             agent_version,
             hostname,
+            binary,
+            arch,
             ..
         } => {
-            if protocol != PROTOCOL_VERSION {
+            if protocol > PROTOCOL_VERSION {
                 let reason = format!(
-                    "protocol {protocol} not supported, server speaks {PROTOCOL_VERSION}: upgrade facaded on both sides"
+                    "agent protocol {protocol} is newer than the server's ({PROTOCOL_VERSION}): upgrade the server first"
                 );
                 let _ = write_json(&mut stream, &ServerMsg::Rejected { reason }).await;
                 return Ok(());
             }
-            control(server, stream, peer, node, hostname, agent_version).await
+            if protocol < MIN_AGENT_PROTOCOL {
+                let reason = format!(
+                    "agent protocol {protocol} is too old for this server (needs {MIN_AGENT_PROTOCOL}): install the server's facaded on this node by hand"
+                );
+                let _ = write_json(&mut stream, &ServerMsg::Rejected { reason }).await;
+                return Ok(());
+            }
+            let build = AgentBuild {
+                version: agent_version,
+                binary,
+                arch,
+            };
+            control(server, stream, peer, node, hostname, build).await
         }
     }
+}
+
+/// What an agent says about the facaded it runs.
+struct AgentBuild {
+    version: String,
+    binary: Option<String>,
+    arch: Option<String>,
 }
 
 async fn control(
@@ -269,8 +292,13 @@ async fn control(
     peer: SocketAddr,
     node: String,
     hostname: String,
-    agent_version: String,
+    build: AgentBuild,
 ) -> anyhow::Result<()> {
+    let AgentBuild {
+        version: agent_version,
+        binary,
+        arch,
+    } = build;
     let (read, mut write) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(256);
     let conn = Arc::new(NodeConn {
@@ -333,6 +361,7 @@ async fn control(
             }
             // Its address may have changed: DNS records follow.
             server.domains_wake.notify_one();
+            offer_upgrade(&server, &node, binary.as_deref(), arch.as_deref()).await;
         });
     }
 
@@ -392,7 +421,52 @@ async fn control(
     result
 }
 
-/// Streams an uploaded executable to an agent that runs an app using it.
+/// Agents run the server's build: one running another is sent the server's
+/// binary (at most once per build and node every ten minutes, so an agent that
+/// cannot install it is not asked in a loop).
+async fn offer_upgrade(server: &Server, node: &str, binary: Option<&str>, arch: Option<&str>) {
+    let Some(own) = crate::selfbin::current() else {
+        return;
+    };
+    if node == server.cfg.local_node || binary == Some(own.sha256.as_str()) {
+        return;
+    }
+    if arch != Some(std::env::consts::ARCH) {
+        warn!(
+            %node,
+            "runs another build of facaded on {}, and this server's binary is for {}: update it by hand",
+            arch.unwrap_or("an unknown CPU"),
+            std::env::consts::ARCH
+        );
+        return;
+    }
+    {
+        let now = facade_core::now();
+        let mut attempts = server.upgrade_attempts.lock();
+        if let Some((sha, at)) = attempts.get(node)
+            && *sha == own.sha256
+            && now.saturating_sub(*at) < 600
+        {
+            return;
+        }
+        attempts.insert(node.to_string(), (own.sha256.clone(), now));
+    }
+    info!(
+        %node,
+        from = binary.map(crate::selfbin::short).unwrap_or("unknown"),
+        to = crate::selfbin::short(&own.sha256),
+        "sending the node this server's facaded"
+    );
+    let request = AgentRequest::Upgrade {
+        sha256: own.sha256.clone(),
+    };
+    if let Err(e) = server.hub.request(node, request).await {
+        warn!(%node, "updating its agent: {e:#}");
+    }
+}
+
+/// Streams an uploaded executable to an agent that runs an app using it, or the
+/// server's own binary to an agent updating itself.
 async fn send_artifact(
     server: &Server,
     node: &str,
@@ -400,6 +474,17 @@ async fn send_artifact(
     mut stream: DataStream,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
+    if let Some(own) = crate::selfbin::current()
+        && own.sha256 == sha256
+    {
+        let mut file = crate::selfbin::open().await?;
+        stream
+            .write_all(format!("ok {}\n", own.size).as_bytes())
+            .await?;
+        tokio::io::copy(&mut file, &mut stream).await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
     let allowed = super::artifacts::used_by_node(server, node)?
         .iter()
         .any(|s| s == sha256);
