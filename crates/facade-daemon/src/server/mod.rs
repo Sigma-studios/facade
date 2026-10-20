@@ -13,6 +13,7 @@ mod settings;
 pub mod store;
 mod ui;
 mod updates;
+pub mod users;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -120,13 +121,18 @@ pub fn load_workload(store: &Store, secrets: &SecretBox, app: &str) -> anyhow::R
         spec: row.spec,
         env,
         revision: row.revision,
-        credentials: load_credentials(store, secrets)?,
+        // Builds use the logins of whoever owns the app, never someone else's.
+        credentials: load_credentials(store, secrets, row.owner.unwrap_or(store::ADMINS))?,
     })
 }
 
-fn load_credentials(store: &Store, secrets: &SecretBox) -> anyhow::Result<Vec<Credential>> {
+fn load_credentials(
+    store: &Store,
+    secrets: &SecretBox,
+    owner: i64,
+) -> anyhow::Result<Vec<Credential>> {
     store
-        .list_credentials()?
+        .list_credentials(Some(owner))?
         .into_iter()
         .map(|c| {
             Ok(Credential {
@@ -162,9 +168,10 @@ impl Server {
         load_workload(&self.store, &self.secrets, app)
     }
 
-    /// Every registry and git login, decrypted.
-    pub fn credentials(&self) -> anyhow::Result<Vec<Credential>> {
-        load_credentials(&self.store, &self.secrets)
+    /// The registry and git logins of `owner` (a user id, or the admins'),
+    /// decrypted.
+    pub fn credentials(&self, owner: i64) -> anyhow::Result<Vec<Credential>> {
+        load_credentials(&self.store, &self.secrets, owner)
     }
 
     /// Apps run from their first deploy on; before that they are only configuration.

@@ -77,14 +77,28 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS app_access (
+    app TEXT NOT NULL REFERENCES apps(name) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (app, user_id)
+);
+"#;
+
+/// Registry and git logins, each belonging to a user (`owner_id`; 0 for the
+/// admins, who share theirs).
+const CREDENTIALS: &str = r#"
 CREATE TABLE IF NOT EXISTS credentials (
     kind TEXT NOT NULL,
     host TEXT NOT NULL,
+    owner_id INTEGER NOT NULL DEFAULT 0,
     username TEXT NOT NULL,
     secret BLOB NOT NULL,
-    PRIMARY KEY (kind, host)
+    PRIMARY KEY (kind, host, owner_id)
 );
 "#;
+
+/// The owner id of logins shared by every admin.
+pub const ADMINS: i64 = 0;
 
 /// `ALTER TABLE … ADD COLUMN`, once.
 fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> anyhow::Result<()> {
@@ -104,6 +118,31 @@ pub struct UserRow {
     pub username: String,
     pub password_hash: String,
     pub role: String,
+    /// Shared by every app the user owns; `None` is no limit.
+    pub memory_cap_mb: Option<u64>,
+    pub cpu_cap: Option<f64>,
+    pub must_change_password: bool,
+}
+
+impl UserRow {
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
+}
+
+const USER_COLUMNS: &str =
+    "u.id, u.username, u.password_hash, u.role, u.memory_cap_mb, u.cpu_cap, u.must_change_password";
+
+fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
+    Ok(UserRow {
+        id: r.get(0)?,
+        username: r.get(1)?,
+        password_hash: r.get(2)?,
+        role: r.get(3)?,
+        memory_cap_mb: r.get(4)?,
+        cpu_cap: r.get(5)?,
+        must_change_password: r.get(6)?,
+    })
 }
 
 pub struct NodeRow {
@@ -119,6 +158,8 @@ pub struct NodeRow {
 pub struct AppRow {
     pub spec: AppSpec,
     pub revision: u64,
+    /// The user whose resources and logins the app uses; `None` for the admins.
+    pub owner: Option<i64>,
 }
 
 pub struct EnvRow {
@@ -128,6 +169,7 @@ pub struct EnvRow {
 }
 
 pub struct CredentialRow {
+    pub owner_id: i64,
     pub kind: CredentialKind,
     pub host: String,
     pub username: String,
@@ -185,6 +227,10 @@ impl Store {
             "must_change_password",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        add_column(&conn, "users", "memory_cap_mb", "INTEGER")?;
+        add_column(&conn, "users", "cpu_cap", "REAL")?;
+        add_column(&conn, "apps", "owner_id", "INTEGER")?;
+        migrate_credentials(&conn)?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -221,31 +267,81 @@ impl Store {
         Ok(())
     }
 
-    pub fn must_change_password(&self, user_id: i64) -> anyhow::Result<bool> {
-        Ok(self.0.lock().query_row(
-            "SELECT must_change_password FROM users WHERE id = ?1",
-            [user_id],
-            |r| r.get(0),
-        )?)
-    }
-
     pub fn user_by_name(&self, username: &str) -> anyhow::Result<Option<UserRow>> {
         Ok(self
             .0
             .lock()
             .query_row(
-                "SELECT id, username, password_hash, role FROM users WHERE username = ?1",
+                &format!("SELECT {USER_COLUMNS} FROM users u WHERE u.username = ?1"),
                 [username],
-                |r| {
-                    Ok(UserRow {
-                        id: r.get(0)?,
-                        username: r.get(1)?,
-                        password_hash: r.get(2)?,
-                        role: r.get(3)?,
-                    })
-                },
+                user_from_row,
             )
             .optional()?)
+    }
+
+    pub fn list_users(&self) -> anyhow::Result<Vec<UserRow>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {USER_COLUMNS} FROM users u ORDER BY u.username"
+        ))?;
+        let users = stmt
+            .query_map([], user_from_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(users)
+    }
+
+    pub fn user_by_id(&self, id: i64) -> anyhow::Result<Option<UserRow>> {
+        Ok(self
+            .0
+            .lock()
+            .query_row(
+                &format!("SELECT {USER_COLUMNS} FROM users u WHERE u.id = ?1"),
+                [id],
+                user_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn set_user_role(&self, id: i64, role: &str) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE users SET role = ?2 WHERE id = ?1",
+            params![id, role],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_user_caps(
+        &self,
+        id: i64,
+        memory_cap_mb: Option<u64>,
+        cpu_cap: Option<f64>,
+    ) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE users SET memory_cap_mb = ?2, cpu_cap = ?3 WHERE id = ?1",
+            params![id, memory_cap_mb, cpu_cap],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a user, their sessions, grants and logins; their apps go back to
+    /// the admins.
+    pub fn delete_user(&self, id: i64) -> anyhow::Result<()> {
+        let conn = self.0.lock();
+        conn.execute("UPDATE apps SET owner_id = NULL WHERE owner_id = ?1", [id])?;
+        conn.execute("DELETE FROM credentials WHERE owner_id = ?1", [id])?;
+        conn.execute("DELETE FROM users WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// A new password chosen by an admin: valid once, then it must be changed.
+    pub fn reset_password(&self, user_id: i64, hash: &str) -> anyhow::Result<()> {
+        let conn = self.0.lock();
+        conn.execute(
+            "UPDATE users SET password_hash = ?1, must_change_password = 1 WHERE id = ?2",
+            params![hash, user_id],
+        )?;
+        conn.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?;
+        Ok(())
     }
 
     pub fn set_password(&self, user_id: i64, hash: &str) -> anyhow::Result<()> {
@@ -281,18 +377,13 @@ impl Store {
             .0
             .lock()
             .query_row(
-                "SELECT u.id, u.username, u.password_hash, u.role FROM sessions s
-                 JOIN users u ON u.id = s.user_id
-                 WHERE s.token_hash = ?1 AND s.expires_at > ?2",
+                &format!(
+                    "SELECT {USER_COLUMNS} FROM sessions s
+                     JOIN users u ON u.id = s.user_id
+                     WHERE s.token_hash = ?1 AND s.expires_at > ?2"
+                ),
                 params![token_hash, facade_core::now()],
-                |r| {
-                    Ok(UserRow {
-                        id: r.get(0)?,
-                        username: r.get(1)?,
-                        password_hash: r.get(2)?,
-                        role: r.get(3)?,
-                    })
-                },
+                user_from_row,
             )
             .optional()?)
     }
@@ -391,21 +482,23 @@ impl Store {
 
     // ---- apps
 
-    fn app_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, u64)> {
-        Ok((r.get(0)?, r.get(1)?))
+    fn app_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, u64, Option<i64>)> {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
     }
 
-    fn parse_app((spec, revision): (String, u64)) -> anyhow::Result<AppRow> {
+    fn parse_app((spec, revision, owner): (String, u64, Option<i64>)) -> anyhow::Result<AppRow> {
         Ok(AppRow {
             spec: serde_json::from_str(&spec)?,
             revision,
+            owner,
         })
     }
 
     pub fn list_apps(&self) -> anyhow::Result<Vec<AppRow>> {
-        let raw: Vec<(String, u64)> = {
+        let raw: Vec<(String, u64, Option<i64>)> = {
             let conn = self.0.lock();
-            let mut stmt = conn.prepare("SELECT spec, revision FROM apps ORDER BY name")?;
+            let mut stmt =
+                conn.prepare("SELECT spec, revision, owner_id FROM apps ORDER BY name")?;
             stmt.query_map([], Self::app_from_row)?
                 .collect::<Result<_, _>>()?
         };
@@ -417,7 +510,7 @@ impl Store {
             .0
             .lock()
             .query_row(
-                "SELECT spec, revision FROM apps WHERE name = ?1",
+                "SELECT spec, revision, owner_id FROM apps WHERE name = ?1",
                 [name],
                 Self::app_from_row,
             )
@@ -434,6 +527,39 @@ impl Store {
             params![spec.name, serde_json::to_string(spec)?, now],
         )?;
         Ok(())
+    }
+
+    pub fn set_app_owner(&self, name: &str, owner: Option<i64>) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE apps SET owner_id = ?2 WHERE name = ?1",
+            params![name, owner],
+        )?;
+        Ok(())
+    }
+
+    /// Users given access to an app besides its owner.
+    pub fn app_access(&self, app: &str) -> anyhow::Result<Vec<i64>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare("SELECT user_id FROM app_access WHERE app = ?1")?;
+        let ids = stmt
+            .query_map([app], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    pub fn grant_access(&self, app: &str, user_id: i64) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "INSERT OR IGNORE INTO app_access (app, user_id) VALUES (?1, ?2)",
+            params![app, user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_access(&self, app: &str, user_id: i64) -> anyhow::Result<bool> {
+        Ok(self.0.lock().execute(
+            "DELETE FROM app_access WHERE app = ?1 AND user_id = ?2",
+            params![app, user_id],
+        )? > 0)
     }
 
     pub fn bump_revision(&self, name: &str) -> anyhow::Result<u64> {
@@ -700,24 +826,29 @@ impl Store {
 
     // ---- registry and git logins
 
-    pub fn list_credentials(&self) -> anyhow::Result<Vec<CredentialRow>> {
+    /// Logins of `owner` (a user id, or [`ADMINS`]), or everyone's.
+    pub fn list_credentials(&self, owner: Option<i64>) -> anyhow::Result<Vec<CredentialRow>> {
         let conn = self.0.lock();
-        let mut stmt = conn
-            .prepare("SELECT kind, host, username, secret FROM credentials ORDER BY kind, host")?;
+        let mut stmt = conn.prepare(
+            "SELECT owner_id, kind, host, username, secret FROM credentials
+             WHERE ?1 IS NULL OR owner_id = ?1 ORDER BY owner_id, kind, host",
+        )?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map([owner], |r| {
                 Ok((
-                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows
             .into_iter()
-            .filter_map(|(kind, host, username, sealed_secret)| {
+            .filter_map(|(owner_id, kind, host, username, sealed_secret)| {
                 Some(CredentialRow {
+                    owner_id,
                     kind: parse_kind(&kind)?,
                     host,
                     username,
@@ -729,23 +860,30 @@ impl Store {
 
     pub fn put_credential(
         &self,
+        owner: i64,
         kind: CredentialKind,
         host: &str,
         username: &str,
         sealed_secret: &[u8],
     ) -> anyhow::Result<()> {
         self.0.lock().execute(
-            "INSERT OR REPLACE INTO credentials (kind, host, username, secret) VALUES (?1, ?2, ?3, ?4)",
-            params![kind.to_string(), host, username, sealed_secret],
+            "INSERT OR REPLACE INTO credentials (owner_id, kind, host, username, secret)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![owner, kind.to_string(), host, username, sealed_secret],
         )?;
         Ok(())
     }
 
     /// Whether there was one to delete.
-    pub fn delete_credential(&self, kind: CredentialKind, host: &str) -> anyhow::Result<bool> {
+    pub fn delete_credential(
+        &self,
+        owner: i64,
+        kind: CredentialKind,
+        host: &str,
+    ) -> anyhow::Result<bool> {
         Ok(self.0.lock().execute(
-            "DELETE FROM credentials WHERE kind = ?1 AND host = ?2",
-            params![kind.to_string(), host],
+            "DELETE FROM credentials WHERE owner_id = ?1 AND kind = ?2 AND host = ?3",
+            params![owner, kind.to_string(), host],
         )? > 0)
     }
 
@@ -755,6 +893,28 @@ impl Store {
         self.0.lock().execute("VACUUM INTO ?1", [dest])?;
         Ok(())
     }
+}
+
+/// Logins used to belong to everyone: they become the admins'.
+fn migrate_credentials(conn: &Connection) -> anyhow::Result<()> {
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(credentials)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    if columns.is_empty() {
+        conn.execute_batch(CREDENTIALS)?;
+    } else if !columns.iter().any(|c| c == "owner_id") {
+        conn.execute_batch(&format!(
+            "BEGIN;
+             ALTER TABLE credentials RENAME TO credentials_old;
+             {CREDENTIALS}
+             INSERT INTO credentials (kind, host, owner_id, username, secret)
+                 SELECT kind, host, 0, username, secret FROM credentials_old;
+             DROP TABLE credentials_old;
+             COMMIT;"
+        ))?;
+    }
+    Ok(())
 }
 
 fn parse_kind(s: &str) -> Option<CredentialKind> {

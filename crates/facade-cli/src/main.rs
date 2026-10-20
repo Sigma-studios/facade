@@ -80,6 +80,11 @@ enum Command {
     /// Logins for private registries (image pulls, Dockerfile FROM) and git hosts.
     #[command(subcommand)]
     Auth(AuthCommand),
+    /// Accounts: admins manage everything, members only their apps (admins only).
+    #[command(subcommand)]
+    User(UserCommand),
+    /// Who you are logged in as, and your resource cap.
+    Whoami,
     /// Every routed domain: where it must point, whether it does, and its certificate.
     Domains,
     /// Show or set the DNS provider facade manages records with.
@@ -203,6 +208,45 @@ enum ServerCommand {
 }
 
 #[derive(Subcommand)]
+enum UserCommand {
+    #[command(alias = "ls")]
+    List,
+    /// Create an account; prints a one-time password to hand over (it must be
+    /// changed at first login).
+    Add {
+        name: String,
+        /// An admin instead of a member.
+        #[arg(long)]
+        admin: bool,
+        /// Memory shared by all the member's apps, in MB.
+        #[arg(long)]
+        memory: Option<u64>,
+        /// CPUs shared by all the member's apps.
+        #[arg(long)]
+        cpus: Option<f64>,
+    },
+    /// Change a role or caps; only the flags given are changed (0 removes a cap).
+    Set {
+        name: String,
+        #[arg(long, value_parser = ["admin", "member"])]
+        role: Option<String>,
+        #[arg(long)]
+        memory: Option<u64>,
+        #[arg(long)]
+        cpus: Option<f64>,
+    },
+    /// Replace a password with a one-time one (logs the user out).
+    ResetPassword { name: String },
+    /// Delete an account; its apps go back to the admins.
+    #[command(alias = "rm")]
+    Remove {
+        name: String,
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum VolumeCommand {
     /// Every volume, with its node, size and last backup.
     #[command(alias = "ls")]
@@ -322,6 +366,23 @@ enum AppCommand {
         move_data: bool,
     },
     #[command(alias = "rm")]
+    /// Give an app to a member (their cap, their logins), or `--admins` back.
+    Owner {
+        app: String,
+        user: Option<String>,
+        #[arg(long, conflicts_with = "user")]
+        admins: bool,
+    },
+    /// Let a member manage an app (admins only).
+    Grant {
+        app: String,
+        user: String,
+    },
+    /// Take that back.
+    Revoke {
+        app: String,
+        user: String,
+    },
     Remove {
         name: String,
         /// Also delete its volumes. Without this they stay on the node.
@@ -879,6 +940,26 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
         Command::Volume(cmd) => volume(api, cmd, json).await?,
         Command::Backup(cmd) => backup(api, cmd, json).await?,
         Command::Auth(cmd) => auth(api, cmd, json).await?,
+        Command::User(cmd) => user(api, cmd, json).await?,
+        Command::Whoami => {
+            let me: WhoAmI = api.get("/api/whoami").await?;
+            if json {
+                return print_json(&me);
+            }
+            println!("{} ({})", me.username, me.role);
+            if let Some(cap) = me.memory_cap_mb {
+                println!(
+                    "memory: {} of {cap} MB used by your apps",
+                    me.memory_allocated_mb
+                );
+            }
+            if let Some(cap) = me.cpu_cap {
+                println!("cpus:   {} of {cap} used by your apps", me.cpus_allocated);
+            }
+            if me.must_change_password {
+                println!("change your password: facade passwd");
+            }
+        }
         Command::Domain(cmd) => {
             let (name, domain, add) = match cmd {
                 DomainCommand::Add { app, domain } => (app, domain, true),
@@ -1447,6 +1528,34 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
             }
             eprintln!("updated {name}");
         }
+        AppCommand::Owner { app, user, admins } => {
+            if user.is_none() && !admins {
+                bail!("give a user, or --admins");
+            }
+            api.send(
+                api.request(Method::PUT, &format!("/api/apps/{app}/owner"))
+                    .json(&SetOwner {
+                        owner: user.clone(),
+                    }),
+            )
+            .await?;
+            match user {
+                Some(u) => eprintln!(
+                    "{app} belongs to {u}: it counts against their cap and builds with their logins"
+                ),
+                None => eprintln!("{app} belongs to the admins"),
+            }
+        }
+        AppCommand::Grant { app, user } => {
+            api.send(api.request(Method::PUT, &format!("/api/apps/{app}/access/{user}")))
+                .await?;
+            eprintln!("{user} can manage {app}");
+        }
+        AppCommand::Revoke { app, user } => {
+            api.send(api.request(Method::DELETE, &format!("/api/apps/{app}/access/{user}")))
+                .await?;
+            eprintln!("{user} can no longer manage {app}");
+        }
         AppCommand::Remove {
             name,
             delete_data,
@@ -1694,9 +1803,15 @@ async fn auth(api: &Api, cmd: AuthCommand, json: bool) -> anyhow::Result<()> {
                 println!("no logins; add one with `facade auth registry ghcr.io --user <you>`");
             }
             table(
-                &["KIND", "HOST", "USER"],
-                list.iter()
-                    .map(|c| vec![c.kind.to_string(), c.host.clone(), c.username.clone()]),
+                &["KIND", "HOST", "USER", "OWNER"],
+                list.iter().map(|c| {
+                    vec![
+                        c.kind.to_string(),
+                        c.host.clone(),
+                        c.username.clone(),
+                        c.owner.clone().unwrap_or_else(|| "admins".into()),
+                    ]
+                }),
             );
             return Ok(());
         }
@@ -1733,6 +1848,125 @@ async fn auth(api: &Api, cmd: AuthCommand, json: bool) -> anyhow::Result<()> {
     )
     .await?;
     eprintln!("saved the {kind} login for {host} (as {user})");
+    Ok(())
+}
+
+async fn user(api: &Api, cmd: UserCommand, json: bool) -> anyhow::Result<()> {
+    let print_password = |p: &OneTimePassword| {
+        println!("{}'s one-time password: {}", p.username, p.password);
+        println!("they log in with it (web UI or `facade login`) and must then choose their own");
+    };
+    match cmd {
+        UserCommand::List => {
+            let users: Vec<UserView> = api.get("/api/users").await?;
+            if json {
+                return print_json(&users);
+            }
+            table(
+                &["USER", "ROLE", "MEMORY", "CPUS", "APPS"],
+                users.iter().map(|u| {
+                    let cap = |used: String, cap: Option<String>| match cap {
+                        Some(cap) => format!("{used} / {cap}"),
+                        None => "-".into(),
+                    };
+                    let mut apps = u.apps.clone();
+                    apps.extend(u.shared_apps.iter().map(|a| format!("{a} (shared)")));
+                    vec![
+                        format!(
+                            "{}{}",
+                            u.username,
+                            if u.must_change_password {
+                                " (new password pending)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        u.role.clone(),
+                        cap(
+                            format!("{} MB", u.memory_allocated_mb),
+                            u.memory_cap_mb.map(|c| format!("{c} MB")),
+                        ),
+                        cap(
+                            u.cpus_allocated.to_string(),
+                            u.cpu_cap.map(|c| c.to_string()),
+                        ),
+                        apps.join(", "),
+                    ]
+                }),
+            );
+        }
+        UserCommand::Add {
+            name,
+            admin,
+            memory,
+            cpus,
+        } => {
+            let created: OneTimePassword = api
+                .json(api.request(Method::POST, "/api/users").json(&CreateUser {
+                    username: name,
+                    role: if admin { "admin" } else { "member" }.into(),
+                    memory_cap_mb: memory,
+                    cpu_cap: cpus,
+                }))
+                .await?;
+            if json {
+                return print_json(&created);
+            }
+            print_password(&created);
+        }
+        UserCommand::Set {
+            name,
+            role,
+            memory,
+            cpus,
+        } => {
+            let users: Vec<UserView> = api.get("/api/users").await?;
+            let current = users
+                .into_iter()
+                .find(|u| u.username == name)
+                .with_context(|| format!("no user named {name}"))?;
+            let update = UpdateUser {
+                role: role.unwrap_or(current.role),
+                memory_cap_mb: match memory {
+                    Some(0) => None,
+                    Some(m) => Some(m),
+                    None => current.memory_cap_mb,
+                },
+                cpu_cap: match cpus {
+                    Some(c) if c == 0.0 => None,
+                    Some(c) => Some(c),
+                    None => current.cpu_cap,
+                },
+            };
+            let view: UserView = api
+                .json(
+                    api.request(Method::PUT, &format!("/api/users/{name}"))
+                        .json(&update),
+                )
+                .await?;
+            if json {
+                return print_json(&view);
+            }
+            eprintln!("updated {name}");
+        }
+        UserCommand::ResetPassword { name } => {
+            let reset: OneTimePassword = api
+                .json(api.request(Method::POST, &format!("/api/users/{name}/password")))
+                .await?;
+            if json {
+                return print_json(&reset);
+            }
+            print_password(&reset);
+        }
+        UserCommand::Remove { name, yes } => {
+            if !yes && !confirm(&format!("Delete {name}? Their apps go back to the admins."))? {
+                bail!("aborted");
+            }
+            api.send(api.request(Method::DELETE, &format!("/api/users/{name}")))
+                .await?;
+            eprintln!("{name} deleted");
+        }
+    }
     Ok(())
 }
 
@@ -1942,6 +2176,12 @@ fn print_app_detail(view: &AppView) {
     let spec = &view.spec;
     println!("name:      {}", spec.name);
     println!("node:      {}", spec.node);
+    if let Some(owner) = &view.owner {
+        println!("owner:     {owner}");
+    }
+    if !view.access.is_empty() {
+        println!("access:    {}", view.access.join(", "));
+    }
     println!(
         "state:     {}{}",
         view.state,
