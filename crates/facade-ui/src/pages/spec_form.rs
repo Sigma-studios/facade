@@ -379,7 +379,9 @@ impl SpecForm {
             ),
             _ => None,
         };
-        let ports = if is_static || self.host_network.get_untracked() {
+        // On the node's network they are not remapped but still declared, so
+        // ports held by something else are caught before the app starts.
+        let ports = if is_static {
             vec![]
         } else {
             self.ports
@@ -691,10 +693,15 @@ pub fn SpecFields(
             <Show when=move || !f.is_static()>
                 <div class="form-row">
                     <label class="field grow">
-                        <span>"Published ports"</span>
-                        <textarea rows="2" bind:value=f.ports disabled=move || f.host_network.get()
+                        <span>{move || if f.host_network.get() { "Ports it listens on" } else { "Published ports" }}</span>
+                        <textarea rows="2" bind:value=f.ports
                             placeholder="3478:3478/udp\n49160-49260:49160-49260/udp"></textarea>
-                        <small>"host:container/protocol, one per line. Opened on the node's public interface."</small>
+                        <small>{move || if f.host_network.get() {
+                            "port/protocol or a range, one per line, e.g. 9090/tcp. Nothing is remapped on the node's network: \
+                             listing them lets façade refuse to start the app while another program holds one."
+                        } else {
+                            "host:container/protocol, one per line. Opened on the node's public interface."
+                        }}</small>
                     </label>
                     <label class="check">
                         <input type="checkbox" bind:checked=f.host_network/>
