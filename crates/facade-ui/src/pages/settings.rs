@@ -169,7 +169,7 @@ fn ServerAccess() -> impl IntoView {
                         <small>
                             {move || match (saved_domain(), ready()) {
                                 (None, _) => view! {
-                                    "Reach facade at its own domain with a real certificate: point an A record for the domain at this server first."
+                                    "Reach façade at its own domain with a real certificate: point an A record for the domain at this server first."
                                 }.into_any(),
                                 (Some(d), false) => view! {
                                     {format!("Waiting for the certificate of {d} (check its DNS on the ")}
@@ -214,7 +214,7 @@ fn ServerAccess() -> impl IntoView {
                                     on:click=move |_| confirm_open.set(true)>"Restrict to this server…"</button>
                             </div>
                             <Show when=move || !ready()>
-                                <small>"Possible once the web UI domain has its certificate, so facade stays reachable."</small>
+                                <small>"Possible once the web UI domain has its certificate, so façade stays reachable."</small>
                             </Show>
                         }
                     >
@@ -232,7 +232,7 @@ fn ServerAccess() -> impl IntoView {
                 {move || {
                     let d = saved_domain().unwrap_or_default();
                     format!(
-                        "Afterwards facade is only reachable at https://{d} (or through an SSH tunnel to the port). \
+                        "Afterwards façade is only reachable at https://{d} (or through an SSH tunnel to the port). \
                          The CLI must sign in again with `facade login https://{d}`."
                     )
                 }}

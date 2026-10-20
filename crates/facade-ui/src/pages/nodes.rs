@@ -190,7 +190,7 @@ pub fn Nodes() -> impl IntoView {
                     </form>
                 }
             >
-                <p>"On the new server (with the facade release folder), install the agent as a service:"</p>
+                <p>"On the new server (with the façade release folder), install the agent as a service:"</p>
                 <CopyField value=install_command/>
                 <p class="muted small">"Or run it directly:"</p>
                 <CopyField value=join_command/>
@@ -264,7 +264,7 @@ fn Ports(
                     </select>
                 </label>
             </div>
-            <p class="muted small">"Every TCP and UDP port open on the node, facade's or not. A port held by another program cannot be published by an app."</p>
+            <p class="muted small">"Every TCP and UDP port open on the node, façade's or not. A port held by another program cannot be published by an app."</p>
             <ErrorNote error=listeners.error/>
             <Show when=move || listeners.loaded() fallback=Loading>
                 <Show when=move || listeners.data.with(|l| l.as_ref().is_some_and(|l| !l.is_empty()))
@@ -298,7 +298,7 @@ fn Ports(
                                         </td>
                                         <td>
                                             {match l.app.clone() {
-                                                Some(app) if app == "facade" => view! { <span>"facade"</span> }.into_any(),
+                                                Some(app) if app == "facade" => view! { <span>"façade"</span> }.into_any(),
                                                 Some(app) => view! {
                                                     <A href=format!("/apps/{app}") attr:class="strong-link">{app.clone()}</A>
                                                 }.into_any(),

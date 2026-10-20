@@ -78,7 +78,7 @@ fn Shell() -> impl IntoView {
             <nav class="sidebar" aria-label="Main">
                 <A href="/" attr:class="brand">
                     <span class="brand-mark" aria-hidden="true">"▚"</span>
-                    "facade"
+                    "façade"
                 </A>
                 <ul class="nav">
                     <li><A href="/" exact=true>"Overview"</A></li>
@@ -149,7 +149,7 @@ fn Login() -> impl IntoView {
             <form class="card login-card" on:submit=submit>
                 <div class="brand login-brand">
                     <span class="brand-mark" aria-hidden="true">"▚"</span>
-                    "facade"
+                    "façade"
                 </div>
                 <label class="field">
                     <span>"Username"</span>

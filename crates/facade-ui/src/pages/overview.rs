@@ -90,7 +90,7 @@ pub fn NodeCard(node: NodeView) -> impl IntoView {
                     <span aria-hidden="true">"⚠ "</span>
                     "Apps on this node are not reachable over the web: "
                     {node.ingress_errors.join("; ")}
-                    ". Another program (a web server?) holds the port; facade keeps retrying. "
+                    ". Another program (a web server?) holds the port; façade keeps retrying. "
                     "The Ports list on the Nodes page shows which."
                 </div>
             })}
