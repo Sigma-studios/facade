@@ -1,0 +1,22 @@
+# /etc/facade/server.toml — every key is optional.
+
+# Address other nodes use to reach this server. Needed before `facade node add`.
+public_host = "203.0.113.10"
+
+# data_dir = "/var/lib/facade"
+# node_listen = "0.0.0.0:7700"    # agents connect here
+# api_listen = "0.0.0.0:7701"     # CLI (self-signed, fingerprint-pinned)
+# http_listen = "0.0.0.0:80"
+# https_listen = "0.0.0.0:443"
+# local_node = "main"             # name of this machine as a node
+
+# Also serve the API at this domain, through the ingress, with a real certificate.
+# api_domain = "facade.example.com"
+
+[acme]
+# enabled = true
+email = "you@example.com"
+# staging = true                  # test against Let's Encrypt staging first
+
+# Alerts go to Discord; set the webhook and who to tag from the CLI:
+#   facade alerts config --webhook https://discord.com/api/webhooks/… --mention @here

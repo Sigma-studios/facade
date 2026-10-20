@@ -1,0 +1,15 @@
+[Unit]
+Description=facade server
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+ExecStart=/usr/local/bin/facaded server --config /etc/facade/server.toml
+Restart=always
+RestartSec=3
+Environment=RUST_LOG=info
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
