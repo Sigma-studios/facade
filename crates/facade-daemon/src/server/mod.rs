@@ -9,6 +9,7 @@ mod hub;
 mod inspect;
 mod monitor;
 mod secrets;
+mod settings;
 mod store;
 mod ui;
 mod updates;
@@ -55,6 +56,7 @@ pub struct Server {
     pub notifier: monitor::Notifier,
     /// Last failed backups, `app/volume` → why. Cleared by the next success.
     pub backup_errors: RwLock<HashMap<String, String>>,
+    pub settings: settings::SettingsCell,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -256,6 +258,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
     let store = Store::open(&cfg.data_dir.join("facade.db"))?;
     let secrets = SecretBox::load_or_create(&cfg.data_dir.join("master.key"))?;
+    let settings = settings::SettingsCell::load(&store, &cfg)?;
     let identity =
         tls::load_or_create_identity(&cfg.data_dir, cfg.public_host.iter().cloned().collect())?;
 
@@ -287,6 +290,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         alerts: Default::default(),
         notifier,
         backup_errors: Default::default(),
+        settings,
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -320,8 +324,14 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(hub::listen(server.clone()));
     tasks.spawn(api::serve_direct(server.clone()));
-    if server.cfg.api_domain.is_some() {
-        tasks.spawn(api::serve_loopback(server.clone()));
+    // Always there, so an API domain set later works without a restart.
+    {
+        let server = server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = api::serve_loopback(server).await {
+                warn!("loopback API (used by the API domain): {e:#}");
+            }
+        });
     }
     tasks.spawn(acme::run(server.clone()));
     tasks.spawn(monitor::run(server.clone()));

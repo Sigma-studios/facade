@@ -11,7 +11,15 @@ public_host = "203.0.113.10"
 # local_node = "main"             # name of this machine as a node
 
 # Also serve the API and web UI at this domain (from this machine, with a real certificate).
+# Like [acme] email, only the starting value: `facade server set` changes it later.
 # api_domain = "facade.example.com"
+
+
+# Volume backups (and of the server's own database and key), in data_dir/backups.
+# [backups]
+# enabled = true
+# every_hours = 24
+# keep = 7
 
 [acme]
 # enabled = true

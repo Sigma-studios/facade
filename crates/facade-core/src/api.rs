@@ -223,6 +223,45 @@ pub struct Candidate {
     pub notes: Vec<String>,
 }
 
+/// Who is logged in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoAmI {
+    pub username: String,
+    pub role: String,
+    /// Still on the password generated at install.
+    #[serde(default)]
+    pub must_change_password: bool,
+}
+
+/// How the server itself is reached. Changed from the CLI or web UI; the
+/// config file only gives the values used before the first change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerSettings {
+    /// Domain serving the web UI and API with a real certificate, through the
+    /// server's own HTTPS entry point.
+    pub api_domain: Option<String>,
+    /// Whether `api_domain` has a certificate (so it works in a browser).
+    pub api_domain_ready: bool,
+    /// Contact address given to Let's Encrypt (expiry notices).
+    pub acme_email: Option<String>,
+    /// Address of the direct API port (self-signed certificate).
+    pub api_listen: String,
+    /// The direct API port only accepts connections from the server itself
+    /// (SSH tunnels), so the API is public only through `api_domain`.
+    pub direct_api_local_only: bool,
+}
+
+/// Fields left out are unchanged; an empty string removes a value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerSettingsUpdate {
+    #[serde(default)]
+    pub api_domain: Option<String>,
+    #[serde(default)]
+    pub acme_email: Option<String>,
+    #[serde(default)]
+    pub direct_api_local_only: Option<bool>,
+}
+
 /// A registry or git login. The secret is never sent back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialView {

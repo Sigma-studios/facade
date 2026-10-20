@@ -205,7 +205,7 @@ pub struct Desired {
 impl Server {
     pub fn desired_domains(&self) -> Vec<Desired> {
         let mut desired = Vec::new();
-        if let Some(domain) = &self.cfg.api_domain {
+        if let Some(domain) = &self.settings.api_domain() {
             desired.push(Desired {
                 domain: domain.clone(),
                 app: None,

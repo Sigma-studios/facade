@@ -39,21 +39,33 @@ alerts; everything scriptable from a CLI with `--json` output.
 ## Install on a VPS (Ubuntu)
 
 ```sh
-deploy/build-linux.sh            # static binaries in dist/amd64 (needs Docker locally)
+deploy/build-linux.sh            # static binaries in dist/amd64 (needs Docker, or podman, and trunk)
 scp -r dist/amd64 root@VPS:/root/facade
-ssh root@VPS /root/facade/install.sh server VPS_PUBLIC_IP
+ssh root@VPS /root/facade/install.sh server VPS_PUBLIC_IP \
+    --domain facade.example.com --email you@example.com
 ```
 
 The installer sets up Docker if needed, writes `/etc/facade/server.toml` (see
-`deploy/server.example.toml` for every option) and starts
-`facaded`. Then from your machine (`cargo install --path crates/facade-cli`):
+`deploy/server.example.toml` for every option) and starts `facaded`. Point an A
+record for the `--domain` at the server: within a minute the web UI is at
+`https://facade.example.com` with a Let's Encrypt certificate. Log in as `admin`
+with the password in `/var/lib/facade/initial-admin-password` (root only, never
+logged), and change it: a banner insists until you do, and the file is deleted then.
+
+Until the domain works, or without one, everything is also on port 7701 with a
+self-signed certificate (`https://VPS_PUBLIC_IP:7701`; the installer prints its
+fingerprint). From your machine (`cargo install --path crates/facade-cli`):
 
 ```sh
-facade login https://VPS_PUBLIC_IP:7701     # user admin, password in /var/lib/facade/initial-admin-password
+facade login https://facade.example.com     # or https://VPS_PUBLIC_IP:7701
 facade passwd
 ```
 
-Add `email` under `[acme]` for Let's Encrypt, then set up domains (below).
+The domain and the Let's Encrypt contact can be changed any time (`facade server set
+--api-domain … --acme-email …`, or Settings → Server access). Once the domain has its
+certificate, `facade server set --direct-api-local-only` closes port 7701 to the
+outside: facade is then public only at its domain, and the port stays usable through
+an SSH tunnel (`ssh -L 7701:127.0.0.1:7701 VPS`) as a way back in.
 
 ### More servers
 
@@ -68,9 +80,9 @@ The node's public IP is detected from where its agent connects; set it with
 
 ## Web UI
 
-`facaded` serves the web UI on the API port: open `https://VPS_IP:7701` (your browser
-warns about the self-signed certificate once) or, with `api_domain` set, that domain
-with a real certificate. Log in with the same account as the CLI. Everything the CLI
+`facaded` serves the web UI at its API domain (`facade server set --api-domain`) with
+a real certificate, and on the API port `https://VPS_IP:7701` (your browser warns
+about the self-signed certificate once). Log in with the same account as the CLI. Everything the CLI
 does is there: apps with live logs, deploys and build output, environment variables,
 settings and limits, nodes and their join commands, alerts and Discord settings,
 export and apply.
