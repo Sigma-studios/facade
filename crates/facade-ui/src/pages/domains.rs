@@ -74,12 +74,12 @@ fn DomainRow(d: DomainStatus, show_app: bool) -> impl IntoView {
     let dns_detail = match (&d.dns_error, d.dns_ok, d.managed, &ip) {
         (Some(e), ..) => e.clone(),
         (None, true, true, Some(ip)) => {
-            format!("Points to {ip}. Record kept up to date by facade.")
+            format!("Points to {ip}. Record kept up to date by façade.")
         }
         (None, true, false, Some(ip)) => format!("Points to {ip}."),
         (None, true, _, None) => "Resolves.".into(),
         (None, false, true, Some(ip)) => {
-            format!("facade set the record to {ip}; it can take a few minutes to be visible.")
+            format!("façade set the record to {ip}; it can take a few minutes to be visible.")
         }
         (None, false, false, Some(ip)) => format!(
             "Create an A record for {} pointing to {ip} at your domain provider.{}",
@@ -117,7 +117,7 @@ fn DomainRow(d: DomainStatus, show_app: bool) -> impl IntoView {
                         Some(app) => view! {
                             <A href=format!("/apps/{app}")>{app.clone()}</A>
                         }.into_any(),
-                        None => view! { <span>"facade itself"</span> }.into_any(),
+                        None => view! { <span>"façade itself"</span> }.into_any(),
                     })}
                     {show_app.then_some(" · ")}
                     {format!("node {}", d.node)}
@@ -197,7 +197,7 @@ fn DnsProvider(on_change: impl Fn() + Copy + Send + Sync + 'static) -> impl Into
                 when=move || connected() && !editing.get()
                 fallback=move || view! {
                     <p class="muted small">
-                        "Connect Porkbun and facade creates each domain's DNS record and a wildcard certificate "
+                        "Connect Porkbun and façade creates each domain's DNS record and a wildcard certificate "
                         "per domain by itself. Without it, create the records shown below by hand."
                     </p>
                     <form class="form" on:submit=connect>
