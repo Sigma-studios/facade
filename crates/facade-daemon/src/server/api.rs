@@ -38,6 +38,10 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/logout", post(logout))
         .route("/api/whoami", get(whoami))
         .route("/api/password", put(change_password))
+        .route(
+            "/api/server-settings",
+            get(server_settings).put(update_server_settings),
+        )
         .route("/api/status", get(status))
         .route("/api/alerts", get(alerts))
         .route("/api/alerts/test", post(test_alert))
@@ -114,9 +118,13 @@ pub async fn serve_direct(server: Arc<Server>) -> anyhow::Result<()> {
     info!("API on https://{}", server.cfg.api_listen);
     let acceptor =
         tokio_rustls::TlsAcceptor::from(tls::single_cert_server(server.identity.key.clone()));
-    let app = router(server);
+    let app = router(server.clone());
     loop {
-        let (tcp, _) = listener.accept().await?;
+        let (tcp, peer) = listener.accept().await?;
+        // Once the API domain works, the direct port can be kept for SSH tunnels.
+        if server.settings.get().direct_api_local_only && !peer.ip().is_loopback() {
+            continue;
+        }
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
@@ -145,8 +153,8 @@ pub async fn serve_loopback(server: Arc<Server>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Creates the first admin with a random password, printed once and saved next to
-/// the database.
+/// Creates the first admin with a random password, saved next to the database
+/// (readable by root only, never logged) until it is changed.
 pub fn ensure_admin(server: &Server) -> anyhow::Result<()> {
     if server.store.user_count()? > 0 {
         return Ok(());
@@ -154,14 +162,18 @@ pub fn ensure_admin(server: &Server) -> anyhow::Result<()> {
     let password = random_token()[..24].to_string();
     server
         .store
-        .create_user("admin", &hash_password(&password)?, "admin")?;
-    let path = server.cfg.data_dir.join("initial-admin-password");
+        .create_user("admin", &hash_password(&password)?, "admin", true)?;
+    let path = initial_password_file(server);
     tls::write_private(&path, format!("{password}\n").as_bytes())?;
     warn!(
-        "created user `admin` with password {password} (also in {}); change it with `facade passwd`",
+        "created user `admin`; its password is in {} until it is changed",
         path.display()
     );
     Ok(())
+}
+
+fn initial_password_file(server: &Server) -> std::path::PathBuf {
+    server.cfg.data_dir.join("initial-admin-password")
 }
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
@@ -282,8 +294,12 @@ async fn logout(State(server): S, user: User) -> ApiResult<StatusCode> {
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn whoami(user: User) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "username": user.username, "role": user.role }))
+async fn whoami(State(server): S, user: User) -> ApiResult<Json<WhoAmI>> {
+    Ok(Json(WhoAmI {
+        must_change_password: server.store.must_change_password(user.id)?,
+        username: user.username,
+        role: user.role,
+    }))
 }
 
 async fn change_password(
@@ -297,7 +313,94 @@ async fn change_password(
     server
         .store
         .set_password(user.id, &hash_password(&req.password)?)?;
+    // The generated password is no longer valid: no reason to keep it around.
+    let _ = std::fs::remove_file(initial_password_file(&server));
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------- server settings
+
+fn settings_view(server: &Server) -> anyhow::Result<ServerSettings> {
+    let settings = server.settings.get();
+    let api_domain_ready = match &settings.api_domain {
+        Some(domain) => {
+            let name = super::acme::covering_name(server, domain);
+            let now = facade_core::now();
+            server
+                .store
+                .list_certs()?
+                .iter()
+                .any(|c| c.domain == name && c.not_after > now)
+        }
+        None => false,
+    };
+    Ok(ServerSettings {
+        api_domain: settings.api_domain,
+        api_domain_ready,
+        acme_email: settings.acme_email,
+        api_listen: server.cfg.api_listen.to_string(),
+        direct_api_local_only: settings.direct_api_local_only,
+    })
+}
+
+async fn server_settings(State(server): S, _: User) -> ApiResult<Json<ServerSettings>> {
+    Ok(Json(settings_view(&server)?))
+}
+
+async fn update_server_settings(
+    State(server): S,
+    _: User,
+    Json(update): Json<ServerSettingsUpdate>,
+) -> ApiResult<Json<ServerSettings>> {
+    let clean = |v: String| {
+        let v = v.trim().to_lowercase();
+        (!v.is_empty()).then_some(v)
+    };
+    let domain = update.api_domain.map(clean);
+    let email = update.acme_email.map(clean);
+    if let Some(Some(domain)) = &domain {
+        facade_core::validate_domain(domain).map_err(bad_request)?;
+        if let Some(app) = server.routes.read().domains.get(domain) {
+            return Err(conflict(format!("{domain} is used by app {app}")));
+        }
+    }
+    if let Some(Some(email)) = &email
+        && (!email.contains('@') || email.contains(char::is_whitespace))
+    {
+        return Err(bad_request(format!("`{email}` is not an email address")));
+    }
+    if update.direct_api_local_only == Some(true) {
+        // Checked against the domain as it will be after this update.
+        let domain = match &domain {
+            Some(d) => d.clone(),
+            None => server.settings.api_domain(),
+        };
+        let current = settings_view(&server)?;
+        let ready = domain.is_some() && domain == current.api_domain && current.api_domain_ready;
+        if !ready {
+            return Err(conflict(
+                "set an API domain and wait for its certificate first: \
+                 otherwise the API is only reachable through an SSH tunnel",
+            ));
+        }
+    }
+    if let Some(domain) = domain {
+        server.settings.set_api_domain(&server.store, domain)?;
+        server.domains_wake.notify_one();
+        super::acme::push_ingress_all(&server).await;
+    }
+    if let Some(email) = email {
+        server.settings.set_acme_email(&server.store, email)?;
+        if let Err(e) = super::acme::update_contact(&server).await {
+            warn!("{e:#}");
+        }
+    }
+    if let Some(local_only) = update.direct_api_local_only {
+        server
+            .settings
+            .set_direct_api_local_only(&server.store, local_only)?;
+    }
+    Ok(Json(settings_view(&server)?))
 }
 
 // ---------------------------------------------------------------- status
@@ -582,7 +685,7 @@ fn check_spec(server: &Server, spec: &AppSpec) -> ApiResult<()> {
     {
         let routes = server.routes.read();
         for domain in spec.domains.iter().chain(&spec.redirects) {
-            if server.cfg.api_domain.as_deref() == Some(domain.as_str()) {
+            if server.settings.api_domain().as_deref() == Some(domain.as_str()) {
                 return Err(conflict(format!("{domain} is the API domain")));
             }
             if let Some(owner) = routes.domains.get(domain)
@@ -1300,7 +1403,7 @@ fn check_spec_for_apply(
     {
         let routes = server.routes.read();
         for domain in spec.domains.iter().chain(&spec.redirects) {
-            if server.cfg.api_domain.as_deref() == Some(domain.as_str()) {
+            if server.settings.api_domain().as_deref() == Some(domain.as_str()) {
                 return Err(conflict(format!("{domain} is the API domain")));
             }
             if let Some(owner) = routes.domains.get(domain)

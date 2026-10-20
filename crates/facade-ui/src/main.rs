@@ -7,7 +7,7 @@ mod util;
 
 use std::time::Duration;
 
-use facade_core::api::{AlertView, LoginRequest, LoginResponse};
+use facade_core::api::{AlertView, LoginRequest, LoginResponse, WhoAmI};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::{A, Outlet, ParentRoute, Route, Router, Routes};
@@ -54,6 +54,12 @@ fn Shell() -> impl IntoView {
     let alerts = polled(Some(Duration::from_secs(15)), || async {
         api::get::<Vec<AlertView>>("/api/alerts").await
     });
+    let whoami = polled(None, || async { api::get::<WhoAmI>("/api/whoami").await });
+    let must_change_password = move || {
+        whoami
+            .data
+            .with(|w| w.as_ref().is_some_and(|w| w.must_change_password))
+    };
     let firing = move || {
         alerts.data.with(|a| {
             a.as_ref()
@@ -92,6 +98,17 @@ fn Shell() -> impl IntoView {
                 <button class="nav-logout" on:click=logout>"Log out"</button>
             </nav>
             <main class="content">
+                <Show when=must_change_password>
+                    <div class="shell-banner">
+                        <A href="/settings" attr:class="banner banner-critical">
+                            <span aria-hidden="true">"⚠"</span>
+                            <span>
+                                <strong>"Change the admin password."</strong>
+                                " It is still the one generated at install. Set your own in Settings."
+                            </span>
+                        </A>
+                    </div>
+                </Show>
                 <Outlet/>
             </main>
         </div>

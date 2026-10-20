@@ -167,6 +167,12 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "deployments", "git_commit", "TEXT")?;
+        add_column(
+            &conn,
+            "users",
+            "must_change_password",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -179,12 +185,28 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?)
     }
 
-    pub fn create_user(&self, username: &str, hash: &str, role: &str) -> anyhow::Result<()> {
+    /// `generated`: the password was made up by facade and must be changed.
+    pub fn create_user(
+        &self,
+        username: &str,
+        hash: &str,
+        role: &str,
+        generated: bool,
+    ) -> anyhow::Result<()> {
         self.0.lock().execute(
-            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![username, hash, role, facade_core::now()],
+            "INSERT INTO users (username, password_hash, role, created_at, must_change_password)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![username, hash, role, facade_core::now(), generated],
         )?;
         Ok(())
+    }
+
+    pub fn must_change_password(&self, user_id: i64) -> anyhow::Result<bool> {
+        Ok(self.0.lock().query_row(
+            "SELECT must_change_password FROM users WHERE id = ?1",
+            [user_id],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn user_by_name(&self, username: &str) -> anyhow::Result<Option<UserRow>> {
@@ -209,7 +231,7 @@ impl Store {
     pub fn set_password(&self, user_id: i64, hash: &str) -> anyhow::Result<()> {
         let conn = self.0.lock();
         conn.execute(
-            "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+            "UPDATE users SET password_hash = ?1, must_change_password = 0 WHERE id = ?2",
             params![hash, user_id],
         )?;
         conn.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id])?;

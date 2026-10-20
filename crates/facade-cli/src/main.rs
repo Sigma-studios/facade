@@ -58,6 +58,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<AlertsCommand>,
     },
+    /// How this server is reached: its web UI domain, ACME contact, direct API port.
+    Server {
+        #[command(subcommand)]
+        action: Option<ServerCommand>,
+    },
     #[command(subcommand)]
     Node(NodeCommand),
     #[command(subcommand)]
@@ -174,6 +179,27 @@ enum NodeCommand {
     Ip { name: String, ip: String },
     /// Every listening port on the node, and which program or app holds it.
     Ports { name: String },
+}
+
+#[derive(Subcommand)]
+enum ServerCommand {
+    /// Change settings; only the flags given are changed.
+    Set {
+        /// Serve the web UI and API at this domain with a real certificate (point
+        /// its DNS at this server). "" removes it.
+        #[arg(long)]
+        api_domain: Option<String>,
+        /// Contact address for Let's Encrypt (expiry notices). "" removes it.
+        #[arg(long)]
+        acme_email: Option<String>,
+        /// Make the direct API port (7701) accept only connections from the
+        /// server itself (SSH tunnels), once the API domain has its certificate.
+        #[arg(long, conflicts_with = "direct_api_open")]
+        direct_api_local_only: bool,
+        /// Accept connections to the direct API port from anywhere again.
+        #[arg(long)]
+        direct_api_open: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -661,13 +687,18 @@ async fn login(
         .send()
         .await?;
     let LoginResponse { token } = client::check(resp).await?.json().await?;
-    Saved {
+    let saved = Saved {
         server,
         fingerprint,
         token,
-    }
-    .save()?;
+    };
+    saved.save()?;
     eprintln!("logged in (saved to {})", client::config_path()?.display());
+    if let Ok(me) = Api::new(saved)?.get::<WhoAmI>("/api/whoami").await
+        && me.must_change_password
+    {
+        eprintln!("this is the password generated at install: change it with `facade passwd`");
+    }
     Ok(())
 }
 
@@ -787,6 +818,59 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                         a.message.clone(),
                     ]
                 }),
+            );
+        }
+        Command::Server { action } => {
+            let settings: ServerSettings = match action {
+                None => api.get("/api/server-settings").await?,
+                Some(ServerCommand::Set {
+                    api_domain,
+                    acme_email,
+                    direct_api_local_only,
+                    direct_api_open,
+                }) => {
+                    let update = ServerSettingsUpdate {
+                        api_domain,
+                        acme_email,
+                        direct_api_local_only: if direct_api_local_only {
+                            Some(true)
+                        } else if direct_api_open {
+                            Some(false)
+                        } else {
+                            None
+                        },
+                    };
+                    api.json(
+                        api.request(Method::PUT, "/api/server-settings")
+                            .json(&update),
+                    )
+                    .await?
+                }
+            };
+            if json {
+                return print_json(&settings);
+            }
+            match &settings.api_domain {
+                Some(d) if settings.api_domain_ready => println!("web UI & API:  https://{d}"),
+                Some(d) => println!(
+                    "web UI & API:  https://{d} (waiting for its certificate: point its DNS here, see `facade domains`)"
+                ),
+                None => println!(
+                    "web UI & API:  no domain (set one with `facade server set --api-domain …`)"
+                ),
+            }
+            println!(
+                "direct port:   https://{} ({})",
+                settings.api_listen,
+                if settings.direct_api_local_only {
+                    "only from the server itself"
+                } else {
+                    "open, self-signed certificate"
+                }
+            );
+            println!(
+                "acme contact:  {}",
+                settings.acme_email.as_deref().unwrap_or("(none)")
             );
         }
         Command::Node(cmd) => node(api, cmd, json).await?,

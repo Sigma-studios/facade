@@ -159,13 +159,45 @@ async fn points_to(server: &Server, domain: &str, node: &str) -> bool {
     }
 }
 
-async fn load_account(server: &Server) -> anyhow::Result<Account> {
+/// Gives the CA the current contact address, if an account exists already
+/// (otherwise it gets the address when it is created).
+pub async fn update_contact(server: &Server) -> anyhow::Result<()> {
+    if !server.cfg.acme.enabled || !account_exists(server)? {
+        return Ok(());
+    }
+    let account = load_account(server).await?;
+    let contact = server
+        .settings
+        .get()
+        .acme_email
+        .map(|e| format!("mailto:{e}"));
+    let contacts: Vec<&str> = contact.iter().map(String::as_str).collect();
+    account
+        .update_contacts(&contacts)
+        .await
+        .context("updating the ACME account's contact")?;
+    Ok(())
+}
+
+fn directory_url(server: &Server) -> String {
     let acme = &server.cfg.acme;
-    let url = match (&acme.directory, acme.staging) {
+    match (&acme.directory, acme.staging) {
         (Some(url), _) => url.clone(),
         (None, true) => LetsEncrypt::Staging.url().to_string(),
         (None, false) => LetsEncrypt::Production.url().to_string(),
-    };
+    }
+}
+
+fn account_exists(server: &Server) -> anyhow::Result<bool> {
+    Ok(server
+        .store
+        .kv_get(&format!("acme_account:{}", directory_url(server)))?
+        .is_some())
+}
+
+async fn load_account(server: &Server) -> anyhow::Result<Account> {
+    let acme = &server.cfg.acme;
+    let url = directory_url(server);
     let key = format!("acme_account:{url}");
     let builder = || match &acme.root_ca {
         Some(path) => Account::builder_with_root(path),
@@ -175,7 +207,11 @@ async fn load_account(server: &Server) -> anyhow::Result<Account> {
         let credentials: AccountCredentials = serde_json::from_str(&saved)?;
         return Ok(builder()?.from_credentials(credentials).await?);
     }
-    let contact = acme.email.as_ref().map(|e| format!("mailto:{e}"));
+    let contact = server
+        .settings
+        .get()
+        .acme_email
+        .map(|e| format!("mailto:{e}"));
     let contacts: Vec<&str> = contact.iter().map(String::as_str).collect();
     let (account, credentials) = builder()?
         .create(
@@ -367,7 +403,7 @@ pub async fn push_ingress(server: &Server, node: &str) -> anyhow::Result<()> {
     }
     let mut proxies = Vec::new();
     if node == server.cfg.local_node
-        && let Some(domain) = &server.cfg.api_domain
+        && let Some(domain) = &server.settings.api_domain()
     {
         proxies.push(ProxyRoute {
             domain: domain.clone(),

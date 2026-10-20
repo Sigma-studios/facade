@@ -1,7 +1,14 @@
-use facade_core::api::{ApplyReport, ChangePassword, CredentialView, SetCredential};
+use std::time::Duration;
+
+use facade_core::api::{
+    ApplyReport, ChangePassword, CredentialView, ServerSettings, ServerSettingsUpdate,
+    SetCredential,
+};
 use facade_core::proto::CredentialKind;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use leptos_router::components::A;
+use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use crate::components::{CopyField, ErrorNote, Loading, Modal};
@@ -13,6 +20,7 @@ pub fn Settings() -> impl IntoView {
         <div class="page page-narrow">
             <header class="page-head"><h1>"Settings"</h1></header>
             <Password/>
+            <ServerAccess/>
             <Credentials/>
             <Export/>
             <Apply/>
@@ -25,6 +33,7 @@ fn Password() -> impl IntoView {
     let password = RwSignal::new(String::new());
     let again = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
+    let navigate = use_navigate();
     let submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         if password.get_untracked() != again.get_untracked() {
@@ -34,12 +43,14 @@ fn Password() -> impl IntoView {
         let body = ChangePassword {
             password: password.get_untracked(),
         };
+        // Every session ends with the change, this one included.
+        let navigate = navigate.clone();
         run(
-            "Password changed. Other sessions were signed out.",
+            "Password changed. Sign in with the new one.",
             async move { api::put_empty("/api/password", &body).await },
             move || {
-                password.set(String::new());
-                again.set(String::new());
+                api::set_token(None);
+                navigate("/login", Default::default());
             },
         );
     };
@@ -65,6 +76,173 @@ fn Password() -> impl IntoView {
                 </div>
             </form>
         </section>
+    }
+}
+
+/// The web UI domain, the Let's Encrypt contact and who may use the direct API port.
+#[component]
+fn ServerAccess() -> impl IntoView {
+    let settings = polled(Some(Duration::from_secs(30)), || async {
+        api::get::<ServerSettings>("/api/server-settings").await
+    });
+    let domain = RwSignal::new(String::new());
+    let email = RwSignal::new(String::new());
+    // The inputs are filled once, so a refresh does not overwrite what is being typed.
+    let filled = StoredValue::new(false);
+    let fill = move |s: &ServerSettings| {
+        domain.set(s.api_domain.clone().unwrap_or_default());
+        email.set(s.acme_email.clone().unwrap_or_default());
+    };
+    Effect::new(move |_| {
+        if !filled.get_value()
+            && let Some(s) = settings.data.get()
+        {
+            fill(&s);
+            filled.set_value(true);
+        }
+    });
+    let busy = RwSignal::new(false);
+    let confirm_open = RwSignal::new(false);
+    let save = move |update: ServerSettingsUpdate, done: &'static str| {
+        busy.set(true);
+        spawn_local(async move {
+            match api::put::<_, ServerSettings>("/api/server-settings", &update).await {
+                Ok(s) => {
+                    fill(&s);
+                    settings.data.try_set(Some(s));
+                    confirm_open.try_set(false);
+                    toasts().ok(done);
+                }
+                Err(e) => toasts().err(e),
+            }
+            busy.try_set(false);
+        });
+    };
+    let save_domain = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let update = ServerSettingsUpdate {
+            api_domain: Some(domain.get_untracked().trim().to_lowercase()),
+            ..Default::default()
+        };
+        save(update, "Web UI domain saved");
+    };
+    let save_email = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let update = ServerSettingsUpdate {
+            acme_email: Some(email.get_untracked().trim().to_string()),
+            ..Default::default()
+        };
+        save(update, "Contact email saved");
+    };
+    let local_only = move |on: bool| {
+        let update = ServerSettingsUpdate {
+            direct_api_local_only: Some(on),
+            ..Default::default()
+        };
+        save(
+            update,
+            if on {
+                "The direct API port now only accepts connections from the server"
+            } else {
+                "The direct API port accepts connections from anywhere again"
+            },
+        );
+    };
+    let current = move || settings.data.get();
+    let saved_domain = move || current().and_then(|s| s.api_domain);
+    let ready = move || current().is_some_and(|s| s.api_domain_ready);
+    let restricted = move || current().is_some_and(|s| s.direct_api_local_only);
+
+    view! {
+        <section class="card form">
+            <h2 class="section-title">"Server access"</h2>
+            <ErrorNote error=settings.error/>
+            <Show when=move || settings.loaded() fallback=Loading>
+                <form class="form" on:submit=save_domain>
+                    <label class="field">
+                        <span>"Web UI domain"</span>
+                        <div class="form-row">
+                            <input type="text" class="grow" bind:value=domain
+                                placeholder="facade.example.com" autocomplete="off"/>
+                            <button type="submit" class="button" disabled=busy>"Save"</button>
+                        </div>
+                        <small>
+                            {move || match (saved_domain(), ready()) {
+                                (None, _) => view! {
+                                    "Reach facade at its own domain with a real certificate: point an A record for the domain at this server first."
+                                }.into_any(),
+                                (Some(d), false) => view! {
+                                    {format!("Waiting for the certificate of {d} (check its DNS on the ")}
+                                    <A href="/domains">"Domains"</A>
+                                    " page)."
+                                }.into_any(),
+                                (Some(d), true) => view! {
+                                    "Live at "
+                                    <a href=format!("https://{d}")>{format!("https://{d}")}</a>
+                                    "."
+                                }.into_any(),
+                            }}
+                        </small>
+                    </label>
+                </form>
+                <form class="form" on:submit=save_email>
+                    <label class="field">
+                        <span>"Let's Encrypt contact email"</span>
+                        <div class="form-row">
+                            <input type="text" class="grow" bind:value=email
+                                placeholder="admin@example.com" autocomplete="email"/>
+                            <button type="submit" class="button" disabled=busy>"Save"</button>
+                        </div>
+                        <small>"Told about certificates that fail to renew. Optional."</small>
+                    </label>
+                </form>
+                <div class="field">
+                    <span>"Direct API port"</span>
+                    <p class="small">
+                        <code>{move || current().map(|s| s.api_listen).unwrap_or_default()}</code>
+                        {move || if restricted() {
+                            " only accepts connections from the server itself (SSH tunnels)."
+                        } else {
+                            " (self-signed certificate) accepts connections from anywhere."
+                        }}
+                    </p>
+                    <Show
+                        when=restricted
+                        fallback=move || view! {
+                            <div class="form-actions push-left">
+                                <button class="button" disabled=move || busy.get() || !ready()
+                                    on:click=move |_| confirm_open.set(true)>"Restrict to this server…"</button>
+                            </div>
+                            <Show when=move || !ready()>
+                                <small>"Possible once the web UI domain has its certificate, so facade stays reachable."</small>
+                            </Show>
+                        }
+                    >
+                        <div class="form-actions push-left">
+                            <button class="button" disabled=busy
+                                on:click=move |_| local_only(false)>"Open to everyone again"</button>
+                        </div>
+                    </Show>
+                </div>
+            </Show>
+        </section>
+
+        <Modal open=confirm_open title="Restrict the direct API port">
+            <p>
+                {move || {
+                    let d = saved_domain().unwrap_or_default();
+                    format!(
+                        "Afterwards facade is only reachable at https://{d} (or through an SSH tunnel to the port). \
+                         The CLI must sign in again with `facade login https://{d}`."
+                    )
+                }}
+            </p>
+            <div class="form-actions">
+                <button class="button" on:click=move |_| confirm_open.set(false)>"Cancel"</button>
+                <button class="button button-danger" disabled=busy
+                    on:click=move |_| local_only(true)>"Restrict"</button>
+            </div>
+        </Modal>
     }
 }
 
