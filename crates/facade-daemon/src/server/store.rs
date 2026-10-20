@@ -201,6 +201,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn flag_password_change(&self, user_id: i64) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE users SET must_change_password = 1 WHERE id = ?1",
+            [user_id],
+        )?;
+        Ok(())
+    }
+
     pub fn must_change_password(&self, user_id: i64) -> anyhow::Result<bool> {
         Ok(self.0.lock().query_row(
             "SELECT must_change_password FROM users WHERE id = ?1",

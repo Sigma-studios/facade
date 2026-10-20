@@ -157,6 +157,13 @@ pub async fn serve_loopback(server: Arc<Server>) -> anyhow::Result<()> {
 /// (readable by root only, never logged) until it is changed.
 pub fn ensure_admin(server: &Server) -> anyhow::Result<()> {
     if server.store.user_count()? > 0 {
+        // Installs from before the flag existed: still on the generated password?
+        if let Ok(generated) = std::fs::read_to_string(initial_password_file(server))
+            && let Some(admin) = server.store.user_by_name("admin")?
+            && verify_password(generated.trim(), &admin.password_hash)
+        {
+            server.store.flag_password_change(admin.id)?;
+        }
         return Ok(());
     }
     let password = random_token()[..24].to_string();
