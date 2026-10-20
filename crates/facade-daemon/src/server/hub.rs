@@ -437,9 +437,13 @@ fn on_event(server: &Server, node: &str, event: AgentEvent) {
         AgentEvent::DeployLog { deployment, line } => {
             server.store.append_deploy_log(deployment, &line)
         }
-        AgentEvent::DeployDone { deployment, error } => {
-            server.store.finish_deployment(deployment, error.as_deref())
-        }
+        AgentEvent::DeployDone {
+            deployment,
+            error,
+            commit,
+        } => server
+            .store
+            .finish_deployment(deployment, error.as_deref(), commit.as_deref()),
     };
     if let Err(e) = result {
         warn!(%node, "handling agent event: {e:#}");

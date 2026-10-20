@@ -38,13 +38,18 @@ pub async fn git_checkout(
     let out = Command::new("git")
         .arg("-C")
         .arg(dest)
-        .args(["log", "-1", "--format=%h %s"])
+        .args(["log", "-1", "--format=%H %s"])
         .output()
         .await?;
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (hash, subject) = line.split_once(' ').unwrap_or((&line, ""));
     log.line(format!(
-        "at commit {}",
-        String::from_utf8_lossy(&out.stdout).trim()
+        "at commit {} {subject}",
+        hash.get(..7).unwrap_or(hash)
     ));
+    if !hash.is_empty() {
+        log.set_commit(hash.to_string());
+    }
     Ok(())
 }
 

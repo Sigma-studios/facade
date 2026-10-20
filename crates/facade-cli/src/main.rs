@@ -113,6 +113,10 @@ enum Command {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Fetch an app's branch and list the commits a deploy would bring.
+    Updates {
+        app: String,
+    },
     /// List what could be deployed from a git repository.
     Scan {
         repo: String,
@@ -980,6 +984,46 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 println!("error:    {e}");
             }
         }
+        Command::Updates { app } => {
+            let check: UpdateCheck = api
+                .json(api.request(Method::POST, &format!("/api/apps/{app}/updates")))
+                .await?;
+            if json {
+                return print_json(&check);
+            }
+            let branch = check.branch.as_deref().unwrap_or("the default branch");
+            let short = |h: &str| h.get(..7).unwrap_or(h).to_string();
+            match check.behind {
+                Some(0) => println!(
+                    "{app} is up to date with {branch} ({})",
+                    short(&check.latest.hash)
+                ),
+                Some(n) => println!(
+                    "{app} is {n} commit{} behind {branch}:",
+                    if n == 1 { "" } else { "s" }
+                ),
+                None => println!(
+                    "{app}'s deployed commit is unknown{}; recent commits on {branch}:",
+                    check
+                        .deployed
+                        .as_deref()
+                        .map(|c| format!(" ({} is not on the branch)", short(c)))
+                        .unwrap_or_default()
+                ),
+            }
+            for c in &check.commits {
+                println!(
+                    "  {} {}  ({}, {})",
+                    short(&c.hash),
+                    c.subject,
+                    c.author,
+                    output::ago(c.time)
+                );
+            }
+            if check.behind != Some(0) {
+                println!("deploy them with `facade deploy {app}`");
+            }
+        }
         Command::Scan { repo, branch } => {
             let report = scan(api, &repo, branch.as_deref()).await?;
             if json {
@@ -1823,6 +1867,13 @@ fn print_app_detail(view: &AppView) {
         println!("message:   {message}");
     }
     println!("revision:  {}", view.revision);
+    if let Some(commit) = &view.commit {
+        println!(
+            "commit:    {} (check for newer ones with `facade updates {}`)",
+            commit.get(..7).unwrap_or(commit),
+            spec.name
+        );
+    }
     match &spec.source {
         Source::Image { image } => println!("source:    image {image}"),
         Source::Executable { filename, arch, .. } => {

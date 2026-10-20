@@ -165,6 +165,8 @@ pub enum AgentRequest {
     },
     /// Every facade volume on the node, with sizes. Answers `Vec<VolumeInfo>`.
     Volumes,
+    /// What listens on the node right now. Answers `Vec<Listener>`.
+    Ports,
     /// Dial a data connection and write a gzipped tar of the volume to it. A running
     /// app is paused meanwhile, so files are copied as they were at one instant.
     VolumeExport {
@@ -215,6 +217,9 @@ pub enum AgentEvent {
     DeployDone {
         deployment: Uuid,
         error: Option<String>,
+        /// The commit that was built, for sources from git.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
     },
 }
 

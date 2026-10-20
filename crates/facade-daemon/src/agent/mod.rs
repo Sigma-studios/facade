@@ -259,6 +259,9 @@ impl Agent {
                     }
                 });
             }
+            AgentRequest::Ports => {
+                return Ok(Some(serde_json::to_value(self.listeners().await)?));
+            }
             AgentRequest::Volumes => {
                 return Ok(Some(serde_json::to_value(
                     self.runtime.list_volumes().await?,
@@ -331,6 +334,7 @@ impl Agent {
             agent: self.clone(),
             deployment,
             app: app.clone(),
+            commit: Default::default(),
         };
         let result = self.runtime.converge(&workload, &log).await;
         let hash = workload_hash(&workload);
@@ -354,6 +358,7 @@ impl Agent {
             self.emit(AgentEvent::DeployDone {
                 deployment,
                 error: result.err().map(|e| format!("{e:#}")),
+                commit: log.commit.lock().take(),
             });
         }
     }
@@ -405,17 +410,7 @@ impl Agent {
         loop {
             tick.tick().await;
             let workloads: Vec<Workload> = self.workloads.lock().values().cloned().collect();
-            let listeners = match self.runtime.port_owners().await {
-                Ok((containers, published)) => {
-                    tokio::task::spawn_blocking(move || ports::scan(&containers, &published))
-                        .await
-                        .unwrap_or_default()
-                }
-                Err(e) => {
-                    warn!("listing containers for port owners: {e:#}");
-                    vec![]
-                }
-            };
+            let listeners = self.listeners().await;
             let report = NodeReport {
                 node: sampler.sample(),
                 apps: self.runtime.app_stats(&workloads).await,
@@ -430,6 +425,20 @@ impl Agent {
                 .is_err()
             {
                 return;
+            }
+        }
+    }
+
+    async fn listeners(&self) -> Vec<facade_core::proto::Listener> {
+        match self.runtime.port_owners().await {
+            Ok((containers, published)) => {
+                tokio::task::spawn_blocking(move || ports::scan(&containers, &published))
+                    .await
+                    .unwrap_or_default()
+            }
+            Err(e) => {
+                warn!("listing containers for port owners: {e:#}");
+                vec![]
             }
         }
     }
@@ -499,6 +508,8 @@ pub struct DeployLog {
     agent: Arc<Agent>,
     deployment: Option<Uuid>,
     app: String,
+    /// The commit checked out, when the source is git and it was fetched.
+    commit: Mutex<Option<String>>,
 }
 
 impl DeployLog {
@@ -520,6 +531,10 @@ impl DeployLog {
 
     pub fn is_deployment(&self) -> bool {
         self.deployment.is_some()
+    }
+
+    pub fn set_commit(&self, commit: String) {
+        *self.commit.lock() = Some(commit);
     }
 }
 
