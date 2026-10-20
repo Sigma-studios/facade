@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::users::{can_see_app, check_caps, check_member_spec, load_app_for, visible_apps};
 use super::{Server, hash_secret, random_token};
 use crate::tls;
 
@@ -78,6 +79,23 @@ pub fn router(server: Arc<Server>) -> Router {
             post(restore_backup),
         )
         .route("/api/server-backup", get(server_backup))
+        .route(
+            "/api/users",
+            get(super::users::list_users).post(super::users::create_user),
+        )
+        .route(
+            "/api/users/{name}",
+            put(super::users::update_user).delete(super::users::delete_user),
+        )
+        .route(
+            "/api/users/{name}/password",
+            post(super::users::reset_password),
+        )
+        .route("/api/apps/{name}/owner", put(super::users::set_owner))
+        .route(
+            "/api/apps/{name}/access/{user}",
+            put(super::users::grant_access).delete(super::users::revoke_access),
+        )
         .route("/api/dns", get(dns_settings).put(update_dns))
         .route("/api/domains", get(domains))
         .route("/api/apps", get(list_apps).post(create_app))
@@ -183,7 +201,7 @@ fn initial_password_file(server: &Server) -> std::path::PathBuf {
     server.cfg.data_dir.join("initial-admin-password")
 }
 
-fn hash_password(password: &str) -> anyhow::Result<String> {
+pub(super) fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
     Ok(Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -203,7 +221,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
 
 // ---------------------------------------------------------------- errors & auth
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -223,24 +241,22 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-fn bad_request(msg: impl ToString) -> ApiError {
+pub(super) fn bad_request(msg: impl ToString) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.to_string())
 }
-fn not_found(msg: impl ToString) -> ApiError {
+pub(super) fn not_found(msg: impl ToString) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, msg.to_string())
 }
-fn conflict(msg: impl ToString) -> ApiError {
+pub(super) fn conflict(msg: impl ToString) -> ApiError {
     ApiError(StatusCode::CONFLICT, msg.to_string())
 }
-fn unavailable(msg: impl ToString) -> ApiError {
+pub(super) fn unavailable(msg: impl ToString) -> ApiError {
     ApiError(StatusCode::SERVICE_UNAVAILABLE, msg.to_string())
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub(super) type ApiResult<T> = Result<T, ApiError>;
 
-/// An authenticated caller. Every user is an admin for now; the role column is
-/// where per-app permissions will hang.
-#[allow(dead_code)]
+/// An authenticated caller. What they may do: see `users`.
 pub struct User {
     pub id: i64,
     pub username: String,
@@ -312,10 +328,19 @@ async fn health(State(server): S) -> (StatusCode, &'static str) {
 }
 
 async fn whoami(State(server): S, user: User) -> ApiResult<Json<WhoAmI>> {
+    let row = server
+        .store
+        .user_by_id(user.id)?
+        .ok_or_else(|| not_found("no such user"))?;
+    let (memory, cpus) = super::users::allocated(&server, user.id, None)?;
     Ok(Json(WhoAmI {
-        must_change_password: server.store.must_change_password(user.id)?,
+        must_change_password: row.must_change_password,
         username: user.username,
         role: user.role,
+        memory_cap_mb: row.memory_cap_mb,
+        cpu_cap: row.cpu_cap,
+        memory_allocated_mb: memory,
+        cpus_allocated: cpus,
     }))
 }
 
@@ -360,15 +385,17 @@ fn settings_view(server: &Server) -> anyhow::Result<ServerSettings> {
     })
 }
 
-async fn server_settings(State(server): S, _: User) -> ApiResult<Json<ServerSettings>> {
+async fn server_settings(State(server): S, user: User) -> ApiResult<Json<ServerSettings>> {
+    user.require_admin()?;
     Ok(Json(settings_view(&server)?))
 }
 
 async fn update_server_settings(
     State(server): S,
-    _: User,
+    user: User,
     Json(update): Json<ServerSettingsUpdate>,
 ) -> ApiResult<Json<ServerSettings>> {
+    user.require_admin()?;
     let clean = |v: String| {
         let v = v.trim().to_lowercase();
         (!v.is_empty()).then_some(v)
@@ -453,7 +480,23 @@ fn node_views(server: &Server) -> anyhow::Result<Vec<NodeView>> {
         .collect())
 }
 
-fn app_view(server: &Server, spec: AppSpec, revision: u64) -> AppView {
+fn app_view(server: &Server, spec: AppSpec, revision: u64, owner: Option<i64>) -> AppView {
+    let username = |id: i64| {
+        server
+            .store
+            .user_by_id(id)
+            .ok()
+            .flatten()
+            .map(|u| u.username)
+    };
+    let owner = owner.and_then(username);
+    let access = server
+        .store
+        .app_access(&spec.name)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(username)
+        .collect();
     let live = server.live.read();
     let entry = live.apps.get(&spec.name);
     let mut state = entry.map(|e| e.state).unwrap_or(AppState::Unknown);
@@ -473,39 +516,61 @@ fn app_view(server: &Server, spec: AppSpec, revision: u64) -> AppView {
         commit: git
             .then(|| server.store.deployed_commit(&spec.name).ok().flatten())
             .flatten(),
+        owner,
+        access,
         spec,
     }
 }
 
-fn app_views(server: &Server) -> anyhow::Result<Vec<AppView>> {
-    Ok(server
-        .store
-        .list_apps()?
+fn app_views(server: &Server, user: &User) -> anyhow::Result<Vec<AppView>> {
+    Ok(visible_apps(server, user)?
         .into_iter()
-        .map(|a| app_view(server, a.spec, a.revision))
+        .map(|a| app_view(server, a.spec, a.revision, a.owner))
         .collect())
 }
 
-async fn status(State(server): S, _: User) -> ApiResult<Json<StatusView>> {
+async fn status(State(server): S, user: User) -> ApiResult<Json<StatusView>> {
     Ok(Json(StatusView {
         nodes: node_views(&server)?,
-        apps: app_views(&server)?,
+        apps: app_views(&server, &user)?,
     }))
 }
 
-async fn alerts(State(server): S, _: User) -> Json<Vec<AlertView>> {
-    Json(server.alerts.lock().views())
+/// Members see the alerts of nodes and of their own apps.
+async fn alerts(State(server): S, user: User) -> Json<Vec<AlertView>> {
+    let all = server.alerts.lock().views();
+    Json(
+        all.into_iter()
+            .filter(|a| {
+                let app = a
+                    .key
+                    .strip_prefix("app:")
+                    .and_then(|k| k.split(':').next())
+                    .or_else(|| {
+                        a.key
+                            .strip_prefix("backup:")
+                            .and_then(|k| k.split('/').next())
+                    });
+                match app {
+                    Some(app) => can_see_app(&server, &user, app),
+                    None => user.is_admin() || a.key.starts_with("node:"),
+                }
+            })
+            .collect(),
+    )
 }
 
-async fn notify_settings(State(server): S, _: User) -> Json<NotifySettings> {
-    Json(server.notifier.settings())
+async fn notify_settings(State(server): S, user: User) -> ApiResult<Json<NotifySettings>> {
+    user.require_admin()?;
+    Ok(Json(server.notifier.settings()))
 }
 
 async fn update_notify(
     State(server): S,
-    _: User,
+    user: User,
     Json(update): Json<NotifyUpdate>,
 ) -> ApiResult<Json<NotifySettings>> {
+    user.require_admin()?;
     server
         .notifier
         .update(&server.store, &server.secrets, update)
@@ -513,7 +578,8 @@ async fn update_notify(
     Ok(Json(server.notifier.settings()))
 }
 
-async fn test_alert(State(server): S, _: User) -> ApiResult<StatusCode> {
+async fn test_alert(State(server): S, user: User) -> ApiResult<StatusCode> {
+    user.require_admin()?;
     if !server.notifier.is_configured() {
         return Err(bad_request(
             "no Discord webhook set (facade alerts config --webhook <url>)",
@@ -535,9 +601,10 @@ async fn list_nodes(State(server): S, _: User) -> ApiResult<Json<Vec<NodeView>>>
 
 async fn create_node(
     State(server): S,
-    _: User,
+    user: User,
     Json(req): Json<CreateNode>,
 ) -> ApiResult<(StatusCode, Json<CreatedNode>)> {
+    user.require_admin()?;
     validate_name("node name", &req.name).map_err(bad_request)?;
     if server.store.node_exists(&req.name)? {
         return Err(conflict(format!(
@@ -564,9 +631,10 @@ async fn create_node(
 
 async fn rotate_node_token(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
 ) -> ApiResult<Json<CreatedNode>> {
+    user.require_admin()?;
     if !server.store.node_exists(&name)? {
         return Err(not_found(format!("no node named {name}")));
     }
@@ -577,7 +645,12 @@ async fn rotate_node_token(
     Ok(Json(CreatedNode { name, join_token }))
 }
 
-async fn delete_node(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<StatusCode> {
+async fn delete_node(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    user.require_admin()?;
     if name == server.cfg.local_node {
         return Err(bad_request("the server's own node cannot be removed"));
     }
@@ -601,10 +674,11 @@ async fn delete_node(State(server): S, _: User, Path(name): Path<String>) -> Api
 
 async fn set_node_ip(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
     Json(req): Json<SetNodeIp>,
 ) -> ApiResult<StatusCode> {
+    user.require_admin()?;
     if !server.store.node_exists(&name)? {
         return Err(not_found(format!("no node named {name}")));
     }
@@ -622,23 +696,33 @@ async fn set_node_ip(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn dns_settings(State(server): S, _: User) -> Json<DnsSettings> {
-    Json(server.dns.settings())
+async fn dns_settings(State(server): S, user: User) -> ApiResult<Json<DnsSettings>> {
+    user.require_admin()?;
+    Ok(Json(server.dns.settings()))
 }
 
 async fn update_dns(
     State(server): S,
-    _: User,
+    user: User,
     Json(update): Json<DnsUpdate>,
 ) -> ApiResult<Json<DnsSettings>> {
+    user.require_admin()?;
     super::dns::update(&server, update)
         .await
         .map(Json)
         .map_err(bad_request)
 }
 
-async fn domains(State(server): S, _: User) -> Json<Vec<DomainStatus>> {
-    Json(super::dns::statuses(&server).await)
+async fn domains(State(server): S, user: User) -> Json<Vec<DomainStatus>> {
+    let all = super::dns::statuses(&server).await;
+    Json(
+        all.into_iter()
+            .filter(|d| match &d.app {
+                Some(app) => can_see_app(&server, &user, app),
+                None => user.is_admin(),
+            })
+            .collect(),
+    )
 }
 
 async fn node_metrics(
@@ -657,7 +741,7 @@ async fn node_metrics(
 
 // ---------------------------------------------------------------- apps
 
-fn load_app(server: &Server, name: &str) -> ApiResult<super::store::AppRow> {
+pub(super) fn load_app(server: &Server, name: &str) -> ApiResult<super::store::AppRow> {
     server
         .store
         .get_app(name)?
@@ -816,28 +900,37 @@ async fn check_ports_free(server: &Server, spec: &AppSpec) -> ApiResult<()> {
     }
 }
 
-async fn list_apps(State(server): S, _: User) -> ApiResult<Json<Vec<AppView>>> {
-    Ok(Json(app_views(&server)?))
+async fn list_apps(State(server): S, user: User) -> ApiResult<Json<Vec<AppView>>> {
+    Ok(Json(app_views(&server, &user)?))
 }
 
-async fn get_app(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<Json<AppView>> {
-    let row = load_app(&server, &name)?;
-    Ok(Json(app_view(&server, row.spec, row.revision)))
+async fn get_app(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+) -> ApiResult<Json<AppView>> {
+    let row = load_app_for(&server, &user, &name)?;
+    Ok(Json(app_view(&server, row.spec, row.revision, row.owner)))
 }
 
 async fn create_app(
     State(server): S,
-    _: User,
+    user: User,
     Json(spec): Json<AppSpec>,
 ) -> ApiResult<(StatusCode, Json<AppView>)> {
     if server.store.get_app(&spec.name)?.is_some() {
         return Err(conflict(format!("app {} exists", spec.name)));
     }
+    // A member's apps are theirs: their cap, their logins.
+    let owner = (!user.is_admin()).then_some(user.id);
+    check_member_spec(&user, None, &spec).await?;
+    check_caps(&server, owner, &spec)?;
     check_spec(&server, &spec)?;
     server.store.put_app(&spec)?;
+    server.store.set_app_owner(&spec.name, owner)?;
     server.refresh_routes()?;
     // Created, not deployed: env vars usually come first, then `facade deploy`.
-    Ok((StatusCode::CREATED, Json(app_view(&server, spec, 0))))
+    Ok((StatusCode::CREATED, Json(app_view(&server, spec, 0, owner))))
 }
 
 #[derive(Deserialize)]
@@ -849,7 +942,7 @@ struct UpdateQuery {
 
 async fn update_app(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
     Query(q): Query<UpdateQuery>,
     Json(spec): Json<AppSpec>,
@@ -857,10 +950,12 @@ async fn update_app(
     if spec.name != name {
         return Err(bad_request("apps cannot be renamed"));
     }
-    let old = load_app(&server, &name)?;
+    let old = load_app_for(&server, &user, &name)?;
+    check_member_spec(&user, Some(&old.spec), &spec).await?;
+    check_caps(&server, old.owner, &spec)?;
     check_spec(&server, &spec)?;
     save_spec(&server, &old.spec, &spec, q.move_data).await?;
-    Ok(Json(app_view(&server, spec, old.revision)))
+    Ok(Json(app_view(&server, spec, old.revision, old.owner)))
 }
 
 /// Stores a changed spec and moves the app between nodes if needed. An app with
@@ -996,11 +1091,11 @@ struct DeleteQuery {
 
 async fn delete_app(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
     Query(q): Query<DeleteQuery>,
 ) -> ApiResult<StatusCode> {
-    let row = load_app(&server, &name)?;
+    let row = load_app_for(&server, &user, &name)?;
     if server.hub.is_connected(&row.spec.node) {
         server
             .hub
@@ -1029,10 +1124,10 @@ async fn delete_app(
 
 async fn deploy_app(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
 ) -> ApiResult<(StatusCode, Json<DeploymentView>)> {
-    let row = load_app(&server, &name)?;
+    let row = load_app_for(&server, &user, &name)?;
     if !server.hub.is_connected(&row.spec.node) {
         return Err(unavailable(format!("node {} is offline", row.spec.node)));
     }
@@ -1041,6 +1136,12 @@ async fn deploy_app(
     // then waits for them (see the deployment log).
     if let Some(problem) = port_conflict(&server, &row.spec, false)? {
         return Err(conflict(problem));
+    }
+    // Deploying (re)starts it.
+    {
+        let mut running = row.spec.clone();
+        running.enabled = true;
+        check_caps(&server, row.owner, &running)?;
     }
     let revision = server.store.bump_revision(&name)?;
     let id = Uuid::new_v4();
@@ -1073,18 +1174,26 @@ async fn deploy_app(
 /// Fetches the app's branch and compares it with the deployed commit.
 async fn check_updates(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
 ) -> ApiResult<Json<UpdateCheck>> {
-    let row = load_app(&server, &name)?;
-    super::updates::check(&server, &row.spec)
-        .await
-        .map(Json)
-        .map_err(|e| bad_request(format!("{e:#}")))
+    let row = load_app_for(&server, &user, &name)?;
+    super::updates::check(
+        &server,
+        &row.spec,
+        row.owner.unwrap_or(super::store::ADMINS),
+    )
+    .await
+    .map(Json)
+    .map_err(|e| bad_request(format!("{e:#}")))
 }
 
-async fn restart_app(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<StatusCode> {
-    let row = load_app(&server, &name)?;
+async fn restart_app(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    let row = load_app_for(&server, &user, &name)?;
     server
         .hub
         .request(&row.spec.node, AgentRequest::Restart { app: name })
@@ -1093,23 +1202,33 @@ async fn restart_app(State(server): S, _: User, Path(name): Path<String>) -> Api
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn set_enabled(server: &Server, name: &str, enabled: bool) -> ApiResult<StatusCode> {
-    let row = load_app(server, name)?;
+async fn set_enabled(
+    server: &Server,
+    user: &User,
+    name: &str,
+    enabled: bool,
+) -> ApiResult<StatusCode> {
+    let row = load_app_for(server, user, name)?;
     let mut spec = row.spec.clone();
     spec.enabled = enabled;
     if enabled && !row.spec.enabled {
+        check_caps(server, row.owner, &spec)?;
         check_ports_free(server, &spec).await?;
     }
     save_spec(server, &row.spec, &spec, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn start_app(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<StatusCode> {
-    set_enabled(&server, &name, true).await
+async fn start_app(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    set_enabled(&server, &user, &name, true).await
 }
 
-async fn stop_app(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<StatusCode> {
-    set_enabled(&server, &name, false).await
+async fn stop_app(State(server): S, user: User, Path(name): Path<String>) -> ApiResult<StatusCode> {
+    set_enabled(&server, &user, &name, false).await
 }
 
 // ---------------------------------------------------------------- env
@@ -1122,11 +1241,11 @@ struct RevealQuery {
 
 async fn get_env(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
     Query(q): Query<RevealQuery>,
 ) -> ApiResult<Json<Vec<EnvView>>> {
-    load_app(&server, &name)?;
+    load_app_for(&server, &user, &name)?;
     let vars = server
         .store
         .list_env(&name)?
@@ -1155,11 +1274,11 @@ fn valid_env_key(key: &str) -> bool {
 
 async fn patch_env(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
     Json(patch): Json<EnvPatch>,
 ) -> ApiResult<StatusCode> {
-    load_app(&server, &name)?;
+    load_app_for(&server, &user, &name)?;
     for key in patch.set.keys().chain(&patch.unset) {
         if !valid_env_key(key) {
             return Err(bad_request(format!(
@@ -1196,11 +1315,11 @@ fn default_tail() -> u32 {
 
 async fn logs(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
     Query(q): Query<LogsQuery>,
 ) -> ApiResult<Response> {
-    let row = load_app(&server, &name)?;
+    let row = load_app_for(&server, &user, &name)?;
     let text_response = |message: String| {
         (
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -1235,32 +1354,39 @@ async fn logs(
         .into_response())
 }
 
-async fn app_metrics(State(server): S, _: User, Path(name): Path<String>) -> Json<Vec<AppMetric>> {
+async fn app_metrics(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Vec<AppMetric>>> {
+    load_app_for(&server, &user, &name)?;
     let live = server.live.read();
-    Json(
+    Ok(Json(
         live.apps
             .get(&name)
             .map(|a| a.history.iter().cloned().collect())
             .unwrap_or_default(),
-    )
+    ))
 }
 
 async fn list_deployments(
     State(server): S,
-    _: User,
+    user: User,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Vec<DeploymentView>>> {
+    load_app_for(&server, &user, &name)?;
     Ok(Json(server.store.list_deployments(&name, 50)?))
 }
 
 async fn get_deployment(
     State(server): S,
-    _: User,
+    user: User,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<DeploymentView>> {
     server
         .store
         .get_deployment(id)?
+        .filter(|d| can_see_app(&server, &user, &d.app))
         .map(Json)
         .ok_or_else(|| not_found("no such deployment"))
 }
@@ -1268,7 +1394,8 @@ async fn get_deployment(
 // ---------------------------------------------------------------- export / apply
 
 /// The whole configuration as TOML. Sensitive values are never included.
-async fn export(State(server): S, _: User) -> ApiResult<Response> {
+async fn export(State(server): S, user: User) -> ApiResult<Response> {
+    user.require_admin()?;
     let mut manifest = Manifest::default();
     for node in server.store.list_nodes()? {
         manifest.nodes.push(NodeDecl { name: node.name });
@@ -1300,7 +1427,8 @@ async fn export(State(server): S, _: User) -> ApiResult<Response> {
 
 /// Creates or updates everything in a manifest. Nothing is deleted; apps already
 /// running get the new config, new apps are created but not deployed.
-async fn apply(State(server): S, _: User, body: String) -> ApiResult<Json<ApplyReport>> {
+async fn apply(State(server): S, user: User, body: String) -> ApiResult<Json<ApplyReport>> {
+    user.require_admin()?;
     let manifest = Manifest::parse(&body).map_err(bad_request)?;
     let mut report = ApplyReport {
         created: vec![],
@@ -1492,13 +1620,18 @@ fn valid_host(host: &str) -> bool {
         && !host.starts_with(['-', '.'])
 }
 
-async fn list_credentials(State(server): S, _: User) -> ApiResult<Json<Vec<CredentialView>>> {
+/// An admin sees every login (members' included, never their secrets); a
+/// member sees theirs.
+async fn list_credentials(State(server): S, user: User) -> ApiResult<Json<Vec<CredentialView>>> {
+    let scope = (!user.is_admin()).then_some(user.id);
+    let rows = server.store.list_credentials(scope)?;
     Ok(Json(
-        server
-            .store
-            .list_credentials()?
-            .into_iter()
+        rows.into_iter()
             .map(|c| CredentialView {
+                owner: (c.owner_id != super::store::ADMINS)
+                    .then(|| server.store.user_by_id(c.owner_id).ok().flatten())
+                    .flatten()
+                    .map(|u| u.username),
                 kind: c.kind,
                 host: c.host,
                 username: c.username,
@@ -1509,7 +1642,7 @@ async fn list_credentials(State(server): S, _: User) -> ApiResult<Json<Vec<Crede
 
 async fn set_credential(
     State(server): S,
-    _: User,
+    user: User,
     Path((kind, host)): Path<(String, String)>,
     Json(req): Json<SetCredential>,
 ) -> ApiResult<StatusCode> {
@@ -1524,6 +1657,7 @@ async fn set_credential(
         return Err(bad_request("a username and a token are required"));
     }
     server.store.put_credential(
+        user.login_owner(),
         kind,
         &host,
         req.username.trim(),
@@ -1536,13 +1670,13 @@ async fn set_credential(
 
 async fn delete_credential(
     State(server): S,
-    _: User,
+    user: User,
     Path((kind, host)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let kind = parse_kind(&kind)?;
     if !server
         .store
-        .delete_credential(kind, &host.to_ascii_lowercase())?
+        .delete_credential(user.login_owner(), kind, &host.to_ascii_lowercase())?
     {
         return Err(not_found(format!("no {kind} login for {host}")));
     }
@@ -1577,7 +1711,7 @@ async fn resync_nodes(server: &Server) {
 
 // ---------------------------------------------------------------- volumes
 
-async fn list_volumes(State(server): S, _: User) -> ApiResult<Json<Vec<VolumeView>>> {
+async fn list_volumes(State(server): S, user: User) -> ApiResult<Json<Vec<VolumeView>>> {
     let apps = server.store.list_apps()?;
     let backups = super::backups::list(&server, None)?;
     let last_backup = |app: &str, volume: &str| {
@@ -1634,12 +1768,14 @@ async fn list_volumes(State(server): S, _: User) -> ApiResult<Json<Vec<VolumeVie
         }
     }
     out.sort_by(|a, b| (&a.app, &a.name).cmp(&(&b.app, &b.name)));
+    // Leftovers of deleted apps are the admins' to clean up.
+    out.retain(|v| can_see_app(&server, &user, &v.app) && (user.is_admin() || v.path.is_some()));
     Ok(Json(out))
 }
 
 /// The node an app's declared volume lives on.
-fn volume_node(server: &Server, app: &str, volume: &str) -> ApiResult<String> {
-    let row = load_app(server, app)?;
+fn volume_node(server: &Server, user: &User, app: &str, volume: &str) -> ApiResult<String> {
+    let row = load_app_for(server, user, app)?;
     if !row.spec.volumes.iter().any(|v| v.name == volume) {
         return Err(not_found(format!("{app} has no volume named {volume}")));
     }
@@ -1651,10 +1787,10 @@ fn volume_node(server: &Server, app: &str, volume: &str) -> ApiResult<String> {
 
 async fn export_volume(
     State(server): S,
-    _: User,
+    user: User,
     Path((app, volume)): Path<(String, String)>,
 ) -> ApiResult<Response> {
-    let node = volume_node(&server, &app, &volume)?;
+    let node = volume_node(&server, &user, &app, &volume)?;
     let stream = server
         .hub
         .open_volume_export(&node, &app, &volume)
@@ -1678,13 +1814,13 @@ async fn export_volume(
 /// stopped while its files are replaced, then started again.
 async fn import_volume(
     State(server): S,
-    _: User,
+    user: User,
     Path((app, volume)): Path<(String, String)>,
     body: Body,
 ) -> ApiResult<StatusCode> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
-    let node = volume_node(&server, &app, &volume)?;
+    let node = volume_node(&server, &user, &app, &volume)?;
     let tmp = scratch_path(&server)?;
     let result = async {
         let mut file = tls::private_file(&tmp).await?;
@@ -1706,9 +1842,10 @@ async fn import_volume(
 /// without `--delete-data`, or a move while the old node was offline).
 async fn delete_leftover_volumes(
     State(server): S,
-    _: User,
+    user: User,
     Path((node, app)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    user.require_admin()?;
     if let Some(row) = server.store.get_app(&app)?
         && row.spec.node == node
     {
@@ -1742,33 +1879,52 @@ struct BackupQuery {
 
 async fn list_backups(
     State(server): S,
-    _: User,
+    user: User,
     Query(q): Query<BackupQuery>,
 ) -> ApiResult<Json<Vec<BackupView>>> {
-    Ok(Json(super::backups::list(&server, q.app.as_deref())?))
+    let mut list = super::backups::list(&server, q.app.as_deref())?;
+    list.retain(|b| can_see_app(&server, &user, &b.app));
+    Ok(Json(list))
 }
 
 async fn run_backups(
     State(server): S,
-    _: User,
+    user: User,
     Json(req): Json<BackupRequest>,
 ) -> ApiResult<Json<BackupReport>> {
     if let Some(app) = &req.app {
-        let row = load_app(&server, app)?;
+        let row = load_app_for(&server, &user, app)?;
         if row.spec.volumes.is_empty() {
             return Err(bad_request(format!("{app} has no volumes")));
         }
     }
-    Ok(Json(
-        super::backups::backup_all(&server, req.app.as_deref()).await,
-    ))
+    if req.app.is_some() || user.is_admin() {
+        return Ok(Json(
+            super::backups::backup_all(&server, req.app.as_deref()).await,
+        ));
+    }
+    // A member's "everything" is their apps.
+    let mut report = BackupReport {
+        done: vec![],
+        failed: vec![],
+    };
+    for row in visible_apps(&server, &user)? {
+        if row.spec.volumes.is_empty() {
+            continue;
+        }
+        let one = super::backups::backup_all(&server, Some(&row.spec.name)).await;
+        report.done.extend(one.done);
+        report.failed.extend(one.failed);
+    }
+    Ok(Json(report))
 }
 
 async fn download_backup(
     State(server): S,
-    _: User,
+    user: User,
     Path((app, volume, id)): Path<(String, String, u64)>,
 ) -> ApiResult<Response> {
+    load_app_for(&server, &user, &app)?;
     let path = super::backups::path(&server, &app, &volume, id).map_err(not_found)?;
     let file = tokio::fs::File::open(&path)
         .await
@@ -1788,10 +1944,10 @@ async fn download_backup(
 
 async fn restore_backup(
     State(server): S,
-    _: User,
+    user: User,
     Path((app, volume, id)): Path<(String, String, u64)>,
 ) -> ApiResult<StatusCode> {
-    volume_node(&server, &app, &volume)?;
+    volume_node(&server, &user, &app, &volume)?;
     super::backups::restore(&server, &app, &volume, id)
         .await
         .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
@@ -1801,7 +1957,8 @@ async fn restore_backup(
 
 /// A fresh copy of the server's database and master key, as a gzipped tar. With
 /// both, `apply` is not even needed: put them in a new data_dir and start.
-async fn server_backup(State(server): S, _: User) -> ApiResult<Response> {
+async fn server_backup(State(server): S, user: User) -> ApiResult<Response> {
+    user.require_admin()?;
     let bytes = super::backups::server_archive(&server).await?;
     Ok((
         [

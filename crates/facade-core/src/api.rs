@@ -79,6 +79,12 @@ pub struct AppView {
     /// Commit of the last successful deployment, for sources from git.
     #[serde(default)]
     pub commit: Option<String>,
+    /// The member whose resources and logins the app uses; `None` for the admins.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Other members who can manage it.
+    #[serde(default)]
+    pub access: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,9 +234,76 @@ pub struct Candidate {
 pub struct WhoAmI {
     pub username: String,
     pub role: String,
-    /// Still on the password generated at install.
+    /// Still on the password generated at install (or reset by an admin).
     #[serde(default)]
     pub must_change_password: bool,
+    /// Shared by every app the user owns; `None` is no limit.
+    #[serde(default)]
+    pub memory_cap_mb: Option<u64>,
+    #[serde(default)]
+    pub cpu_cap: Option<f64>,
+    /// What the user's running apps reserve, against those caps.
+    #[serde(default)]
+    pub memory_allocated_mb: u64,
+    #[serde(default)]
+    pub cpus_allocated: f64,
+}
+
+/// `admin`: everything. `member`: only the apps they own or were given, and
+/// nothing global.
+pub const ROLES: [&str; 2] = ["admin", "member"];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserView {
+    pub username: String,
+    pub role: String,
+    pub memory_cap_mb: Option<u64>,
+    pub cpu_cap: Option<f64>,
+    pub memory_allocated_mb: u64,
+    pub cpus_allocated: f64,
+    /// Apps the user owns.
+    pub apps: Vec<String>,
+    /// Apps the user was given access to.
+    pub shared_apps: Vec<String>,
+    pub must_change_password: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateUser {
+    pub username: String,
+    #[serde(default = "member")]
+    pub role: String,
+    #[serde(default)]
+    pub memory_cap_mb: Option<u64>,
+    #[serde(default)]
+    pub cpu_cap: Option<f64>,
+}
+
+fn member() -> String {
+    "member".into()
+}
+
+/// Replaces a user's role and caps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateUser {
+    pub role: String,
+    #[serde(default)]
+    pub memory_cap_mb: Option<u64>,
+    #[serde(default)]
+    pub cpu_cap: Option<f64>,
+}
+
+/// A password made up by the server: shown once, to be changed at first login.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OneTimePassword {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetOwner {
+    /// `None`: the admins.
+    pub owner: Option<String>,
 }
 
 /// How the server itself is reached. Changed from the CLI or web UI; the
@@ -268,6 +341,10 @@ pub struct CredentialView {
     pub kind: CredentialKind,
     pub host: String,
     pub username: String,
+    /// Whose it is: a member's name, or `None` for the admins'. Builds of an
+    /// app use its owner's logins.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

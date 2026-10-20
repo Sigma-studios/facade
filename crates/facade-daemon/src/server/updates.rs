@@ -20,12 +20,13 @@ fn repo_dir(server: &Server, app: &str) -> PathBuf {
     server.cfg.data_dir.join("repos").join(format!("{app}.git"))
 }
 
-pub async fn check(server: &Server, spec: &AppSpec) -> anyhow::Result<UpdateCheck> {
+/// `owner`: whose logins fetch (the app's owner, or the admins).
+pub async fn check(server: &Server, spec: &AppSpec, owner: i64) -> anyhow::Result<UpdateCheck> {
     let Source::Git { repo, branch, .. } = &spec.source else {
         bail!("{} is not built from git", spec.name);
     };
     let dir = repo_dir(server, &spec.name);
-    let env = crate::gitauth::git_env(repo, &server.credentials()?);
+    let env = crate::gitauth::git_env(repo, &server.credentials(owner)?);
     // A repository URL change starts over.
     let url = git(&dir, &["config", "--get", "remote.origin.url"], &env)
         .await

@@ -15,7 +15,7 @@ use crate::lang;
 
 pub async fn inspect(
     State(server): State<Arc<Server>>,
-    _: User,
+    user: User,
     Json(req): Json<InspectRequest>,
 ) -> Result<Json<InspectReport>, ApiError> {
     let repo = req.repo.trim().to_string();
@@ -31,7 +31,8 @@ pub async fn inspect(
         .data_dir
         .join("inspect")
         .join(uuid::Uuid::new_v4().to_string());
-    let git_env = crate::gitauth::git_env(&repo, &server.credentials()?);
+    // The caller's own logins: a member never clones with someone else's.
+    let git_env = crate::gitauth::git_env(&repo, &server.credentials(user.login_owner())?);
     let result = scan(&repo, branch.as_deref(), &dir, git_env).await;
     let _ = tokio::fs::remove_dir_all(&dir).await;
     result
