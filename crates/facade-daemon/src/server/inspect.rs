@@ -31,7 +31,8 @@ pub async fn inspect(
         .data_dir
         .join("inspect")
         .join(uuid::Uuid::new_v4().to_string());
-    let result = scan(&repo, branch.as_deref(), &dir).await;
+    let git_env = crate::gitauth::git_env(&repo, &server.credentials()?);
+    let result = scan(&repo, branch.as_deref(), &dir, git_env).await;
     let _ = tokio::fs::remove_dir_all(&dir).await;
     result
         .map(Json)
@@ -42,6 +43,7 @@ async fn scan(
     repo: &str,
     branch: Option<&str>,
     dir: &std::path::Path,
+    git_env: Vec<(String, String)>,
 ) -> anyhow::Result<InspectReport> {
     tokio::fs::create_dir_all(dir.parent().expect("has parent")).await?;
     let mut clone = Command::new("git");
@@ -54,6 +56,7 @@ async fn scan(
         .arg(repo)
         .arg(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(git_env)
         .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(90), clone.output())
         .await

@@ -156,6 +156,7 @@ template in `lang::generated_dockerfile`.
 | `facade alerts config --webhook URL --mention @here` / `facade alerts test` | Discord notifications |
 | `facade logs <app> -f` | container logs |
 | `facade deployments <app> [--id ID]` | build history and logs |
+| `facade updates <app>` | commits on the app's branch since its deployed one |
 | `facade metrics <app>` / `facade node metrics <node>` | last hour of samples |
 | `facade env ls <app> [--reveal]` / `env set` / `env unset` | variables; sensitive unless `--public` |
 | `facade domain add <app> <domain>` | route a host name to an app |

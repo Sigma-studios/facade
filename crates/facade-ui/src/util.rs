@@ -180,6 +180,11 @@ pub fn date(at: u64) -> String {
     )
 }
 
+/// The 7-character form of a git commit hash.
+pub fn short_hash(hash: &str) -> &str {
+    hash.get(..7).unwrap_or(hash)
+}
+
 pub fn percent(part: u64, whole: u64) -> f64 {
     if whole == 0 {
         0.0

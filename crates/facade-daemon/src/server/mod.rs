@@ -11,6 +11,7 @@ mod monitor;
 mod secrets;
 mod store;
 mod ui;
+mod updates;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

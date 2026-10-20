@@ -76,6 +76,9 @@ pub struct AppView {
     pub message: Option<String>,
     pub revision: u64,
     pub stats: Option<AppStats>,
+    /// Commit of the last successful deployment, for sources from git.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +129,33 @@ pub struct DeploymentView {
     /// Only filled when a single deployment is fetched.
     #[serde(default)]
     pub log: String,
+    /// The commit that was built, for sources from git.
+    #[serde(default)]
+    pub commit: Option<String>,
+}
+
+/// What a deploy would bring: the branch's latest commit compared to the deployed one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateCheck {
+    /// The branch deployments build, as configured (`None`: the default branch).
+    pub branch: Option<String>,
+    /// Commit of the last successful deployment.
+    pub deployed: Option<String>,
+    pub latest: CommitView,
+    /// Commits on the branch since the deployed one. `None` when that is unknown
+    /// (never deployed from git, or the deployed commit is no longer on the branch).
+    pub behind: Option<u32>,
+    /// Those commits, newest first (at most 50); the latest few when `behind` is unknown.
+    pub commits: Vec<CommitView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitView {
+    pub hash: String,
+    pub subject: String,
+    pub author: String,
+    /// Unix time.
+    pub time: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

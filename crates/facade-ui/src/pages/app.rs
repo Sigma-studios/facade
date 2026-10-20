@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AppMetric, AppView, BackupReport, BackupRequest, BackupView, DeploymentStatus, DeploymentView,
-    DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, VolumeView,
+    AppMetric, AppView, BackupReport, BackupRequest, BackupView, CommitView, DeploymentStatus,
+    DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, UpdateCheck, VolumeView,
 };
 use facade_core::proto::AppState;
 use facade_core::{Build, Source};
@@ -16,7 +16,7 @@ use super::domains::DomainTable;
 use super::spec_form::{SpecFields, SpecForm};
 use crate::api;
 use crate::components::{ErrorNote, Loading, Modal, Sparkline, StateBadge};
-use crate::util::{ago, bytes, clock, date, polled, run, strip_ansi, toasts};
+use crate::util::{ago, bytes, clock, date, polled, run, short_hash, strip_ansi, toasts};
 
 const TABS: &[(&str, &str)] = &[
     ("overview", "Overview"),
@@ -57,7 +57,7 @@ pub fn AppPage() -> impl IntoView {
     let busy = RwSignal::new(false);
     let deploy = {
         let set_tab = set_tab.clone();
-        move |_| {
+        move || {
             busy.set(true);
             let set_tab = set_tab.clone();
             spawn_local(async move {
@@ -78,6 +78,11 @@ pub fn AppPage() -> impl IntoView {
             });
         }
     };
+    // For the Update button of the overview's update check.
+    let on_deploy = Callback::new({
+        let deploy = deploy.clone();
+        move |()| deploy()
+    });
     let simple = move |action: &'static str, done: &'static str| {
         let path = format!("/api/apps/{}/{action}", name.get_untracked());
         run(done, async move { api::act(&path).await }, move || {
@@ -132,7 +137,10 @@ pub fn AppPage() -> impl IntoView {
                 </div>
                 <div class="actions">
                     <button class="button button-primary" disabled=move || busy.get() || !app.loaded()
-                        on:click=deploy
+                        on:click={
+                            let deploy = deploy.clone();
+                            move |_| deploy()
+                        }
                         title="Fetch the latest code or image, rebuild and restart">
                         {move || if busy.get() { "Starting…" } else if deployed() { "Deploy" } else { "First deploy" }}
                     </button>
@@ -187,7 +195,10 @@ pub fn AppPage() -> impl IntoView {
                         <SettingsTab app=app.data.get_untracked().expect("loaded")
                             on_saved=move || app.reload() on_delete=move || confirm_delete.set(true)/>
                     }.into_any(),
-                    _ => view! { <OverviewTab name=name app=Signal::derive(move || app.data.get())/> }.into_any(),
+                    _ => view! {
+                        <OverviewTab name=name app=Signal::derive(move || app.data.get())
+                            deploying=busy on_deploy=on_deploy/>
+                    }.into_any(),
                 }}
             </Show>
 
@@ -235,7 +246,12 @@ fn subtitle(app: &AppView) -> String {
                 Build::Python { .. } => "Python",
                 Build::Static { .. } => "static site",
             };
-            format!("{} · {kind}", repo.trim_start_matches("https://"))
+            let commit = app
+                .commit
+                .as_deref()
+                .map(|c| format!(" · {}", short_hash(c)))
+                .unwrap_or_default();
+            format!("{} · {kind}{commit}", repo.trim_start_matches("https://"))
         }
     };
     let deployed = if app.revision == 0 {
@@ -249,7 +265,12 @@ fn subtitle(app: &AppView) -> String {
 // ---------------------------------------------------------------- overview
 
 #[component]
-fn OverviewTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) -> impl IntoView {
+fn OverviewTab(
+    name: Memo<String>,
+    #[prop(into)] app: Signal<Option<AppView>>,
+    deploying: RwSignal<bool>,
+    on_deploy: Callback<()>,
+) -> impl IntoView {
     let metrics = polled(Some(Duration::from_secs(15)), move || {
         let name = name.get();
         async move { api::get::<Vec<AppMetric>>(&format!("/api/apps/{name}/metrics")).await }
@@ -276,6 +297,8 @@ fn OverviewTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) -
             .map(|m| (m * 1024 * 1024) as f64)
     });
     let is_static = move || spec().is_some_and(|s| s.is_static());
+    let from_git = move || spec().is_some_and(|s| matches!(s.source, Source::Git { .. }));
+    let commit = move || app.get().and_then(|a| a.commit);
     let domains = polled(Some(Duration::from_secs(30)), || async {
         api::get::<Vec<DomainStatus>>("/api/domains").await
     });
@@ -332,6 +355,13 @@ fn OverviewTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) -
                         Source::Executable { filename, arch, .. } => format!("Executable {filename} ({arch})"),
                         Source::Git { repo, branch, .. } => format!("{repo} ({})", branch.clone().unwrap_or_else(|| "default branch".into())),
                     }}</dd>
+                    {matches!(s.source, Source::Git { .. }).then(|| view! {
+                        <dt>"Deployed commit"</dt>
+                        <dd>{move || match commit() {
+                            Some(c) => view! { <code title=c.clone()>{short_hash(&c).to_string()}</code> }.into_any(),
+                            None => view! { <span>"—"</span> }.into_any(),
+                        }}</dd>
+                    })}
                     {(!s.args.is_empty()).then(|| view! {
                         <dt>"Arguments"</dt>
                         <dd><code>{s.args.join(" ")}</code></dd>
@@ -352,7 +382,97 @@ fn OverviewTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) -
                     })}
                 </dl>
             })}
+            <Show when=from_git>
+                <UpdateCheckPanel name=name deploying=deploying on_deploy=on_deploy/>
+            </Show>
         </section>
+    }
+}
+
+/// Compares the deployed commit with the branch on demand: fetching the repository
+/// takes a few seconds.
+#[component]
+fn UpdateCheckPanel(
+    name: Memo<String>,
+    deploying: RwSignal<bool>,
+    on_deploy: Callback<()>,
+) -> impl IntoView {
+    let checking = RwSignal::new(false);
+    let result = RwSignal::new(None::<UpdateCheck>);
+    let error = RwSignal::new(None::<String>);
+    let check = move |_| {
+        checking.set(true);
+        error.set(None);
+        let path = format!("/api/apps/{}/updates", name.get_untracked());
+        spawn_local(async move {
+            match api::act_json::<UpdateCheck>(&path).await {
+                Ok(r) => {
+                    result.try_set(Some(r));
+                }
+                Err(e) => {
+                    result.try_set(None);
+                    error.try_set(Some(e));
+                }
+            }
+            checking.try_set(false);
+        });
+    };
+    let summary = move || {
+        result.get().map(|r| {
+            let branch = r
+                .branch
+                .clone()
+                .unwrap_or_else(|| "the default branch".into());
+            match r.behind {
+                Some(0) => format!("Up to date at {}.", short_hash(&r.latest.hash)),
+                Some(n) => format!(
+                    "{n} commit{} behind {branch}.",
+                    if n == 1 { "" } else { "s" }
+                ),
+                None => format!(
+                    "Latest on {branch}: {} {}",
+                    short_hash(&r.latest.hash),
+                    r.latest.subject
+                ),
+            }
+        })
+    };
+    let outdated = move || result.with(|r| r.as_ref().is_some_and(|r| r.behind != Some(0)));
+    view! {
+        <div class="update-check">
+            <div class="toolbar">
+                <button class="button" disabled=checking on:click=check>
+                    {move || if checking.get() { "Checking…" } else { "Check for updates" }}
+                </button>
+                <span>{summary}</span>
+                <Show when=outdated>
+                    <button class="button button-primary push-right" disabled=deploying
+                        on:click=move |_| on_deploy.run(())>
+                        "Update"
+                    </button>
+                </Show>
+            </div>
+            <ErrorNote error=error/>
+            {move || result.get().filter(|r| r.behind != Some(0) && !r.commits.is_empty()).map(|r| view! {
+                <div class="muted small">
+                    {if r.behind.is_some() { "New commits" } else { "Recent commits" }}
+                </div>
+                <ul class="commit-list">
+                    {r.commits.into_iter().map(|c| view! { <CommitRow c=c/> }).collect_view()}
+                </ul>
+            })}
+        </div>
+    }
+}
+
+#[component]
+fn CommitRow(c: CommitView) -> impl IntoView {
+    view! {
+        <li class="commit">
+            <code title=c.hash.clone()>{short_hash(&c.hash).to_string()}</code>
+            <span class="commit-subject">{c.subject}</span>
+            <span class="muted small">{format!("{} · {}", c.author, ago(c.time))}</span>
+        </li>
     }
 }
 
@@ -533,7 +653,10 @@ fn DeploymentsTab(name: Memo<String>, selected: RwSignal<Option<Uuid>>) -> impl 
                                 on:click=move |_| selected.set(Some(d.id))>
                                 <DeployStatus status=d.status/>
                                 <span class="deploy-rev">{format!("rev {}", d.revision)}</span>
-                                <span class="muted small">{ago(d.started_at)}</span>
+                                <span class="muted small">
+                                    {ago(d.started_at)}
+                                    {d.commit.as_deref().map(|c| format!(" · {}", short_hash(c)))}
+                                </span>
                             </button>
                         </li>
                     </For>
@@ -543,6 +666,9 @@ fn DeploymentsTab(name: Memo<String>, selected: RwSignal<Option<Uuid>>) -> impl 
                         <div class="deploy-head">
                             <DeployStatus status=d.status/>
                             <span>{format!("Revision {}", d.revision)}</span>
+                            {d.commit.clone().map(|c| view! {
+                                <code title=c.clone()>{short_hash(&c).to_string()}</code>
+                            })}
                             <span class="muted small">
                                 {format!("started {}", ago(d.started_at))}
                                 {d.finished_at.map(|f| format!(" · took {}s", f.saturating_sub(d.started_at)))}

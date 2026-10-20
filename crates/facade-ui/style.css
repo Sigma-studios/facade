@@ -714,6 +714,15 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .domain-check { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; color: var(--text-secondary); min-width: 0; word-break: break-word; }
 .app-domains { margin-bottom: 16px; }
 .app-backups { margin-top: 24px; }
+.update-check { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
+.update-check .toolbar { margin-bottom: 8px; }
+.commit-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.commit { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+.commit-subject { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.update-check { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
+.commit-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.commit { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+.commit-subject { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .node-ports { margin-top: 28px; }
 .node-ports .section-title { margin: 0; }
 .provider-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }

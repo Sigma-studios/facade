@@ -82,6 +82,7 @@ pub fn router(server: Arc<Server>) -> Router {
             get(get_app).put(update_app).delete(delete_app),
         )
         .route("/api/apps/{name}/deploy", post(deploy_app))
+        .route("/api/apps/{name}/updates", post(check_updates))
         .route("/api/apps/{name}/restart", post(restart_app))
         .route("/api/apps/{name}/start", post(start_app))
         .route("/api/apps/{name}/stop", post(stop_app))
@@ -343,11 +344,15 @@ fn app_view(server: &Server, spec: AppSpec, revision: u64) -> AppView {
     } else if !server.hub.is_connected(&spec.node) {
         state = AppState::Unknown;
     }
+    let git = matches!(spec.source, facade_core::Source::Git { .. });
     AppView {
         state,
         message,
         stats: entry.and_then(|e| e.stats.clone()),
         revision,
+        commit: git
+            .then(|| server.store.deployed_commit(&spec.name).ok().flatten())
+            .flatten(),
         spec,
     }
 }
@@ -684,8 +689,23 @@ fn holder(l: &Listener) -> String {
     }
 }
 
-/// Before (re)starting an app by hand: its ports must be free.
-fn check_ports_free(server: &Server, spec: &AppSpec) -> ApiResult<()> {
+/// Before (re)starting an app by hand: its ports must be free, as the node sees
+/// them now (an old program stopped a second ago no longer counts).
+async fn check_ports_free(server: &Server, spec: &AppSpec) -> ApiResult<()> {
+    if !host_ports(spec).is_empty()
+        && let Ok(listeners) = server
+            .hub
+            .query::<Vec<Listener>>(&spec.node, AgentRequest::Ports)
+            .await
+    {
+        server
+            .live
+            .write()
+            .nodes
+            .entry(spec.node.clone())
+            .or_default()
+            .listeners = listeners;
+    }
     match port_conflict(server, spec, true)? {
         Some(problem) => Err(conflict(problem)),
         None => Ok(()),
@@ -896,6 +916,7 @@ async fn delete_app(
         )));
     }
     // An offline node drops the app when it reconnects and syncs.
+    super::updates::forget(&server, &name).await;
     server.store.delete_app(&name)?;
     server.live.write().apps.remove(&name);
     server.refresh_routes()?;
@@ -911,7 +932,7 @@ async fn deploy_app(
     if !server.hub.is_connected(&row.spec.node) {
         return Err(unavailable(format!("node {} is offline", row.spec.node)));
     }
-    check_ports_free(&server, &row.spec)?;
+    check_ports_free(&server, &row.spec).await?;
     let revision = server.store.bump_revision(&name)?;
     let id = Uuid::new_v4();
     server.store.create_deployment(id, &name, revision)?;
@@ -930,7 +951,7 @@ async fn deploy_app(
     if let Err(e) = server.hub.request(&row.spec.node, request).await {
         server
             .store
-            .finish_deployment(id, Some(&format!("{e:#}")))?;
+            .finish_deployment(id, Some(&format!("{e:#}")), None)?;
         return Err(unavailable(format!("{e:#}")));
     }
     let view = server
@@ -938,6 +959,19 @@ async fn deploy_app(
         .get_deployment(id)?
         .context("deployment vanished")?;
     Ok((StatusCode::ACCEPTED, Json(view)))
+}
+
+/// Fetches the app's branch and compares it with the deployed commit.
+async fn check_updates(
+    State(server): S,
+    _: User,
+    Path(name): Path<String>,
+) -> ApiResult<Json<UpdateCheck>> {
+    let row = load_app(&server, &name)?;
+    super::updates::check(&server, &row.spec)
+        .await
+        .map(Json)
+        .map_err(|e| bad_request(format!("{e:#}")))
 }
 
 async fn restart_app(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<StatusCode> {
@@ -955,7 +989,7 @@ async fn set_enabled(server: &Server, name: &str, enabled: bool) -> ApiResult<St
     let mut spec = row.spec.clone();
     spec.enabled = enabled;
     if enabled && !row.spec.enabled {
-        check_ports_free(server, &spec)?;
+        check_ports_free(server, &spec).await?;
     }
     save_spec(server, &row.spec, &spec, false).await?;
     Ok(StatusCode::NO_CONTENT)

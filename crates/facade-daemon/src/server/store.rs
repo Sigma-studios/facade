@@ -166,6 +166,7 @@ impl Store {
         )?;
         conn.execute_batch(SCHEMA)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
+        add_column(&conn, "deployments", "git_commit", "TEXT")?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -474,23 +475,44 @@ impl Store {
         Ok(())
     }
 
-    pub fn finish_deployment(&self, id: Uuid, error: Option<&str>) -> anyhow::Result<()> {
+    pub fn finish_deployment(
+        &self,
+        id: Uuid,
+        error: Option<&str>,
+        commit: Option<&str>,
+    ) -> anyhow::Result<()> {
         let status = if error.is_some() {
             DeploymentStatus::Failed
         } else {
             DeploymentStatus::Succeeded
         };
         self.0.lock().execute(
-            "UPDATE deployments SET status = ?2, error = ?3, finished_at = ?4
+            "UPDATE deployments SET status = ?2, error = ?3, finished_at = ?4, git_commit = ?5
              WHERE id = ?1 AND status = 'running'",
             params![
                 id.to_string(),
                 status_str(status),
                 error,
-                facade_core::now()
+                facade_core::now(),
+                commit
             ],
         )?;
         Ok(())
+    }
+
+    /// Commit built by the app's last successful deployment from git.
+    pub fn deployed_commit(&self, app: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .query_row(
+                "SELECT git_commit FROM deployments
+                 WHERE app = ?1 AND status = 'succeeded' AND git_commit IS NOT NULL
+                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                [app],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Deployments that can no longer finish because their node went away.
@@ -509,7 +531,7 @@ impl Store {
     pub fn list_deployments(&self, app: &str, limit: u32) -> anyhow::Result<Vec<DeploymentView>> {
         let conn = self.0.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, app, revision, status, started_at, finished_at, error, '' FROM deployments
+            "SELECT id, app, revision, status, started_at, finished_at, error, '', git_commit FROM deployments
              WHERE app = ?1 ORDER BY started_at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = stmt
@@ -523,7 +545,7 @@ impl Store {
             .0
             .lock()
             .query_row(
-                "SELECT id, app, revision, status, started_at, finished_at, error, log
+                "SELECT id, app, revision, status, started_at, finished_at, error, log, git_commit
                  FROM deployments WHERE id = ?1",
                 [id.to_string()],
                 Self::deployment_row,
@@ -543,6 +565,7 @@ impl Store {
             finished_at: r.get(5)?,
             error: r.get(6)?,
             log: r.get(7)?,
+            commit: r.get(8)?,
         })
     }
 
