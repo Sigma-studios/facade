@@ -20,7 +20,7 @@ docker run --rm --platform "linux/$arch" \
     -v facade-cargo-registry:/usr/local/cargo/registry \
     -v "facade-target-$arch":/src/target \
     -v "$out":/out \
-    rust:1-alpine sh -c '
+    docker.io/library/rust:1-alpine sh -c '
         apk add --no-cache musl-dev >/dev/null &&
         cargo build --release --bin facaded --bin facade &&
         cp target/release/facaded target/release/facade /out/'
