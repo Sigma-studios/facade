@@ -1,7 +1,7 @@
 use facade_core::proto::AppState;
 use leptos::prelude::*;
 
-use crate::util::{copy_to_clipboard, toasts};
+use crate::util::{bytes, copy_to_clipboard, cpus, toasts};
 
 /// App state as icon + label; the colour only reinforces it.
 #[component]
@@ -231,4 +231,159 @@ pub fn ErrorNote(#[prop(into)] error: Signal<Option<String>>) -> impl IntoView {
 #[component]
 pub fn Loading() -> impl IntoView {
     view! { <div class="loading">"Loading…"</div> }
+}
+
+const MB: u64 = 1024 * 1024;
+
+/// What an [`AmountSlider`] chooses. Values stay absolute (MB, cores): a share
+/// of the machine would drift when it is resized.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Amount {
+    /// Megabytes; the slider moves in percent of the total.
+    Memory,
+    /// Cores, in quarters.
+    Cpus,
+}
+
+impl Amount {
+    /// Slider `(min, max, step)` for a total.
+    fn range(self, total: f64) -> (f64, f64, f64) {
+        match self {
+            Amount::Memory => (1.0, 100.0, 1.0),
+            Amount::Cpus => (0.25, total.max(0.25), 0.25),
+        }
+    }
+
+    fn to_slider(self, value: f64, total: f64) -> f64 {
+        match self {
+            Amount::Memory => value * 100.0 / total,
+            Amount::Cpus => value,
+        }
+    }
+
+    fn of_slider(self, slider: f64, total: f64) -> f64 {
+        match self {
+            Amount::Memory => (slider * total / 100.0).round(),
+            Amount::Cpus => slider,
+        }
+    }
+
+    /// The text the form stores and parses.
+    fn format(self, value: f64) -> String {
+        match self {
+            Amount::Memory => (value.round().max(0.0) as u64).to_string(),
+            Amount::Cpus => cpus(((value * 4.0).round() / 4.0).max(0.25)),
+        }
+    }
+
+    pub fn describe(self, value: f64, total: f64) -> String {
+        match self {
+            Amount::Memory => format!(
+                "{:.0} % · {} of {}",
+                value * 100.0 / total,
+                bytes(value as u64 * MB),
+                bytes(total as u64 * MB)
+            ),
+            Amount::Cpus => format!("{} of {} cores", cpus(value), cpus(total)),
+        }
+    }
+
+    fn left(self, value: f64) -> String {
+        match self {
+            Amount::Memory => format!("{} MB left in your share", value.max(0.0) as u64),
+            Amount::Cpus => format!("{} CPUs left in your share", cpus(value.max(0.0))),
+        }
+    }
+}
+
+/// A memory or CPU amount as a slider over `total` (MB or cores) with a number
+/// input kept in sync. `value` holds the number as text, empty for none. Without
+/// a known total only the number input is shown.
+#[component]
+pub fn AmountSlider(
+    label: &'static str,
+    amount: Amount,
+    value: RwSignal<String>,
+    #[prop(into)] total: Signal<Option<f64>>,
+    /// Offer a "none" checkbox labelled `none_label`; otherwise a value is required.
+    #[prop(into)]
+    optional: Signal<bool>,
+    none_label: &'static str,
+    /// What is left of a shared cap, marked on the slider.
+    #[prop(into)]
+    available: Signal<Option<f64>>,
+) -> impl IntoView {
+    let current = move || value.with(|v| v.trim().parse::<f64>().ok());
+    let empty = move || value.with(|v| v.trim().is_empty());
+    let (unit, number_min, number_step) = match amount {
+        Amount::Memory => ("MB", "16", "1"),
+        Amount::Cpus => ("CPUs", "0.25", "0.25"),
+    };
+    let over = move || match (current(), available.get()) {
+        (Some(v), Some(a)) => v > a + 1e-9,
+        _ => false,
+    };
+    let number = move || {
+        view! {
+            <input type="number" class="slider-number" min=number_min step=number_step
+                bind:value=value required=move || !optional.get()
+                placeholder=move || if optional.get() { "no limit" } else { "required" }/>
+        }
+    };
+    view! {
+        <div class="field">
+            <span>{label}</span>
+            {move || match total.get() {
+                None => view! {
+                    <div class="slider-row">{number()}<span class="muted small">{unit}</span></div>
+                }.into_any(),
+                Some(total) => {
+                    let (min, max, step) = amount.range(total);
+                    // A starting point when a limit is switched on: a quarter, or what is left.
+                    let start = move || {
+                        let quarter = amount.of_slider(amount.to_slider(total, total) / 4.0, total);
+                        let start = available.get().map_or(quarter, |a| a.min(quarter));
+                        amount.format(start.max(amount.of_slider(min, total)))
+                    };
+                    view! {
+                        <Show when=move || optional.get()>
+                            <label class="check slider-none">
+                                <input type="checkbox" prop:checked=empty
+                                    on:change=move |ev| value.set(if event_target_checked(&ev) { String::new() } else { start() })/>
+                                {none_label}
+                            </label>
+                        </Show>
+                        <Show when=move || !optional.get() || !empty()>
+                            <div class="slider-row">
+                                <div class="slider-track">
+                                    <input type="range" min=min max=max step=step aria-label=label
+                                        prop:value=move || amount.to_slider(current().unwrap_or(0.0), total).clamp(min, max).to_string()
+                                        on:input=move |ev| {
+                                            let slider = event_target_value(&ev).parse().unwrap_or(min);
+                                            value.set(amount.format(amount.of_slider(slider, total)));
+                                        }/>
+                                    {move || available.get().map(|a| {
+                                        let at = ((amount.to_slider(a, total) - min) / (max - min)).clamp(0.0, 1.0);
+                                        view! {
+                                            <span class="slider-mark" title="what is left in your share"
+                                                style=format!("left: {:.1}%", at * 100.0)></span>
+                                        }
+                                    })}
+                                </div>
+                                {number()}
+                                <span class="muted small">{unit}</span>
+                            </div>
+                            <small class=move || if over() { "slider-label over" } else { "slider-label" }>
+                                {move || match current() {
+                                    Some(v) => amount.describe(v, total),
+                                    None => "Pick a value.".into(),
+                                }}
+                                {move || available.get().map(|a| format!(" · {}", amount.left(a)))}
+                            </small>
+                        </Show>
+                    }.into_any()
+                }
+            }}
+        </div>
+    }
 }

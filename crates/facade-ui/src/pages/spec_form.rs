@@ -6,8 +6,8 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
-use crate::components::ErrorNote;
-use crate::util::{bytes, cpus, me};
+use crate::components::{Amount, AmountSlider, ErrorNote};
+use crate::util::{bytes, me};
 
 #[derive(Clone, Copy)]
 pub struct SpecForm {
@@ -36,6 +36,10 @@ pub struct SpecForm {
     memory: RwSignal<String>,
     cpus: RwSignal<String>,
     enabled: RwSignal<bool>,
+    /// The saved limits of a running app: they are freed when it changes, so they
+    /// count as available in the owner's share.
+    own_memory: Option<f64>,
+    own_cpus: Option<f64>,
     artifact: RwSignal<Option<ArtifactView>>,
     args: RwSignal<String>,
     scan: RwSignal<Option<InspectReport>>,
@@ -83,6 +87,8 @@ impl SpecForm {
             memory: s(""),
             cpus: s(""),
             enabled: RwSignal::new(true),
+            own_memory: None,
+            own_cpus: None,
             artifact: RwSignal::new(None),
             args: s(""),
             scan: RwSignal::new(None),
@@ -94,7 +100,7 @@ impl SpecForm {
     }
 
     pub fn from_spec(spec: &AppSpec) -> Self {
-        let form = Self::new(spec.node.clone());
+        let mut form = Self::new(spec.node.clone());
         form.name.set(spec.name.clone());
         match &spec.source {
             Source::Image { image } => {
@@ -172,6 +178,10 @@ impl SpecForm {
         form.memory.set(opt_text(spec.limits.memory_mb));
         form.cpus.set(opt_text(spec.limits.cpus));
         form.enabled.set(spec.enabled);
+        if spec.enabled {
+            form.own_memory = spec.limits.memory_mb.map(|m| m as f64);
+            form.own_cpus = spec.limits.cpus;
+        }
         form
     }
 
@@ -653,6 +663,17 @@ pub fn SpecFields(
 ) -> impl IntoView {
     let f = form;
     let me = me();
+    // Capacity of the chosen node, which bounds the limit sliders.
+    let node_stat = move |pick: fn(&facade_core::proto::NodeStats) -> f64| {
+        let node = f.node.get();
+        nodes.with(|ns| {
+            ns.iter()
+                .find(|n| n.name == node)
+                .and_then(|n| n.stats.as_ref())
+                .map(pick)
+                .filter(|v| *v > 0.0)
+        })
+    };
     view! {
         <fieldset class="form-section">
             <legend>"App"</legend>
@@ -857,25 +878,22 @@ pub fn SpecFields(
             </fieldset>
             <fieldset class="form-section">
                 <legend>"Limits"</legend>
-                <div class="form-row">
-                    <label class="field">
-                        <span>"Memory (MB)"</span>
-                        <input type="number" min="16" bind:value=f.memory
-                            required=move || me.memory_cap().is_some()
-                            placeholder=move || if me.memory_cap().is_some() { "required" } else { "no limit" }/>
-                        {move || me.memory_cap().map(|(used, cap)| view! {
-                            <small>{format!("{used} of {cap} MB used by your apps.")}</small>
-                        })}
-                    </label>
-                    <label class="field">
-                        <span>"CPUs"</span>
-                        <input type="number" min="0.1" step="0.1" bind:value=f.cpus
-                            required=move || me.cpu_cap().is_some()
-                            placeholder=move || if me.cpu_cap().is_some() { "required" } else { "no limit" }/>
-                        {move || me.cpu_cap().map(|(used, cap)| view! {
-                            <small>{format!("{} of {} CPUs used by your apps.", cpus(used), cpus(cap))}</small>
-                        })}
-                    </label>
+                <div class="form-row limits-row">
+                    <AmountSlider label="Memory" amount=Amount::Memory value=f.memory
+                        total=Signal::derive(move || node_stat(|s| (s.mem_total / (1024 * 1024)) as f64))
+                        optional=Signal::derive(move || me.memory_cap().is_none())
+                        none_label="No limit"
+                        available=Signal::derive(move || {
+                            me.memory_cap()
+                                .map(|(used, cap)| cap as f64 - used as f64 + f.own_memory.unwrap_or(0.0))
+                        })/>
+                    <AmountSlider label="CPUs" amount=Amount::Cpus value=f.cpus
+                        total=Signal::derive(move || node_stat(|s| s.cpus as f64))
+                        optional=Signal::derive(move || me.cpu_cap().is_none())
+                        none_label="No limit"
+                        available=Signal::derive(move || {
+                            me.cpu_cap().map(|(used, cap)| cap - used + f.own_cpus.unwrap_or(0.0))
+                        })/>
                 </div>
             </fieldset>
         </Show>
