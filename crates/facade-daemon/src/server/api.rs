@@ -1201,6 +1201,24 @@ async fn logs(
     Query(q): Query<LogsQuery>,
 ) -> ApiResult<Response> {
     let row = load_app(&server, &name)?;
+    let text_response = |message: String| {
+        (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            message,
+        )
+            .into_response()
+    };
+    if row.revision == 0 {
+        return Ok(text_response(format!(
+            "[façade] {name} is not deployed yet: its logs appear here after its first deploy\n"
+        )));
+    }
+    if !server.hub.is_connected(&row.spec.node) {
+        return Ok(text_response(format!(
+            "[façade] node {} is offline: logs are read from the node itself\n",
+            row.spec.node
+        )));
+    }
     let stream = server
         .hub
         .open_logs(&row.spec.node, &name, q.tail.min(100_000), q.follow)

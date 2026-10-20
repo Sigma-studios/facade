@@ -944,21 +944,59 @@ impl Runtime {
             out.write_all(b"static sites have no logs\n").await?;
             return Ok(());
         }
-        let mut logs = self.docker().logs(
-            &container(app),
-            Some(LogsOptions {
-                follow,
-                stdout: true,
-                stderr: true,
-                timestamps: true,
-                tail: tail.to_string(),
-                ..Default::default()
-            }),
-        );
-        while let Some(chunk) = logs.next().await {
-            let chunk = chunk?;
-            out.write_all(&chunk.into_bytes()).await?;
-            out.flush().await?;
+        let name = container(app);
+        // The stream always ends cleanly, with the reason in it if it could not
+        // go on: cut off, it reads as a network failure on the other side.
+        let ended = match self
+            .docker()
+            .inspect_container(&name, None::<InspectContainerOptions>)
+            .await
+        {
+            Err(e) if is_not_found(&e) => Some(format!(
+                "{app} has no container on this node yet: its logs start with its next deploy"
+            )),
+            Err(e) => Some(format!("cannot read the logs of {app}: {e}")),
+            Ok(_) => {
+                let mut logs = self.docker().logs(
+                    &name,
+                    Some(LogsOptions {
+                        follow,
+                        stdout: true,
+                        stderr: true,
+                        timestamps: true,
+                        tail: tail.to_string(),
+                        ..Default::default()
+                    }),
+                );
+                let mut ended = None;
+                while let Some(chunk) = logs.next().await {
+                    match chunk {
+                        Ok(chunk) => {
+                            out.write_all(&chunk.into_bytes()).await?;
+                            out.flush().await?;
+                        }
+                        // Removed while followed: a redeploy replaced it.
+                        Err(e) if is_not_found(&e) => {
+                            ended = Some(format!("{app}'s container was replaced or removed"));
+                            break;
+                        }
+                        Err(e) => {
+                            ended = Some(format!("log stream ended: {e}"));
+                            break;
+                        }
+                    }
+                }
+                if follow && ended.is_none() {
+                    ended = Some(format!(
+                        "{app}'s container stopped or was replaced (a deploy or a configuration change): reopen the logs to follow the new one"
+                    ));
+                }
+                ended
+            }
+        };
+        if let Some(reason) = ended {
+            out.write_all(format!("[façade] {reason}\n").as_bytes())
+                .await?;
         }
         out.shutdown().await?;
         Ok(())
