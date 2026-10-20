@@ -1933,7 +1933,7 @@ async fn user(api: &Api, cmd: UserCommand, json: bool) -> anyhow::Result<()> {
                     None => current.memory_cap_mb,
                 },
                 cpu_cap: match cpus {
-                    Some(c) if c == 0.0 => None,
+                    Some(0.0) => None,
                     Some(c) => Some(c),
                     None => current.cpu_cap,
                 },
