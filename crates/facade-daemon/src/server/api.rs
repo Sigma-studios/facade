@@ -104,7 +104,7 @@ pub fn router(server: Arc<Server>) -> Router {
             )),
         )
         .route("/api/inspect", post(super::inspect::inspect))
-        .route("/api/health", get(|| async { "ok" }))
+        .route("/api/health", get(health))
         .fallback(super::ui::serve)
         .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
         .with_state(server)
@@ -299,6 +299,16 @@ async fn login(State(server): S, Json(req): Json<LoginRequest>) -> ApiResult<Jso
 async fn logout(State(server): S, user: User) -> ApiResult<StatusCode> {
     server.store.delete_session(&user.token_hash)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `ok` once the server's own agent is connected (so it serves and converges);
+/// 503 before that, e.g. just after a restart.
+async fn health(State(server): S) -> (StatusCode, &'static str) {
+    if server.hub.is_connected(&server.cfg.local_node) {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "starting")
+    }
 }
 
 async fn whoami(State(server): S, user: User) -> ApiResult<Json<WhoAmI>> {

@@ -919,6 +919,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "instant-acme",
+ "libc",
  "parking_lot",
  "rand 0.9.5",
  "rcgen",

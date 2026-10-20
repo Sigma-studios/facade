@@ -15,8 +15,12 @@ alerts; everything scriptable from a CLI with `--json` output.
 ```
 
 * **Each node serves its own apps.** A domain points at the node its app runs on;
-  that node's agent terminates HTTPS and forwards to the container, so traffic never
-  goes through another server. Nodes need ports 80 and 443 open.
+  that node's entry point (`facaded-ingress`) terminates HTTPS and forwards to the
+  container, so traffic never goes through another server. Nodes need ports 80 and
+  443 open.
+* **The entry point is its own process.** The node's agent tells it what to serve;
+  it keeps serving while the agent or the server restarts, and it updates itself by
+  handing its sockets to the new version, so updates never drop connections.
 * **The server is the control plane.** It gets certificates and pushes them to the
   nodes that need them, keeps DNS records up to date through the DNS provider, and
   sends each agent its complete desired state when it connects. Agents converge
@@ -66,6 +70,34 @@ The domain and the Let's Encrypt contact can be changed any time (`facade server
 certificate, `facade server set --direct-api-local-only` closes port 7701 to the
 outside: facade is then public only at its domain, and the port stays usable through
 an SSH tunnel (`ssh -L 7701:127.0.0.1:7701 VPS`) as a way back in.
+
+### Updating
+
+```sh
+deploy/build-linux.sh
+deploy/upgrade.sh root@VPS          # or ubuntu@VPS with passwordless sudo
+```
+
+`upgrade.sh` first asks the new binary what it would do to the running apps (a new
+version can change how containers are fingerprinted: they are then recreated, or
+rebuilt from their branch's latest commit), and waits for a yes. Then it backs up
+the database and key, keeps the previous binary as `facaded.prev`, installs, and
+waits for the server to be healthy, going back to the previous binary if it is not
+within a minute. Last, `systemctl reload facaded-ingress` hands the entry point over
+to the new binary: it takes the listening sockets, and the old process finishes its
+open connections (WebSockets included, up to an hour) before exiting. If the new
+binary does not start, the old one keeps serving.
+
+Apps run on through all of it: they belong to Docker. Other nodes update themselves:
+when an agent connects to a server running another build of facaded (for the same
+CPU), it downloads the server's binary, hands its node's entry point over to it and
+restarts. The server accepts agents from the previous protocol version on, so an
+update never locks nodes out.
+
+Installs from before the separate entry point serve apps from inside `facaded`: add
+`ingress = "external"` to `/etc/facade/server.toml`, install
+`facaded-ingress.service`, then `systemctl restart facaded && systemctl enable --now
+facaded-ingress`.
 
 ### More servers
 

@@ -159,6 +159,18 @@ fn parse_status(s: &str) -> DeploymentStatus {
 }
 
 impl Store {
+    /// The database of a running server, read only and as it is (no schema
+    /// changes), for tools like `facaded upgrade-check`.
+    pub fn open_read_only(path: &Path) -> anyhow::Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening {}", path.display()))?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        Ok(Self(Mutex::new(conn)))
+    }
+
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.execute_batch(

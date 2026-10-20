@@ -61,6 +61,9 @@ if [[ $role == server ]]; then
     if [[ ! -f /etc/facade/server.toml ]]; then
         {
             echo "public_host = \"$public_host\""
+            echo
+            echo "# Apps are served by facaded-ingress, so updating facaded never drops traffic."
+            echo "ingress = \"external\""
             if [[ -n $domain ]]; then
                 echo
                 echo "# Web UI and API with a real certificate (later: facade server set --api-domain)."
@@ -74,12 +77,23 @@ if [[ $role == server ]]; then
                 echo '# email = "you@example.com"'
             fi
         } > /etc/facade/server.toml
-    elif [[ -n $domain || -n $email ]]; then
-        echo "note: /etc/facade/server.toml exists and was kept; once logged in, run"
-        echo "  facade server set${domain:+ --api-domain $domain}${email:+ --acme-email $email}"
+    else
+        if [[ -n $domain || -n $email ]]; then
+            echo "note: /etc/facade/server.toml exists and was kept; once logged in, run"
+            echo "  facade server set${domain:+ --api-domain $domain}${email:+ --acme-email $email}"
+        fi
+        if ! grep -q '^ingress *= *"external"' /etc/facade/server.toml; then
+            echo "note: /etc/facade/server.toml serves apps from inside facaded; add"
+            echo '  ingress = "external"'
+            echo "  and restart facaded so updates never drop traffic (see README)"
+        fi
     fi
     install -m 0644 "$here/facaded.service" /etc/systemd/system/facaded.service
+    install -m 0644 "$here/facaded-ingress.service" /etc/systemd/system/facaded-ingress.service
     systemctl daemon-reload
+    if grep -q '^ingress *= *"external"' /etc/facade/server.toml; then
+        systemctl enable --now facaded-ingress
+    fi
     systemctl enable --now facaded
     open_ports 80/tcp 443/tcp 7700/tcp 7701/tcp
     sleep 2
@@ -103,8 +117,9 @@ else
     mkdir -p /var/lib/facade-agent && chmod 700 /var/lib/facade-agent
     (umask 077 && printf '%s' "$token" > /var/lib/facade-agent/join-token)
     install -m 0644 "$here/facaded-agent.service" /etc/systemd/system/facaded-agent.service
+    install -m 0644 "$here/facaded-ingress.service" /etc/systemd/system/facaded-ingress.service
     systemctl daemon-reload
-    systemctl enable --now facaded-agent
+    systemctl enable --now facaded-ingress facaded-agent
     open_ports 80/tcp 443/tcp
     echo "facade agent running; check with: journalctl -u facaded-agent -f"
 fi

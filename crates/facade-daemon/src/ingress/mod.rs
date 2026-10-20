@@ -1,44 +1,67 @@
-//! The node's public HTTP(S) entry point. Routes by host name to the apps running
-//! on this node, straight to their local port; WebSocket (and any HTTP/1.1
-//! upgrade) is spliced through.
+//! A node's public HTTP(S) entry point. Routes by host name, straight to the
+//! apps running on the node; WebSocket (and any HTTP/1.1 upgrade) is spliced
+//! through.
 //!
-//! Certificates and ACME HTTP-01 answers come from the server. They are kept on
-//! disk too, so apps stay reachable over HTTPS while the server is away.
+//! What to serve comes as a [`Table`] from the node's agent: routes, certificates
+//! and ACME HTTP-01 answers. The table is kept on disk, so apps stay reachable
+//! while the agent (or the server) is away or restarting.
 //!
-//! An address that is taken (another web server on 80/443) is retried every few
-//! seconds and reported to the server, so facade takes over as soon as the other
-//! program stops.
+//! The entry point runs either inside the agent (`embedded`, handy in
+//! development) or as its own process, `facaded ingress` (see [`process`]): then
+//! updating facade's control plane or agent never touches traffic, and the
+//! entry point updates itself by handing its listening sockets to the new
+//! binary while the old one finishes its open connections.
 
-use std::collections::HashMap;
+pub mod process;
+
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
-use facade_core::proto::{CertBundle, ProxyRoute, Workload};
+use facade_core::proto::CertBundle;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower::ServiceExt;
 use tracing::{debug, info, warn};
 
-use super::Agent;
 use crate::tls;
 
-/// Where the entry point listens. `None` disables a listener.
-#[derive(Debug, Clone, Copy)]
-pub struct IngressOptions {
-    pub http: Option<SocketAddr>,
-    pub https: Option<SocketAddr>,
+/// Everything the entry point needs to know, replaced as a whole by the agent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Table {
+    /// Host name → where it goes.
+    pub routes: BTreeMap<String, Route>,
+    pub certs: Vec<CertBundle>,
+    /// ACME HTTP-01 token → key authorization.
+    pub challenges: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Route {
+    /// An app (or facade's own API) listening on this local port.
+    Port { app: String, port: u16 },
+    /// Files of a static site.
+    Static { app: String, root: PathBuf },
+    /// A permanent redirect to another host, path and query kept.
+    Redirect { to: String },
+    /// An app that cannot be reached right now (not started, or failing).
+    Unavailable { app: String },
 }
 
 /// Certificates by name; `*.example.com` covers one level of subdomains.
@@ -46,27 +69,19 @@ pub struct IngressOptions {
 pub struct Certs {
     by_name: RwLock<HashMap<String, Arc<CertifiedKey>>>,
     fallback: Arc<CertifiedKey>,
-    file: PathBuf,
 }
 
 impl Certs {
-    pub fn load(dir: &std::path::Path) -> anyhow::Result<Self> {
+    pub fn new() -> anyhow::Result<Self> {
         let generated = rcgen::generate_simple_self_signed(vec!["facade".to_string()])?;
         let fallback = tls::certified_key(
             generated.cert.pem().as_bytes(),
             generated.signing_key.serialize_pem().as_bytes(),
         )?;
-        let certs = Self {
+        Ok(Self {
             by_name: Default::default(),
             fallback,
-            file: dir.join("certificates.json"),
-        };
-        if let Ok(raw) = std::fs::read(&certs.file)
-            && let Ok(bundles) = serde_json::from_slice::<Vec<CertBundle>>(&raw)
-        {
-            certs.install(&bundles);
-        }
-        Ok(certs)
+        })
     }
 
     fn install(&self, bundles: &[CertBundle]) {
@@ -78,23 +93,10 @@ impl Certs {
                         by_name.insert(name.to_ascii_lowercase(), key.clone());
                     }
                 }
-                Err(e) => warn!(names = ?bundle.names, "bad certificate from server: {e:#}"),
+                Err(e) => warn!(names = ?bundle.names, "bad certificate: {e:#}"),
             }
         }
         *self.by_name.write() = by_name;
-    }
-
-    /// Replaces every certificate, and remembers them for the next start.
-    pub fn replace(&self, bundles: &[CertBundle]) {
-        self.install(bundles);
-        match serde_json::to_vec(bundles) {
-            Ok(json) => {
-                if let Err(e) = tls::write_private(&self.file, &json) {
-                    warn!("saving certificates: {e}");
-                }
-            }
-            Err(e) => warn!("saving certificates: {e}"),
-        }
     }
 
     pub fn find(&self, host: &str) -> Option<Arc<CertifiedKey>> {
@@ -115,45 +117,100 @@ impl ResolvesServerCert for Certs {
     }
 }
 
-/// What the server pushes besides workloads.
-#[derive(Default)]
-pub struct Routing {
-    pub challenges: RwLock<HashMap<String, String>>,
-    pub proxies: RwLock<Vec<ProxyRoute>>,
-}
-
-pub async fn run(agent: Arc<Agent>, options: IngressOptions) {
-    let client: Client<HttpConnector, Incoming> = Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(60))
-        .build(HttpConnector::new());
-    let ingress = Arc::new(Ingress { agent, client });
-    for (addr, tls) in [(options.http, false), (options.https, true)] {
-        if let Some(addr) = addr {
-            tokio::spawn(ingress.clone().listen(addr, tls));
-        }
-    }
-}
-
-const BIND_RETRY: Duration = Duration::from_secs(5);
-
-struct Ingress {
-    agent: Arc<Agent>,
+/// The entry point's state, shared by its listeners.
+pub struct Ingress {
+    table: RwLock<Table>,
+    certs: Arc<Certs>,
     client: Client<HttpConnector, Incoming>,
-}
-
-enum Target {
-    Port(u16),
-    Static(PathBuf),
+    /// Where the table is kept between runs.
+    file: PathBuf,
+    /// Addresses that cannot be bound yet, with why.
+    bind_errors: Mutex<BTreeMap<SocketAddr, String>>,
+    /// Connections being served (WebSockets included), so a retiring process
+    /// knows when it is done.
+    active: Arc<AtomicUsize>,
+    /// Told whenever `bind_errors` changes.
+    pub status: watch::Sender<()>,
 }
 
 impl Ingress {
+    /// Loads the last table saved in `dir`.
+    pub fn new(dir: &std::path::Path) -> anyhow::Result<Arc<Self>> {
+        tls::create_private_dir(dir)?;
+        let file = dir.join("ingress-table.json");
+        let table: Table = std::fs::read(&file)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default();
+        let certs = Arc::new(Certs::new()?);
+        certs.install(&table.certs);
+        let client = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(60))
+            .build(HttpConnector::new());
+        Ok(Arc::new(Self {
+            table: RwLock::new(table),
+            certs,
+            client,
+            file,
+            bind_errors: Default::default(),
+            active: Default::default(),
+            status: watch::channel(()).0,
+        }))
+    }
+
+    /// Replaces the table (and saves it) if it changed.
+    pub fn set_table(&self, table: Table) {
+        {
+            let current = self.table.read();
+            if *current == table {
+                return;
+            }
+            if current.certs != table.certs {
+                self.certs.install(&table.certs);
+            }
+        }
+        match serde_json::to_vec(&table) {
+            Ok(json) => {
+                if let Err(e) = tls::write_private(&self.file, &json) {
+                    warn!("saving the routing table: {e}");
+                }
+            }
+            Err(e) => warn!("saving the routing table: {e}"),
+        }
+        *self.table.write() = table;
+    }
+
+    pub fn bind_errors(&self) -> Vec<String> {
+        self.bind_errors.lock().values().cloned().collect()
+    }
+
+    pub fn active_connections(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    fn set_bind_error(&self, addr: SocketAddr, error: Option<String>) {
+        let changed = {
+            let mut errors = self.bind_errors.lock();
+            match error {
+                Some(e) => errors.insert(addr, e.clone()).as_ref() != Some(&e),
+                None => errors.remove(&addr).is_some(),
+            }
+        };
+        if changed {
+            self.status.send_replace(());
+        }
+    }
+
     /// Binds `addr`, retrying while another program holds it.
-    async fn listen(self: Arc<Self>, addr: SocketAddr, tls: bool) {
+    pub async fn bind(self: &Arc<Self>, addr: SocketAddr, tls: bool) -> TcpListener {
         let scheme = if tls { "https" } else { "http" };
         let mut warned = false;
-        let listener = loop {
+        loop {
             match TcpListener::bind(addr).await {
-                Ok(listener) => break listener,
+                Ok(listener) => {
+                    self.set_bind_error(addr, None);
+                    return listener;
+                }
                 Err(e) => {
                     let message = format!("cannot listen on {addr} ({scheme}): {e}");
                     if !warned {
@@ -162,26 +219,47 @@ impl Ingress {
                         );
                         warned = true;
                     }
-                    self.agent.ingress_errors.lock().insert(addr, message);
+                    self.set_bind_error(addr, Some(message));
                     tokio::time::sleep(BIND_RETRY).await;
                 }
             }
-        };
-        self.agent.ingress_errors.lock().remove(&addr);
-        info!("serving {scheme}://{addr}");
-        self.accept(listener, tls).await;
+        }
     }
 
-    async fn accept(self: Arc<Self>, listener: TcpListener, tls: bool) {
+    /// Binds (with retries) and serves `addr` until the process ends.
+    pub async fn listen(self: Arc<Self>, addr: SocketAddr, tls: bool) {
+        let listener = self.bind(addr, tls).await;
+        let (_keep, stop) = watch::channel(false);
+        self.serve(listener, tls, stop).await;
+    }
+
+    /// Accepts connections until `stop` turns true; connections already accepted
+    /// carry on.
+    pub async fn serve(
+        self: Arc<Self>,
+        listener: TcpListener,
+        tls: bool,
+        mut stop: watch::Receiver<bool>,
+    ) {
+        let addr = listener.local_addr().ok();
+        info!(
+            "serving {}://{}",
+            if tls { "https" } else { "http" },
+            addr.map(|a| a.to_string()).unwrap_or_default()
+        );
         let acceptor = tls.then(|| {
             let mut config = rustls::ServerConfig::builder()
                 .with_no_client_auth()
-                .with_cert_resolver(self.agent.certs.clone());
+                .with_cert_resolver(self.certs.clone());
             config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             tokio_rustls::TlsAcceptor::from(Arc::new(config))
         });
         loop {
-            let (tcp, peer) = match listener.accept().await {
+            let accepted = tokio::select! {
+                accepted = listener.accept() => accepted,
+                _ = stopped(&mut stop) => return,
+            };
+            let (tcp, peer) = match accepted {
                 Ok(conn) => conn,
                 Err(e) => {
                     warn!("accept: {e}");
@@ -191,14 +269,18 @@ impl Ingress {
             };
             let ingress = self.clone();
             let acceptor = acceptor.clone();
+            let counted = Counted::new(&ingress.active);
             tokio::spawn(async move {
+                let _counted = counted;
                 match acceptor {
-                    None => ingress.serve(TokioIo::new(tcp), peer, false).await,
+                    None => ingress.connection(TokioIo::new(tcp), peer, false).await,
                     Some(acceptor) => {
                         match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp))
                             .await
                         {
-                            Ok(Ok(stream)) => ingress.serve(TokioIo::new(stream), peer, true).await,
+                            Ok(Ok(stream)) => {
+                                ingress.connection(TokioIo::new(stream), peer, true).await
+                            }
                             _ => debug!(%peer, "TLS handshake failed"),
                         }
                     }
@@ -207,7 +289,7 @@ impl Ingress {
         }
     }
 
-    async fn serve<I>(self: Arc<Self>, io: I, peer: SocketAddr, tls: bool)
+    async fn connection<I>(self: Arc<Self>, io: I, peer: SocketAddr, tls: bool)
     where
         I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     {
@@ -222,7 +304,11 @@ impl Ingress {
 
     async fn handle(&self, req: Request<Incoming>, peer: SocketAddr, tls: bool) -> Response<Body> {
         let host = request_host(&req).unwrap_or_default();
-        let routing = &self.agent.routing;
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".into());
 
         if !tls
             && let Some(token) = req
@@ -230,94 +316,47 @@ impl Ingress {
                 .path()
                 .strip_prefix("/.well-known/acme-challenge/")
         {
-            return match routing.challenges.read().get(token) {
+            return match self.table.read().challenges.get(token) {
                 Some(key_auth) => text(StatusCode::OK, key_auth.clone()),
                 None => text(StatusCode::NOT_FOUND, "unknown challenge"),
             };
         }
-        if let Some(main) = self.redirect_for(&host) {
-            let scheme = if tls || self.agent.certs.find(&main).is_some() {
+        let route = self.table.read().routes.get(&host).cloned();
+        if let Some(Route::Redirect { to }) = &route {
+            let scheme = if tls || self.certs.find(to).is_some() {
                 "https"
             } else {
                 "http"
             };
-            return redirect(format!(
-                "{scheme}://{main}{}",
-                req.uri()
-                    .path_and_query()
-                    .map(|p| p.as_str())
-                    .unwrap_or("/")
-            ));
+            return redirect(format!("{scheme}://{to}{path}"));
         }
-        if !tls && self.agent.certs.find(&host).is_some() {
-            let target = format!(
-                "https://{host}{}",
-                req.uri()
-                    .path_and_query()
-                    .map(|p| p.as_str())
-                    .unwrap_or("/")
-            );
-            return redirect(target);
+        if !tls && self.certs.find(&host).is_some() {
+            return redirect(format!("https://{host}{path}"));
         }
-
-        let proxy = routing
-            .proxies
-            .read()
-            .iter()
-            .find(|p| p.domain == host)
-            .map(|p| p.port);
-        let (name, target) = if let Some(port) = proxy {
-            ("facade".to_string(), Ok(Target::Port(port)))
-        } else {
-            let Some(workload) = self.workload_for(&host) else {
+        let result = match route {
+            None => {
                 return text(
                     StatusCode::NOT_FOUND,
                     format!("no app is served at {host}\n"),
                 );
-            };
-            let target = self.target(&workload).await;
-            (workload.spec.name, target)
+            }
+            Some(Route::Redirect { .. }) => unreachable!("answered above"),
+            Some(Route::Unavailable { app }) => Err((app, anyhow::anyhow!("not running"))),
+            Some(Route::Static { app, root }) => {
+                serve_static(req, root).await.map_err(|e| (app, e))
+            }
+            Some(Route::Port { app, port }) => self
+                .proxy(req, port, &host, peer, tls)
+                .await
+                .map_err(|e| (app, e)),
         };
-        let result = match target {
-            Ok(Target::Static(root)) => serve_static(req, root).await,
-            Ok(Target::Port(port)) => self.proxy(req, port, &host, peer, tls).await,
-            Err(e) => Err(e),
-        };
-        result.unwrap_or_else(|e| {
-            debug!(app = %name, "proxy error: {e:#}");
+        result.unwrap_or_else(|(app, e)| {
+            debug!(%app, "proxy error: {e:#}");
             text(
                 StatusCode::BAD_GATEWAY,
-                format!("{name} is unavailable right now\n"),
+                format!("{app} is unavailable right now\n"),
             )
         })
-    }
-
-    /// The main domain `host` redirects to, if it is one of an app's redirects.
-    fn redirect_for(&self, host: &str) -> Option<String> {
-        self.agent
-            .workloads
-            .lock()
-            .values()
-            .find(|w| w.spec.enabled && w.spec.redirects.iter().any(|d| d == host))
-            .and_then(|w| w.spec.domains.first().cloned())
-    }
-
-    fn workload_for(&self, host: &str) -> Option<Workload> {
-        self.agent
-            .workloads
-            .lock()
-            .values()
-            .find(|w| w.spec.enabled && w.spec.domains.iter().any(|d| d == host))
-            .cloned()
-    }
-
-    async fn target(&self, workload: &Workload) -> anyhow::Result<Target> {
-        if workload.spec.is_static() {
-            return Ok(Target::Static(self.agent.runtime.static_root(workload)?));
-        }
-        Ok(Target::Port(
-            self.agent.runtime.http_target(workload).await?.port(),
-        ))
     }
 
     async fn proxy(
@@ -364,7 +403,10 @@ impl Ingress {
             && let Some(downstream) = downstream_upgrade
         {
             let upstream = hyper::upgrade::on(&mut resp);
+            // The HTTP connection ends here; the spliced one counts on its own.
+            let counted = Counted::new(&self.active);
             tokio::spawn(async move {
+                let _counted = counted;
                 match tokio::try_join!(downstream, upstream) {
                     Ok((down, up)) => {
                         let mut down = TokioIo::new(down);
@@ -378,6 +420,29 @@ impl Ingress {
             strip_hop_by_hop(resp.headers_mut());
         }
         Ok(resp.map(Body::new))
+    }
+}
+
+const BIND_RETRY: Duration = Duration::from_secs(5);
+
+/// Resolves once `stop` turns true (or its sender is gone).
+pub async fn stopped(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stop| *stop).await;
+}
+
+/// Counts itself in `counter` while alive.
+struct Counted(Arc<AtomicUsize>);
+
+impl Counted {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -482,22 +547,33 @@ mod tests {
     }
 
     #[test]
-    fn wildcards_cover_one_level() {
-        let dir = std::env::temp_dir().join(format!("facade-certs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let certs = Certs::load(&dir).unwrap();
+    fn wildcards_cover_one_level_and_tables_persist() {
+        let dir = std::env::temp_dir().join(format!("facade-ingress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ingress = Ingress::new(&dir).unwrap();
         let generated = rcgen::generate_simple_self_signed(vec!["*.example.com".into()]).unwrap();
-        certs.replace(&[CertBundle {
+        let mut table = Table::default();
+        table.certs.push(CertBundle {
             names: vec!["example.com".into(), "*.example.com".into()],
             cert_pem: generated.cert.pem(),
             key_pem: generated.signing_key.serialize_pem(),
-        }]);
-        assert!(certs.find("example.com").is_some());
-        assert!(certs.find("app.example.com").is_some());
-        assert!(certs.find("a.b.example.com").is_none());
-        assert!(certs.find("other.com").is_none());
+        });
+        table.routes.insert(
+            "app.example.com".into(),
+            Route::Port {
+                app: "app".into(),
+                port: 8080,
+            },
+        );
+        ingress.set_table(table.clone());
+        assert!(ingress.certs.find("example.com").is_some());
+        assert!(ingress.certs.find("app.example.com").is_some());
+        assert!(ingress.certs.find("a.b.example.com").is_none());
+        assert!(ingress.certs.find("other.com").is_none());
         // Reloaded from disk after a restart.
-        assert!(Certs::load(&dir).unwrap().find("app.example.com").is_some());
+        let again = Ingress::new(&dir).unwrap();
+        assert_eq!(*again.table.read(), table);
+        assert!(again.certs.find("app.example.com").is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

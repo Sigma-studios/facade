@@ -1,0 +1,21 @@
+[Unit]
+Description=facade entry point (HTTP and HTTPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Reads http_listen, https_listen and ingress_control from the server config when
+# there is one (on other nodes: 0.0.0.0:80, 0.0.0.0:443, /run/facade/ingress.sock).
+ExecStart=/usr/local/bin/facaded ingress --config /etc/facade/server.toml
+# Hands the sockets to the binary now installed; open connections finish on the
+# old process. A new binary that does not start leaves the old one serving.
+ExecReload=/bin/kill -USR2 $MAINPID
+Type=notify
+NotifyAccess=all
+Restart=always
+RestartSec=2
+Environment=RUST_LOG=info
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
