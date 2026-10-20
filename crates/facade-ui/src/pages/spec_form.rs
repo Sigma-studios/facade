@@ -1,7 +1,7 @@
 //! The app settings form, shared by "New app" and an app's Settings tab.
 
 use facade_core::api::{ArtifactView, Candidate, InspectReport, InspectRequest, NodeView};
-use facade_core::{AppSpec, Build, DEFAULT_PYTHON, Limits, PortMap, Source, Volume};
+use facade_core::{AppSpec, Build, DEFAULT_PYTHON, Limits, PortMap, Protocol, Source, Volume};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -30,7 +30,7 @@ pub struct SpecForm {
     http_port: RwSignal<String>,
     domains: RwSignal<String>,
     redirects: RwSignal<String>,
-    ports: RwSignal<String>,
+    ports: RwSignal<Vec<PortRow>>,
     host_network: RwSignal<bool>,
     volumes: RwSignal<String>,
     memory: RwSignal<String>,
@@ -77,7 +77,7 @@ impl SpecForm {
             http_port: s(""),
             domains: s(""),
             redirects: s(""),
-            ports: s(""),
+            ports: RwSignal::new(vec![]),
             host_network: RwSignal::new(false),
             volumes: s(""),
             memory: s(""),
@@ -158,13 +158,8 @@ impl SpecForm {
         form.http_port.set(opt_text(spec.http_port));
         form.domains.set(spec.domains.join("\n"));
         form.redirects.set(spec.redirects.join("\n"));
-        form.ports.set(
-            spec.ports
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        form.ports
+            .set(spec.ports.iter().map(PortRow::from_map).collect());
         form.host_network.set(spec.host_network);
         form.args.set(join_args(&spec.args));
         form.volumes.set(
@@ -384,12 +379,12 @@ impl SpecForm {
         let ports = if is_static {
             vec![]
         } else {
+            let host_network = self.host_network.get_untracked();
             self.ports
                 .get_untracked()
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(|l| l.parse::<PortMap>().map_err(|e| e.to_string()))
+                .iter()
+                .filter(|row| !row.is_blank())
+                .map(|row| row.port_map(host_network))
                 .collect::<Result<_, _>>()?
         };
         let args = if is_static {
@@ -488,6 +483,141 @@ fn join_args(args: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// One line of the ports editor: a port or a range, and where it goes inside the
+/// app when that differs.
+#[derive(Clone, Copy)]
+pub struct PortRow {
+    id: usize,
+    protocol: RwSignal<&'static str>,
+    first: RwSignal<String>,
+    /// Last port of a range; empty for a single port.
+    last: RwSignal<String>,
+    /// Port inside the app; empty when the same.
+    inner: RwSignal<String>,
+}
+
+impl PortRow {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            protocol: RwSignal::new("tcp"),
+            first: RwSignal::new(String::new()),
+            last: RwSignal::new(String::new()),
+            inner: RwSignal::new(String::new()),
+        }
+    }
+
+    fn from_map(map: &PortMap) -> Self {
+        let row = Self::new();
+        row.protocol.set(match map.protocol {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        });
+        row.first.set(map.host.to_string());
+        if map.count > 1 {
+            row.last
+                .set((u32::from(map.host) + u32::from(map.count) - 1).to_string());
+        }
+        if map.container != map.host {
+            row.inner.set(map.container.to_string());
+        }
+        row
+    }
+
+    fn is_blank(&self) -> bool {
+        self.first.get_untracked().trim().is_empty() && self.last.get_untracked().trim().is_empty()
+    }
+
+    /// Ports in the row, while it is being typed.
+    fn count(&self) -> Option<u32> {
+        let first: u32 = self.first.get().trim().parse().ok()?;
+        match self.last.get().trim() {
+            "" => Some(1),
+            last => last
+                .parse::<u32>()
+                .ok()
+                .filter(|l| *l >= first)
+                .map(|l| l - first + 1),
+        }
+    }
+
+    fn port_map(self, host_network: bool) -> Result<PortMap, String> {
+        let port = |what: &str, text: String| {
+            text.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("{what} `{}` is not a port number", text.trim()))
+        };
+        let host = port("port", self.first.get_untracked())?;
+        let count = match self.last.get_untracked().trim() {
+            "" => 1,
+            _ => {
+                let last = port("port", self.last.get_untracked())?;
+                if last < host {
+                    return Err(format!("the range {host}–{last} ends before it starts"));
+                }
+                last - host + 1
+            }
+        };
+        let container = match self.inner.get_untracked().trim() {
+            "" => host,
+            _ if host_network => host,
+            _ => port("port in the app", self.inner.get_untracked())?,
+        };
+        let protocol = match self.protocol.get_untracked() {
+            "udp" => Protocol::Udp,
+            _ => Protocol::Tcp,
+        };
+        let map = PortMap {
+            host,
+            container,
+            count,
+            protocol,
+        };
+        map.validate().map_err(|e| e.to_string())?;
+        Ok(map)
+    }
+}
+
+/// Ports as rows: protocol, port or range, and (unless on the node's network)
+/// the port inside the app.
+#[component]
+fn PortsEditor(form: SpecForm) -> impl IntoView {
+    let rows = form.ports;
+    let host_network = form.host_network;
+    view! {
+        <div class="ports-editor">
+            <For each=move || rows.get() key=|row| row.id let:row>
+                <div class="port-row">
+                    <Segmented value=row.protocol options=&[("tcp", "TCP"), ("udp", "UDP")] label="Protocol"/>
+                    <input type="number" min="1" max="65535" placeholder="port"
+                        aria-label="Port, or first port of a range" bind:value=row.first/>
+                    <span class="muted">"to"</span>
+                    <input type="number" min="1" max="65535" placeholder="—"
+                        aria-label="Last port of a range (empty for one port)" bind:value=row.last/>
+                    <Show when=move || !host_network.get()>
+                        <span class="muted">"→ app"</span>
+                        <input type="number" min="1" max="65535" placeholder="same"
+                            aria-label="Port inside the app, when it differs" bind:value=row.inner/>
+                    </Show>
+                    <span class="muted small port-count">
+                        {move || match row.count() {
+                            Some(1) | None => String::new(),
+                            Some(n) => format!("{n} ports"),
+                        }}
+                    </span>
+                    <button type="button" class="icon-button" aria-label="Remove this port"
+                        on:click=move |_| rows.update(|r| r.retain(|x| x.id != row.id))>"×"</button>
+                </div>
+            </For>
+            <button type="button" class="button" on:click=move |_| rows.update(|r| r.push(PortRow::new()))>
+                "Add a port or range"
+            </button>
+        </div>
+    }
 }
 
 /// A segmented control over a small set of string options.
@@ -692,17 +822,16 @@ pub fn SpecFields(
             </label>
             <Show when=move || !f.is_static()>
                 <div class="form-row">
-                    <label class="field grow">
+                    <div class="field grow">
                         <span>{move || if f.host_network.get() { "Ports it listens on" } else { "Published ports" }}</span>
-                        <textarea rows="2" bind:value=f.ports
-                            placeholder="3478:3478/udp\n49160-49260:49160-49260/udp"></textarea>
+                        <PortsEditor form=f/>
                         <small>{move || if f.host_network.get() {
-                            "port/protocol or a range, one per line, e.g. 9090/tcp. Nothing is remapped on the node's network: \
-                             listing them lets façade refuse to start the app while another program holds one."
+                            "Nothing is remapped on the node's network: listing them lets façade wait for, \
+                             or refuse, a program already holding one."
                         } else {
-                            "host:container/protocol, one per line. Opened on the node's public interface."
+                            "Opened on the node's public interface, outside the web entry point (e.g. a game server or TURN relay)."
                         }}</small>
-                    </label>
+                    </div>
                     <label class="check">
                         <input type="checkbox" bind:checked=f.host_network/>
                         "Use the node's network"
