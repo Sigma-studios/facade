@@ -9,10 +9,12 @@ use leptos_router::components::A;
 use super::overview::NodeCard;
 use crate::api;
 use crate::components::{CopyField, ErrorNote, Loading, Modal};
-use crate::util::{polled, run, toasts};
+use crate::util::{me, polled, run, toasts};
 
 #[component]
 pub fn Nodes() -> impl IntoView {
+    // Members see the nodes but cannot change them.
+    let me = me();
     let nodes = polled(Some(Duration::from_secs(5)), || async {
         api::get::<Vec<NodeView>>("/api/nodes").await
     });
@@ -115,7 +117,9 @@ pub fn Nodes() -> impl IntoView {
         <div class="page">
             <header class="page-head">
                 <h1>"Nodes"</h1>
-                <button class="button button-primary" on:click=move |_| add_open.set(true)>"Add node"</button>
+                <Show when=move || me.is_admin()>
+                    <button class="button button-primary" on:click=move |_| add_open.set(true)>"Add node"</button>
+                </Show>
             </header>
             <p class="muted lead">
                 "Servers that run apps. Each one runs an agent that connects to this server and serves its own apps' domains: it needs Docker, and ports 80 and 443 open."
@@ -137,13 +141,19 @@ pub fn Nodes() -> impl IntoView {
                                 <div class="node-wrap">
                                     <NodeCard node=node/>
                                     <div class="card-actions">
-                                        <button class="link-button" on:click=move |_| {
-                                            ip_target.set(Some(name3.clone()));
-                                            ip_value.set(current_ip.clone());
-                                            ip_open.set(true);
-                                        }>"Public IP"</button>
+                                        <Show when=move || me.is_admin()>
+                                            <button class="link-button" on:click={
+                                                let name = name3.clone();
+                                                let current_ip = current_ip.clone();
+                                                move |_| {
+                                                    ip_target.set(Some(name.clone()));
+                                                    ip_value.set(current_ip.clone());
+                                                    ip_open.set(true);
+                                                }
+                                            }>"Public IP"</button>
+                                        </Show>
                                         <button class="link-button" on:click=move |_| ports_node.set(Some(name4.clone()))>"Ports"</button>
-                                        <Show when=move || !local>
+                                        <Show when=move || !local && me.is_admin()>
                                             <button class="link-button" on:click={
                                                 let name = name.clone();
                                                 move |_| token_for(name.clone())

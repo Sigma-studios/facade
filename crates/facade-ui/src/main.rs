@@ -14,7 +14,7 @@ use leptos_router::components::{A, Outlet, ParentRoute, Route, Router, Routes};
 use leptos_router::hooks::use_navigate;
 use leptos_router::path;
 
-use util::polled;
+use util::{Me, polled};
 
 fn main() {
     console_error_panic_hook::set_once();
@@ -35,6 +35,7 @@ fn App() -> impl IntoView {
                     <Route path=path!("nodes") view=pages::nodes::Nodes/>
                     <Route path=path!("domains") view=pages::domains::Domains/>
                     <Route path=path!("alerts") view=pages::alerts::Alerts/>
+                    <Route path=path!("users") view=pages::users::Users/>
                     <Route path=path!("settings") view=pages::settings::Settings/>
                 </ParentRoute>
             </Routes>
@@ -54,7 +55,12 @@ fn Shell() -> impl IntoView {
     let alerts = polled(Some(Duration::from_secs(15)), || async {
         api::get::<Vec<AlertView>>("/api/alerts").await
     });
-    let whoami = polled(None, || async { api::get::<WhoAmI>("/api/whoami").await });
+    // Refreshed now and then: a member's cap usage follows their deploys.
+    let whoami = polled(Some(Duration::from_secs(30)), || async {
+        api::get::<WhoAmI>("/api/whoami").await
+    });
+    let me = Me(whoami);
+    provide_context(me);
     let must_change_password = move || {
         whoami
             .data
@@ -93,6 +99,9 @@ fn Shell() -> impl IntoView {
                             </Show>
                         </A>
                     </li>
+                    <Show when=move || me.is_admin()>
+                        <li><A href="/users">"Users"</A></li>
+                    </Show>
                     <li><A href="/settings">"Settings"</A></li>
                 </ul>
                 <button class="nav-logout" on:click=logout>"Log out"</button>
@@ -103,8 +112,12 @@ fn Shell() -> impl IntoView {
                         <A href="/settings" attr:class="banner banner-critical">
                             <span aria-hidden="true">"⚠"</span>
                             <span>
-                                <strong>"Change the admin password."</strong>
-                                " It is still the one generated at install. Set your own in Settings."
+                                <strong>"Change your password."</strong>
+                                {move || if me.is_admin() {
+                                    " It is still the one generated at install. Set your own in Settings."
+                                } else {
+                                    " It is still the one-time password you were given. Set your own in Settings."
+                                }}
                             </span>
                         </A>
                     </div>

@@ -718,6 +718,11 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .shell-banner { padding: 20px 36px 0; max-width: 1240px; }
 .shell-banner .banner { margin-bottom: 0; }
 .push-left { justify-content: flex-start; }
+.check-field { display: flex; flex-direction: column; gap: 4px; }
+.cap-card .meters { max-width: 560px; }
+.access-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.access-list li { display: flex; justify-content: space-between; align-items: center; gap: 12px; max-width: 420px; }
+.form-row > select { flex: 1 1 200px; }
 .update-check { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
 .update-check .toolbar { margin-bottom: 8px; }
 .commit-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }

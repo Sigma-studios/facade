@@ -6,3 +6,4 @@ pub mod nodes;
 pub mod overview;
 pub mod settings;
 pub mod spec_form;
+pub mod users;

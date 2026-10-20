@@ -6,10 +6,11 @@ use leptos_router::components::A;
 
 use crate::api;
 use crate::components::{ErrorNote, Loading, Meter, OnlineBadge, StateBadge};
-use crate::util::{ago, bytes, percent, polled};
+use crate::util::{ago, bytes, cpus, me, percent, polled};
 
 #[component]
 pub fn Overview() -> impl IntoView {
+    let me = me();
     let status = polled(Some(Duration::from_secs(5)), || async {
         api::get::<StatusView>("/api/status").await
     });
@@ -33,6 +34,21 @@ pub fn Overview() -> impl IntoView {
                 <A href="/apps/new" attr:class="button button-primary">"New app"</A>
             </header>
             <ErrorNote error=status.error/>
+            <Show when=move || me.memory_cap().is_some() || me.cpu_cap().is_some()>
+                <section class="card cap-card">
+                    <h2 class="section-title">"Your share"</h2>
+                    <div class="meters">
+                        {move || me.memory_cap().map(|(used, cap)| view! {
+                            <Meter label="Memory" percent=percent(used, cap)
+                                detail=format!("{used} of {cap} MB used by your apps")/>
+                        })}
+                        {move || me.cpu_cap().map(|(used, cap)| view! {
+                            <Meter label="CPUs" percent={ if cap > 0.0 { used * 100.0 / cap } else { 0.0 } }
+                                detail=format!("{} of {} CPUs used by your apps", cpus(used), cpus(cap))/>
+                        })}
+                    </div>
+                </section>
+            </Show>
             <Show when=move || !firing().is_empty()>
                 <A href="/alerts" attr:class="banner banner-critical">
                     <span aria-hidden="true">"⚠"</span>
@@ -120,6 +136,7 @@ pub fn NodeCard(node: NodeView) -> impl IntoView {
 
 #[component]
 pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
+    let me = me();
     view! {
         <Show
             when=move || apps.with(|a| !a.is_empty())
@@ -145,13 +162,20 @@ pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
                     <tbody>
                         <For
                             each=move || apps.get()
-                            key=|a| (a.spec.name.clone(), a.state, a.stats.as_ref().map(|s| (s.mem_used, s.cpu_percent.to_bits())), a.spec.domains.clone())
+                            key=|a| (a.spec.name.clone(), a.state, a.stats.as_ref().map(|s| (s.mem_used, s.cpu_percent.to_bits())), a.spec.domains.clone(), a.owner.clone())
                             children=move |app| {
                                 let href = format!("/apps/{}", app.spec.name);
                                 let stats = app.stats.clone().filter(|s| s.mem_used > 0);
                                 view! {
                                     <tr>
-                                        <td><A href=href attr:class="strong-link">{app.spec.name.clone()}</A></td>
+                                        <td>
+                                            <A href=href attr:class="strong-link">{app.spec.name.clone()}</A>
+                                            {app.owner.clone().map(|owner| view! {
+                                                <Show when=move || me.is_admin()>
+                                                    <div class="muted small">{format!("owned by {owner}")}</div>
+                                                </Show>
+                                            })}
+                                        </td>
                                         <td><StateBadge state=app.state/></td>
                                         <td class="muted">{app.spec.node.clone()}</td>
                                         <td class="num">{stats.as_ref().map(|s| format!("{:.1} %", s.cpu_percent))}</td>
