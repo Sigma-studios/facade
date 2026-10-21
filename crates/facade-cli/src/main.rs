@@ -12,7 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use facade_core::api::*;
-use facade_core::{AppSpec, Build, Limits, PortMap, Source};
+use facade_core::stack::{ServiceSpec, StackSpec};
+use facade_core::{AppSpec, Build, Limits, Link, PortMap, Source, Volume};
 use futures_util::StreamExt;
 use reqwest::Method;
 
@@ -70,13 +71,37 @@ enum Command {
     /// Show or set the DNS provider facade manages records with.
     #[command(subcommand)]
     Dns(DnsCommand),
-    /// Build (if needed) and (re)start an app, following the output.
+    /// Build (if needed) and (re)start an app from the latest commit of its branch,
+    /// following the output.
     Deploy {
         app: String,
+        /// Deploy this commit (full hash), branch or tag instead.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Build again without Docker's layer cache, even if this commit was built.
+        #[arg(long)]
+        rebuild: bool,
         /// Return immediately instead of following the build.
         #[arg(long)]
         detach: bool,
     },
+    /// Deploy the commit of an earlier successful deployment (by default, the one
+    /// before the current commit).
+    Rollback {
+        app: String,
+        /// Deployment ID to go back to (see `facade deployments <app>`).
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Stop a queued or building deployment: a deployment ID, or an app name for
+    /// its current one.
+    Cancel {
+        target: String,
+    },
+    /// What each node is building and what waits, and recent deployments.
+    Builds,
     Restart {
         app: String,
     },
@@ -113,6 +138,20 @@ enum Command {
     Metrics {
         app: String,
     },
+    /// Credentials for private repositories: deploy keys and access tokens.
+    #[command(subcommand)]
+    Git(GitCommand),
+    /// Databases: an official image with a volume, a generated password and a
+    /// connection URL for the apps it is linked to.
+    #[command(subcommand)]
+    Db(DbCommand),
+    /// Volumes on the nodes.
+    #[command(subcommand)]
+    Volume(VolumeCommand),
+    /// Stacks: services deployed together from one repository (a docker-compose
+    /// file, or services defined here), on one node, on a network of their own.
+    #[command(subcommand)]
+    Stack(StackCommand),
     /// Print the whole configuration as TOML (sensitive values are left out).
     Export {
         #[arg(short, long)]
@@ -145,6 +184,305 @@ enum AlertsCommand {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once
+enum StackCommand {
+    #[command(alias = "ls")]
+    List,
+    /// Services, their state, and recent deployments.
+    Show { name: String },
+    /// Create a stack. Its services come from a compose file of the repository
+    /// (found on its own, or --file), read again at every deploy; with --no-file,
+    /// you define them with `facade stack service add`.
+    Create {
+        name: String,
+        #[arg(long)]
+        git: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        /// Compose file in the repository.
+        #[arg(long, conflicts_with = "no_file")]
+        file: Option<String>,
+        /// Define the services here rather than in a file.
+        #[arg(long)]
+        no_file: bool,
+        /// Node for every service (default: the server's own).
+        #[arg(long)]
+        node: Option<String>,
+        /// Create without asking.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Change the repository, branch, file or node (applied by the next deploy).
+    Update {
+        name: String,
+        #[arg(long)]
+        git: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, conflicts_with = "no_file")]
+        file: Option<String>,
+        #[arg(long)]
+        no_file: bool,
+        #[arg(long)]
+        node: Option<String>,
+    },
+    /// What a deploy would do now: the services, and which ones changed.
+    Plan {
+        name: String,
+        #[arg(long)]
+        commit: Option<String>,
+    },
+    /// Delete the stack and its services.
+    #[command(alias = "rm")]
+    Remove {
+        name: String,
+        /// Delete its volumes (its data) too.
+        #[arg(long)]
+        volumes: bool,
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Services of a stack: define them (stacks without a file), or change what
+    /// the file says about them (domains, limits, release command, …).
+    #[command(subcommand)]
+    Service(ServiceCommand),
+}
+
+#[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once
+enum ServiceCommand {
+    /// Add a service (or settings for one of the file's).
+    Add {
+        stack: String,
+        service: String,
+        #[command(flatten)]
+        args: ServiceArgs,
+    },
+    /// Change a service's settings; only the flags given change.
+    Update {
+        stack: String,
+        service: String,
+        #[command(flatten)]
+        args: ServiceArgs,
+    },
+    /// Remove a service (or the settings given here for one of the file's).
+    #[command(alias = "rm")]
+    Remove { stack: String, service: String },
+}
+
+#[derive(Args, Default)]
+struct ServiceArgs {
+    /// Run a registry image.
+    #[arg(long, conflicts_with_all = ["dockerfile", "rust_bin", "database"])]
+    image: Option<String>,
+    /// Build with this Dockerfile of the stack's repository.
+    #[arg(long)]
+    dockerfile: Option<String>,
+    /// Build context in the repository (default: the Dockerfile's directory).
+    #[arg(long)]
+    context: Option<String>,
+    /// Build this cargo binary of the repository.
+    #[arg(long, conflicts_with_all = ["dockerfile", "database"])]
+    rust_bin: Option<String>,
+    #[arg(long, requires = "rust_bin")]
+    rust_package: Option<String>,
+    #[arg(long, requires = "rust_bin", value_delimiter = ',')]
+    features: Vec<String>,
+    #[arg(long, requires = "rust_bin")]
+    no_default_features: bool,
+    /// A database: postgres, mysql, mariadb or redis (image, volume, password and
+    /// DATABASE_URL / REDIS_URL for the other services to use).
+    #[arg(long, conflicts_with = "dockerfile")]
+    database: Option<String>,
+    /// Database image tag.
+    #[arg(long, requires = "database")]
+    version: Option<String>,
+    /// Replace the image's command ("" restores it).
+    #[arg(long, allow_hyphen_values = true)]
+    command: Option<String>,
+    /// Run before each deploy replaces the service ("" removes it).
+    #[arg(long, allow_hyphen_values = true)]
+    release: Option<String>,
+    /// Port HTTP for its domains goes to (0 removes it).
+    #[arg(long)]
+    port: Option<u16>,
+    /// Route this domain to the service (repeatable; replaces the list).
+    #[arg(long = "domain")]
+    domains: Vec<String>,
+    #[arg(long, conflicts_with = "domains")]
+    no_domains: bool,
+    /// Publish raw ports on the node's public address (repeatable).
+    #[arg(long = "publish", short = 'p')]
+    ports: Vec<PortMap>,
+    /// Stack volume to mount: name:/path (repeatable; shared by the services
+    /// naming it).
+    #[arg(long = "volume", short = 'v')]
+    volumes: Vec<Volume>,
+    /// Services to start (and replace) before this one (repeatable).
+    #[arg(long = "depends-on")]
+    depends_on: Vec<String>,
+    /// Memory limit in MB.
+    #[arg(long)]
+    memory: Option<u64>,
+    #[arg(long)]
+    cpus: Option<f64>,
+    /// How to tell the service is ready, run with `sh -c` in its container; the
+    /// services depending on it start once it passes ("" uses the default).
+    #[arg(long, allow_hyphen_values = true)]
+    health: Option<String>,
+}
+
+/// `--health "cmd"`: a shell check, or none for "".
+fn health_check(command: &str) -> Option<facade_core::HealthCheck> {
+    let command = command.trim();
+    (!command.is_empty()).then(|| facade_core::HealthCheck::shell(command))
+}
+
+impl ServiceArgs {
+    /// Applies the flags given to `spec`.
+    fn apply(&self, spec: &mut ServiceSpec) -> anyhow::Result<()> {
+        if let Some(image) = &self.image {
+            spec.image = Some(image.clone());
+            spec.build = None;
+        }
+        if let Some(dockerfile) = &self.dockerfile {
+            let context = self.context.clone().unwrap_or_else(|| {
+                std::path::Path::new(dockerfile)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| ".".into())
+            });
+            spec.build = Some(Build::Dockerfile {
+                dockerfile: dockerfile.clone(),
+                context,
+            });
+            spec.image = None;
+        } else if let Some(context) = &self.context {
+            match &mut spec.build {
+                Some(Build::Dockerfile { context: c, .. }) => *c = context.clone(),
+                _ => bail!("--context goes with --dockerfile"),
+            }
+        }
+        if let Some(bin) = &self.rust_bin {
+            spec.build = Some(Build::Rust {
+                package: self.rust_package.clone(),
+                bin: bin.clone(),
+                features: self.features.clone(),
+                no_default_features: self.no_default_features,
+            });
+            spec.image = None;
+        }
+        if let Some(command) = &self.command {
+            let words = facade_core::split_command(command)?;
+            spec.command = (!words.is_empty()).then_some(words);
+        }
+        if let Some(release) = &self.release {
+            spec.release_command = Some(release.trim().to_string()).filter(|r| !r.is_empty());
+        }
+        if let Some(port) = self.port {
+            spec.http_port = (port != 0).then_some(port);
+        }
+        if !self.domains.is_empty() || self.no_domains {
+            spec.domains = Some(self.domains.iter().map(|d| d.to_lowercase()).collect());
+        }
+        if !self.ports.is_empty() {
+            spec.ports = Some(self.ports.clone());
+        }
+        if !self.volumes.is_empty() {
+            spec.volumes = Some(self.volumes.clone());
+        }
+        if !self.depends_on.is_empty() {
+            spec.depends_on = Some(self.depends_on.clone());
+        }
+        if let Some(mb) = self.memory {
+            spec.limits.memory_mb = (mb != 0).then_some(mb);
+        }
+        if let Some(cpus) = self.cpus {
+            spec.limits.cpus = (cpus != 0.0).then_some(cpus);
+        }
+        if let Some(health) = &self.health {
+            spec.healthcheck = health_check(health);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Subcommand)]
+enum GitCommand {
+    /// List credentials and the apps they cover.
+    #[command(alias = "ls")]
+    List,
+    /// Generate a deploy key for one repository and print its public half, to add
+    /// to the repository (GitHub: Settings → Deploy keys).
+    Key {
+        name: String,
+        /// The repository, e.g. https://github.com/me/app.
+        #[arg(long)]
+        repo: String,
+        /// Use this private key (OpenSSH format, file path) instead of generating one.
+        #[arg(long)]
+        private_key: Option<PathBuf>,
+    },
+    /// Store an access token (GitHub fine-grained token with read access to
+    /// contents, GitLab project/group token, …) for every repository under a scope.
+    /// The token is read from stdin or prompted for.
+    Token {
+        name: String,
+        /// Repositories it covers: github.com/my-org, github.com/me/app, …
+        #[arg(long)]
+        scope: String,
+        /// HTTPS user name sent with the token (default x-access-token).
+        #[arg(long)]
+        username: Option<String>,
+    },
+    #[command(alias = "rm")]
+    Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum DbCommand {
+    /// Create (and start) a database app.
+    Create {
+        name: String,
+        /// postgres, mysql, mariadb or redis.
+        #[arg(long, default_value = "postgres")]
+        kind: String,
+        /// Image tag (default: a recent major version).
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        node: Option<String>,
+        /// Memory limit in MB.
+        #[arg(long)]
+        memory: Option<u64>,
+        /// App to connect to it (repeatable): linked, and given the URL in
+        /// DATABASE_URL (REDIS_URL for Redis).
+        #[arg(long = "link")]
+        links: Vec<String>,
+        /// Variable the linked apps get the URL in.
+        #[arg(long)]
+        env_var: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumeCommand {
+    /// Volumes on every node, their size and the app they belong to.
+    #[command(alias = "ls")]
+    List,
+    /// Delete a volume no app declares any more (its data is lost).
+    #[command(alias = "rm")]
+    Remove {
+        node: String,
+        /// Docker volume name, as listed (facade-<app>-<volume>).
+        name: String,
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum NodeCommand {
     #[command(alias = "ls")]
     List,
@@ -158,6 +496,14 @@ enum NodeCommand {
     Metrics { name: String },
     /// Set the public IP domains of this node's apps point to (`auto` to detect it).
     Ip { name: String, ip: String },
+    /// Free disk space now: old build cache and unused images. Also runs on its own
+    /// every 6 hours, and when the disk is 85 % full.
+    Prune {
+        name: String,
+        /// Also drop the whole build cache and the images kept for rollbacks.
+        #[arg(long)]
+        aggressive: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -182,6 +528,9 @@ enum AppCommand {
     #[command(alias = "rm")]
     Remove {
         name: String,
+        /// Delete its volumes (its data) too; otherwise they stay on the node.
+        #[arg(long)]
+        volumes: bool,
         #[arg(long, short)]
         yes: bool,
     },
@@ -244,6 +593,28 @@ struct SpecArgs {
     /// CPU limit in cores (0 removes it).
     #[arg(long)]
     cpus: Option<f64>,
+    /// Replace the image's command, e.g. "./worker --queue emails" ("" restores it).
+    #[arg(long, allow_hyphen_values = true)]
+    command: Option<String>,
+    /// Run before each deploy replaces the app, in a container of the new build
+    /// (with `sh -c`), e.g. "./migrate up". A failure stops the deploy ("" removes it).
+    #[arg(long, allow_hyphen_values = true)]
+    release: Option<String>,
+    /// Keep data in a volume: name:/path (repeatable; replaces the list).
+    #[arg(long = "volume", short = 'v')]
+    volumes: Vec<Volume>,
+    #[arg(long, conflicts_with = "volumes")]
+    no_volumes: bool,
+    /// Reach another app of the node by name: app or app:alias (repeatable;
+    /// replaces the list).
+    #[arg(long = "link")]
+    links: Vec<Link>,
+    #[arg(long, conflicts_with = "links")]
+    no_links: bool,
+    /// How to tell the app is ready, run with `sh -c` in the container (exit 0 =
+    /// ready), e.g. "curl -fs localhost:8080/health". Deploys wait for it ("" removes it).
+    #[arg(long, allow_hyphen_values = true)]
+    health: Option<String>,
 }
 
 impl SpecArgs {
@@ -367,6 +738,21 @@ impl SpecArgs {
         }
         if let Some(cpus) = self.cpus {
             spec.limits.cpus = (cpus != 0.0).then_some(cpus);
+        }
+        if let Some(command) = &self.command {
+            spec.command = facade_core::split_command(command)?;
+        }
+        if let Some(release) = &self.release {
+            spec.release_command = Some(release.trim().to_string()).filter(|r| !r.is_empty());
+        }
+        if !self.volumes.is_empty() || self.no_volumes {
+            spec.volumes = self.volumes.clone();
+        }
+        if !self.links.is_empty() || self.no_links {
+            spec.links = self.links.clone();
+        }
+        if let Some(health) = &self.health {
+            spec.healthcheck = health_check(health);
         }
         Ok(())
     }
@@ -674,33 +1060,260 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 eprintln!("{domain} removed from {name}");
             }
         }
-        Command::Deploy { app, detach } => {
-            let deployment: DeploymentView = api
-                .json(api.request(Method::POST, &format!("/api/apps/{app}/deploy")))
-                .await?;
-            if json && detach {
-                return print_json(&deployment);
+        Command::Deploy {
+            app,
+            commit,
+            rebuild,
+            detach,
+        } => {
+            if stack_of(api, &app).await.is_some() {
+                let request = StackDeployRequest {
+                    commit,
+                    rebuild,
+                    all: false,
+                };
+                return deploy_stack(api, &app, &request, detach, json).await;
             }
-            if detach {
-                eprintln!("deployment {} started", deployment.id);
+            let request = DeployRequest { commit, rebuild };
+            deploy(api, &app, &request, detach, json).await?;
+        }
+        Command::Rollback { app, to, detach } => {
+            if let Some(stack) = stack_of(api, &app).await {
+                let list: Vec<StackDeploymentView> =
+                    api.get(&format!("/api/stacks/{app}/deployments")).await?;
+                let target = match &to {
+                    Some(id) => list
+                        .iter()
+                        .find(|d| d.id.to_string().starts_with(id.as_str()))
+                        .with_context(|| format!("no deployment {id} of {app}"))?,
+                    None => list
+                        .iter()
+                        .find(|d| {
+                            d.status == DeploymentStatus::Succeeded
+                                && d.commit.is_some()
+                                && d.commit != stack.commit
+                        })
+                        .context("no earlier successful deployment of another commit")?,
+                };
+                let commit = target
+                    .commit
+                    .clone()
+                    .context("that deployment has no commit")?;
+                if !json {
+                    eprintln!(
+                        "rolling {app} back to {} {}",
+                        short(&commit),
+                        target.commit_title.as_deref().unwrap_or("")
+                    );
+                }
+                let request = StackDeployRequest {
+                    commit: Some(commit),
+                    rebuild: false,
+                    all: false,
+                };
+                return deploy_stack(api, &app, &request, detach, json).await;
+            }
+            let list: Vec<DeploymentView> =
+                api.get(&format!("/api/apps/{app}/deployments")).await?;
+            let current: AppView = api.get(&format!("/api/apps/{app}")).await?;
+            let target = match &to {
+                Some(id) => list
+                    .iter()
+                    .find(|d| d.id.to_string().starts_with(id.as_str()))
+                    .with_context(|| format!("no deployment {id} of {app}"))?,
+                None => list
+                    .iter()
+                    .find(|d| {
+                        d.status == DeploymentStatus::Succeeded
+                            && d.commit.is_some()
+                            && d.commit != current.commit
+                    })
+                    .context("no earlier successful deployment of another commit")?,
+            };
+            let commit = target
+                .commit
+                .clone()
+                .context("that deployment has no recorded commit")?;
+            if !json {
+                eprintln!(
+                    "rolling {app} back to {} {}",
+                    short(&commit),
+                    target.commit_title.as_deref().unwrap_or("")
+                );
+            }
+            let request = DeployRequest {
+                commit: Some(commit),
+                rebuild: false,
+            };
+            deploy(api, &app, &request, detach, json).await?;
+        }
+        Command::Cancel { target } => {
+            if stack_of(api, &target).await.is_some() {
+                let list: Vec<StackDeploymentView> = api
+                    .get(&format!("/api/stacks/{target}/deployments"))
+                    .await?;
+                let id = list
+                    .iter()
+                    .find(|d| !d.status.is_finished())
+                    .map(|d| d.id)
+                    .with_context(|| format!("{target} has no deployment in progress"))?;
+                api.send(api.request(Method::POST, &format!("/api/stack-deployments/{id}/cancel")))
+                    .await?;
+                eprintln!("deployment {id} of {target} cancelled");
                 return Ok(());
             }
-            follow_deployment(api, deployment.id, json).await?;
-        }
-        Command::Restart { app } => {
-            api.send(api.request(Method::POST, &format!("/api/apps/{app}/restart")))
+            let id = match uuid::Uuid::parse_str(&target) {
+                Ok(id) => id,
+                Err(_) => {
+                    let list: Vec<DeploymentView> =
+                        api.get(&format!("/api/apps/{target}/deployments")).await?;
+                    list.iter()
+                        .find(|d| !d.status.is_finished())
+                        .map(|d| d.id)
+                        .with_context(|| format!("{target} has no deployment in progress"))?
+                }
+            };
+            api.send(api.request(Method::POST, &format!("/api/deployments/{id}/cancel")))
                 .await?;
-            eprintln!("{app} restarted");
+            eprintln!("deployment {id} cancelled");
+        }
+        Command::Builds => {
+            let builds: BuildsView = api.get("/api/builds").await?;
+            if json {
+                return print_json(&builds);
+            }
+            if builds.queue.is_empty() {
+                println!("nothing building");
+            } else {
+                table(
+                    &["NODE", "APP", "STATE", "COMMIT", "SINCE", "DEPLOYMENT"],
+                    builds.queue.iter().map(|b| {
+                        vec![
+                            b.node.clone(),
+                            b.app.clone(),
+                            match b.state {
+                                facade_core::proto::BuildState::Building => "building".into(),
+                                facade_core::proto::BuildState::Queued => {
+                                    format!("queued #{}", b.position)
+                                }
+                            },
+                            b.commit.as_deref().map(short).unwrap_or_default(),
+                            output::ago(b.since),
+                            b.deployment
+                                .map(|d| d.to_string())
+                                .unwrap_or_else(|| "(healing)".into()),
+                        ]
+                    }),
+                );
+            }
+            println!();
+            print_deployments(&builds.recent, true);
+        }
+        Command::Git(cmd) => git(api, cmd, json).await?,
+        Command::Db(DbCommand::Create {
+            name,
+            kind,
+            version,
+            node,
+            memory,
+            links,
+            env_var,
+        }) => {
+            let kind: DatabaseKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let view: AppView = api
+                .json(
+                    api.request(Method::POST, "/api/databases")
+                        .json(&CreateDatabase {
+                            name: name.clone(),
+                            kind,
+                            version,
+                            node,
+                            memory_mb: memory,
+                            link: links.clone(),
+                            env_var: env_var.clone(),
+                        }),
+                )
+                .await?;
+            if json {
+                return print_json(&view);
+            }
+            eprintln!(
+                "created {name} ({}) on {}, with its data in a volume",
+                match &view.spec.source {
+                    Source::Image { image } => image.as_str(),
+                    _ => "?",
+                },
+                view.spec.node
+            );
+            let var = env_var.unwrap_or_else(|| kind.url_var().to_string());
+            for app in &links {
+                eprintln!(
+                    "{app}: linked, {var}={}",
+                    facade_core::env::reference(&name, kind.url_var())
+                );
+            }
+            eprintln!(
+                "other apps of {} connect with: facade app update <app> --link {name} && facade env set <app> {var}='{}' --public",
+                view.spec.node,
+                facade_core::env::reference(&name, kind.url_var())
+            );
+        }
+        Command::Volume(VolumeCommand::List) => {
+            let volumes: Vec<VolumeView> = api.get("/api/volumes").await?;
+            if json {
+                return print_json(&volumes);
+            }
+            if volumes.is_empty() {
+                println!("no volumes");
+            }
+            table(
+                &["NODE", "VOLUME", "APP", "SIZE", "STATE"],
+                volumes.iter().map(|v| {
+                    vec![
+                        v.node.clone(),
+                        v.name.clone(),
+                        v.app.clone(),
+                        v.size.map(bytes).unwrap_or_else(|| "?".into()),
+                        if !v.declared {
+                            "orphaned (no app declares it)".into()
+                        } else if v.in_use {
+                            "in use".into()
+                        } else {
+                            "declared, not mounted".into()
+                        },
+                    ]
+                }),
+            );
+        }
+        Command::Volume(VolumeCommand::Remove { node, name, yes }) => {
+            if !yes && !confirm(&format!("Delete volume {name} on {node} and all its data?"))? {
+                bail!("aborted");
+            }
+            api.send(api.request(Method::DELETE, &format!("/api/nodes/{node}/volumes/{name}")))
+                .await?;
+            eprintln!("{name} deleted");
+        }
+        Command::Stack(cmd) => stack(api, cmd, json).await?,
+        Command::Restart { app } => {
+            for app in targets(api, &app).await? {
+                api.send(api.request(Method::POST, &format!("/api/apps/{app}/restart")))
+                    .await?;
+                eprintln!("{app} restarted");
+            }
         }
         Command::Start { app } => {
-            api.send(api.request(Method::POST, &format!("/api/apps/{app}/start")))
-                .await?;
-            eprintln!("{app} enabled");
+            for app in targets(api, &app).await? {
+                api.send(api.request(Method::POST, &format!("/api/apps/{app}/start")))
+                    .await?;
+                eprintln!("{app} enabled");
+            }
         }
         Command::Stop { app } => {
-            api.send(api.request(Method::POST, &format!("/api/apps/{app}/stop")))
-                .await?;
-            eprintln!("{app} stopped");
+            for app in targets(api, &app).await? {
+                api.send(api.request(Method::POST, &format!("/api/apps/{app}/stop")))
+                    .await?;
+                eprintln!("{app} stopped");
+            }
         }
         Command::Logs { app, follow, tail } => {
             let resp = api
@@ -724,8 +1337,12 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 }
                 print!("{}", d.log);
                 println!(
-                    "-- {:?}{}",
+                    "-- {}{}{}",
                     d.status,
+                    d.commit
+                        .as_deref()
+                        .map(|c| format!(" at {}", short(c)))
+                        .unwrap_or_default(),
                     d.error.map(|e| format!(": {e}")).unwrap_or_default()
                 );
                 return Ok(());
@@ -735,24 +1352,7 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
             if json {
                 return print_json(&list);
             }
-            table(
-                &["ID", "REV", "STATUS", "STARTED", "ERROR"],
-                list.iter().map(|d| {
-                    vec![
-                        d.id.to_string(),
-                        d.revision.to_string(),
-                        format!("{:?}", d.status).to_lowercase(),
-                        output::ago(d.started_at),
-                        d.error
-                            .clone()
-                            .unwrap_or_default()
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .to_string(),
-                    ]
-                }),
-            );
+            print_deployments(&list, false);
         }
         Command::Domains => {
             let domains: Vec<DomainStatus> = api.get("/api/domains").await?;
@@ -832,11 +1432,15 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
             }
         }
         Command::Scan { repo, branch } => {
-            let report = scan(api, &repo, branch.as_deref()).await?;
+            let repo = repo.as_str();
+            let report = scan(api, repo, branch.as_deref()).await?;
             if json {
                 return print_json(&report);
             }
             println!("commit {}", report.commit);
+            if let Some(credential) = &report.credential {
+                println!("fetched with credential {credential}");
+            }
             if report.candidates.is_empty() {
                 println!("nothing deployable found");
             }
@@ -845,6 +1449,11 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 if !c.env.is_empty() {
                     println!("   reads {}", c.env.join(", "));
                 }
+            }
+            for file in &report.compose_files {
+                println!(
+                    "compose file {file}: `facade import {repo} --file {file}` creates one app per service"
+                );
             }
         }
         Command::Metrics { app } => {
@@ -922,8 +1531,48 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn deploy(
+    api: &Api,
+    app: &str,
+    request: &DeployRequest,
+    detach: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let deployment: DeploymentView = api
+        .json(
+            api.request(Method::POST, &format!("/api/apps/{app}/deploy"))
+                .json(request),
+        )
+        .await?;
+    if json && detach {
+        return print_json(&deployment);
+    }
+    if detach {
+        eprintln!(
+            "deployment {} started{}",
+            deployment.id,
+            deployment
+                .commit
+                .as_deref()
+                .map(|c| format!(" (commit {})", short(c)))
+                .unwrap_or_default()
+        );
+        return Ok(());
+    }
+    if !json && let Some(commit) = &deployment.commit {
+        eprintln!("deploying {app} at {}", short(commit));
+    }
+    follow_deployment(api, deployment.id, json).await
+}
+
+/// The first 12 characters of a commit hash.
+fn short(commit: &str) -> String {
+    commit.chars().take(12).collect()
+}
+
 async fn follow_deployment(api: &Api, id: uuid::Uuid, json: bool) -> anyhow::Result<()> {
     let mut printed = 0;
+    let mut said_queued = false;
     loop {
         let d: DeploymentView = api.get(&format!("/api/deployments/{id}")).await?;
         if !json && d.log.len() > printed {
@@ -932,13 +1581,34 @@ async fn follow_deployment(api: &Api, id: uuid::Uuid, json: bool) -> anyhow::Res
             printed = d.log.len();
         }
         match d.status {
+            DeploymentStatus::Queued => {
+                if !json && !said_queued && printed == 0 {
+                    eprintln!("queued: waiting for the node's build slot (`facade builds`)");
+                    said_queued = true;
+                }
+                tokio::time::sleep(Duration::from_millis(1000)).await
+            }
             DeploymentStatus::Running => tokio::time::sleep(Duration::from_millis(700)).await,
             DeploymentStatus::Succeeded => {
                 if json {
                     return print_json(&d);
                 }
-                eprintln!("deployed {} (revision {})", d.app, d.revision);
+                eprintln!(
+                    "deployed {} (revision {}{})",
+                    d.app,
+                    d.revision,
+                    d.commit
+                        .as_deref()
+                        .map(|c| format!(", commit {}", short(c)))
+                        .unwrap_or_default()
+                );
                 return Ok(());
+            }
+            DeploymentStatus::Cancelled => {
+                if json {
+                    print_json(&d)?;
+                }
+                bail!("deployment cancelled; the previous version keeps running");
             }
             DeploymentStatus::Failed => {
                 if json {
@@ -951,6 +1621,659 @@ async fn follow_deployment(api: &Api, id: uuid::Uuid, json: bool) -> anyhow::Res
             }
         }
     }
+}
+
+fn print_deployments(list: &[DeploymentView], with_app: bool) {
+    let mut headers = vec!["ID", "REV", "STATUS", "COMMIT", "CREATED", "TOOK", "ERROR"];
+    if with_app {
+        headers.insert(1, "APP");
+    }
+    table(
+        &headers,
+        list.iter().map(|d| {
+            let mut row = vec![
+                d.id.to_string(),
+                d.revision.to_string(),
+                d.status.to_string(),
+                match (&d.commit, &d.commit_title) {
+                    (Some(c), Some(t)) => format!("{} {}", short(c), truncate(t, 40)),
+                    (Some(c), None) => short(c),
+                    _ => String::new(),
+                },
+                output::ago(d.created_at),
+                match (d.started_at, d.finished_at) {
+                    (Some(s), Some(f)) => format!("{}s", f.saturating_sub(s)),
+                    _ => String::new(),
+                },
+                d.error
+                    .clone()
+                    .unwrap_or_default()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            ];
+            if with_app {
+                row.insert(1, d.app.clone());
+            }
+            row
+        }),
+    );
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max - 1).collect::<String>())
+    }
+}
+
+/// The stack named `name`, if it is one.
+async fn stack_of(api: &Api, name: &str) -> Option<StackView> {
+    if name.contains('.') || uuid::Uuid::parse_str(name).is_ok() {
+        return None;
+    }
+    api.get(&format!("/api/stacks/{name}")).await.ok()
+}
+
+/// An app, or every service of a stack.
+async fn targets(api: &Api, name: &str) -> anyhow::Result<Vec<String>> {
+    Ok(match stack_of(api, name).await {
+        Some(stack) => stack.services.into_iter().map(|a| a.spec.name).collect(),
+        None => vec![name.to_string()],
+    })
+}
+
+async fn deploy_stack(
+    api: &Api,
+    name: &str,
+    request: &StackDeployRequest,
+    detach: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let d: StackDeploymentView = api
+        .json(
+            api.request(Method::POST, &format!("/api/stacks/{name}/deploy"))
+                .json(request),
+        )
+        .await?;
+    if detach {
+        if json {
+            return print_json(&d);
+        }
+        eprintln!("deployment {} of {name} started", d.id);
+        return Ok(());
+    }
+    // The stack's own log, and each service's build and start output.
+    let mut printed = 0;
+    let mut service_printed: BTreeMap<uuid::Uuid, usize> = BTreeMap::new();
+    loop {
+        let d: StackDeploymentView = api.get(&format!("/api/stack-deployments/{}", d.id)).await?;
+        if !json {
+            if d.log.len() > printed {
+                print!("{}", &d.log[printed..]);
+                printed = d.log.len();
+            }
+            for s in &d.services {
+                let Ok(sd) = api
+                    .get::<DeploymentView>(&format!("/api/deployments/{}", s.deployment))
+                    .await
+                else {
+                    continue;
+                };
+                let done = service_printed.entry(s.deployment).or_default();
+                if sd.log.len() > *done {
+                    for line in sd.log[*done..].lines() {
+                        println!("  {} | {line}", s.service);
+                    }
+                    *done = sd.log.len();
+                }
+            }
+            std::io::stdout().flush()?;
+        }
+        match d.status {
+            DeploymentStatus::Queued | DeploymentStatus::Running => {
+                tokio::time::sleep(Duration::from_millis(800)).await
+            }
+            DeploymentStatus::Succeeded => {
+                if json {
+                    return print_json(&d);
+                }
+                eprintln!(
+                    "deployed {name}{}",
+                    d.commit
+                        .as_deref()
+                        .map(|c| format!(" at {}", short(c)))
+                        .unwrap_or_default()
+                );
+                return Ok(());
+            }
+            DeploymentStatus::Cancelled => {
+                if json {
+                    print_json(&d)?;
+                }
+                bail!("deployment cancelled");
+            }
+            DeploymentStatus::Failed => {
+                if json {
+                    print_json(&d)?;
+                }
+                bail!(
+                    "deployment failed: {}",
+                    d.error.unwrap_or_else(|| "unknown error".into())
+                );
+            }
+        }
+    }
+}
+
+fn print_stack_plan(plan: &StackPlan) {
+    if let Some(commit) = &plan.commit {
+        println!(
+            "at {} {}",
+            short(commit),
+            plan.commit_title.as_deref().unwrap_or("")
+        );
+    }
+    for s in &plan.services {
+        let app = &s.app;
+        let source = match &app.source {
+            Source::Image { image } => format!("image {image}"),
+            Source::Git {
+                build:
+                    Build::Dockerfile {
+                        dockerfile,
+                        context,
+                    },
+                ..
+            } => format!("build {dockerfile} (context {context})"),
+            Source::Git {
+                build: Build::Rust { bin, .. },
+                ..
+            } => format!("cargo binary {bin}"),
+            _ => String::new(),
+        };
+        let change = match s.change {
+            ServiceChange::New => "new",
+            ServiceChange::Changed => "changed",
+            ServiceChange::Unchanged => "unchanged",
+        };
+        println!("  {} ({change}): {source}", s.service);
+        if let Some(port) = app.http_port {
+            println!("      http port {port}");
+        }
+        for domain in &app.domains {
+            println!("      domain {domain}");
+        }
+        for v in &app.volumes {
+            println!("      volume {v}");
+        }
+        if !s.depends_on.is_empty() {
+            println!("      after {}", s.depends_on.join(", "));
+        }
+        if let Some(release) = &app.release_command {
+            println!("      release {release}");
+        }
+        if !s.env.is_empty() {
+            println!("      {} variables from the file", s.env.len());
+        }
+        if !s.missing.is_empty() {
+            println!(
+                "      to set: {} (facade env set {} KEY)",
+                s.missing.join(", "),
+                app.name
+            );
+        }
+    }
+    if !plan.removed.is_empty() {
+        println!("  removed: {}", plan.removed.join(", "));
+    }
+    for note in &plan.notes {
+        println!("  note: {note}");
+    }
+}
+
+async fn stack(api: &Api, cmd: StackCommand, json: bool) -> anyhow::Result<()> {
+    match cmd {
+        StackCommand::List => {
+            let stacks: Vec<StackView> = api.get("/api/stacks").await?;
+            if json {
+                return print_json(&stacks);
+            }
+            if stacks.is_empty() {
+                println!("no stacks; create one with `facade stack create <name> --git <url>`");
+            }
+            table(
+                &["STACK", "NODE", "SOURCE", "COMMIT", "SERVICES"],
+                stacks.iter().map(|s| {
+                    let running = s
+                        .services
+                        .iter()
+                        .filter(|a| a.state == facade_core::proto::AppState::Running)
+                        .count();
+                    vec![
+                        s.spec.name.clone(),
+                        s.spec.node.clone(),
+                        match (&s.spec.repo, &s.spec.file) {
+                            (Some(repo), Some(file)) => format!("{repo} ({file})"),
+                            (Some(repo), None) => format!("{repo} (services defined here)"),
+                            (None, _) => "services defined here".into(),
+                        },
+                        s.commit.as_deref().map(short).unwrap_or_default(),
+                        format!("{running}/{} running", s.services.len()),
+                    ]
+                }),
+            );
+        }
+        StackCommand::Show { name } => {
+            let s: StackView = api.get(&format!("/api/stacks/{name}")).await?;
+            let deployments: Vec<StackDeploymentView> =
+                api.get(&format!("/api/stacks/{name}/deployments")).await?;
+            if json {
+                return print_json(&serde_json::json!({ "stack": s, "deployments": deployments }));
+            }
+            println!("stack:     {}", s.spec.name);
+            println!("node:      {}", s.spec.node);
+            if let Some(repo) = &s.spec.repo {
+                println!(
+                    "repo:      {repo} ({})",
+                    s.spec.branch.as_deref().unwrap_or("default branch")
+                );
+            }
+            println!(
+                "services:  {}",
+                match &s.spec.file {
+                    Some(file) => format!("from {file}, read at each deploy"),
+                    None => "defined here".into(),
+                }
+            );
+            if let Some(commit) = &s.commit {
+                println!("commit:    {commit}");
+            }
+            println!();
+            table(
+                &["SERVICE", "APP", "STATE", "CPU", "MEMORY", "DOMAINS"],
+                s.services.iter().map(|a| {
+                    let st = a.stats.as_ref();
+                    vec![
+                        a.spec.service().unwrap_or_default().to_string(),
+                        a.spec.name.clone(),
+                        a.state.to_string(),
+                        st.map(|s| format!("{:.1}%", s.cpu_percent))
+                            .unwrap_or_default(),
+                        st.filter(|s| s.mem_used > 0)
+                            .map(|s| bytes(s.mem_used))
+                            .unwrap_or_default(),
+                        a.spec.domains.join(", "),
+                    ]
+                }),
+            );
+            if !deployments.is_empty() {
+                println!();
+                table(
+                    &[
+                        "DEPLOYMENT",
+                        "STATUS",
+                        "COMMIT",
+                        "CREATED",
+                        "SERVICES",
+                        "ERROR",
+                    ],
+                    deployments.iter().take(10).map(|d| {
+                        vec![
+                            d.id.to_string(),
+                            d.status.to_string(),
+                            match (&d.commit, &d.commit_title) {
+                                (Some(c), Some(t)) => format!("{} {}", short(c), truncate(t, 30)),
+                                (Some(c), None) => short(c),
+                                _ => String::new(),
+                            },
+                            output::ago(d.created_at),
+                            d.services
+                                .iter()
+                                .map(|s| s.service.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            d.error.clone().unwrap_or_default(),
+                        ]
+                    }),
+                );
+            }
+        }
+        StackCommand::Create {
+            name,
+            git,
+            branch,
+            file,
+            no_file,
+            node,
+            yes,
+        } => {
+            let node = match node {
+                Some(n) => n,
+                None => default_node(api).await?,
+            };
+            let file = match (&git, file, no_file) {
+                (_, Some(file), _) => Some(file),
+                (Some(repo), None, false) => {
+                    let report = scan(api, repo, branch.as_deref()).await?;
+                    match report.compose_files.first() {
+                        Some(file) => {
+                            eprintln!("using {file}");
+                            Some(file.clone())
+                        }
+                        None => {
+                            eprintln!(
+                                "no compose file in the repository: define the services with `facade stack service add {name} …`"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let spec = StackSpec {
+                name: name.clone(),
+                node,
+                repo: git,
+                branch,
+                file,
+                services: BTreeMap::new(),
+            };
+            if spec.file.is_some() {
+                let plan: StackPlan =
+                    api.json(api.request(Method::POST, "/api/stacks/plan").json(
+                        &StackPlanRequest {
+                            spec: spec.clone(),
+                            commit: None,
+                        },
+                    ))
+                    .await?;
+                if !json {
+                    print_stack_plan(&plan);
+                }
+                if !yes && !confirm("Create this stack?")? {
+                    bail!("aborted");
+                }
+            }
+            let view: StackView = api
+                .json(api.request(Method::POST, "/api/stacks").json(&spec))
+                .await?;
+            if json {
+                return print_json(&view);
+            }
+            eprintln!(
+                "created stack {name}. Set what is missing (facade env set {name}.<service> KEY), add domains (facade stack service update {name} <service> --domain …), then: facade deploy {name}"
+            );
+        }
+        StackCommand::Update {
+            name,
+            git,
+            branch,
+            file,
+            no_file,
+            node,
+        } => {
+            let mut spec = api
+                .get::<StackView>(&format!("/api/stacks/{name}"))
+                .await?
+                .spec;
+            if git.is_some() {
+                spec.repo = git;
+            }
+            if branch.is_some() {
+                spec.branch = branch.filter(|b| !b.is_empty());
+            }
+            if file.is_some() {
+                spec.file = file;
+            }
+            if no_file {
+                spec.file = None;
+            }
+            if let Some(node) = node {
+                spec.node = node;
+            }
+            save_stack(api, &spec, json).await?;
+        }
+        StackCommand::Plan { name, commit } => {
+            let spec = api
+                .get::<StackView>(&format!("/api/stacks/{name}"))
+                .await?
+                .spec;
+            let plan: StackPlan = api
+                .json(
+                    api.request(Method::POST, "/api/stacks/plan")
+                        .json(&StackPlanRequest { spec, commit }),
+                )
+                .await?;
+            if json {
+                return print_json(&plan);
+            }
+            print_stack_plan(&plan);
+        }
+        StackCommand::Remove { name, volumes, yes } => {
+            let what = if volumes {
+                "its services, their variables and its volumes (their data)"
+            } else {
+                "its services and their variables"
+            };
+            if !yes && !confirm(&format!("Delete stack {name}, {what}?"))? {
+                bail!("aborted");
+            }
+            api.send(
+                api.request(Method::DELETE, &format!("/api/stacks/{name}"))
+                    .query(&[("volumes", volumes)]),
+            )
+            .await?;
+            eprintln!("{name} deleted");
+        }
+        StackCommand::Service(cmd) => service(api, cmd, json).await?,
+    }
+    Ok(())
+}
+
+async fn save_stack(api: &Api, spec: &StackSpec, json: bool) -> anyhow::Result<()> {
+    let view: StackView = api
+        .json(
+            api.request(Method::PUT, &format!("/api/stacks/{}", spec.name))
+                .json(spec),
+        )
+        .await?;
+    if json {
+        return print_json(&view);
+    }
+    eprintln!(
+        "saved; it applies from the next deploy: facade deploy {}",
+        spec.name
+    );
+    Ok(())
+}
+
+async fn service(api: &Api, cmd: ServiceCommand, json: bool) -> anyhow::Result<()> {
+    match cmd {
+        ServiceCommand::Add {
+            stack,
+            service,
+            args,
+        }
+        | ServiceCommand::Update {
+            stack,
+            service,
+            args,
+        } => {
+            let mut spec = api
+                .get::<StackView>(&format!("/api/stacks/{stack}"))
+                .await?
+                .spec;
+            let mut settings = spec.services.get(&service).cloned().unwrap_or_default();
+            // A database brings its image, volume and variables.
+            let mut db_env = Vec::new();
+            let mut url_var = "DATABASE_URL";
+            if let Some(kind) = &args.database {
+                let kind: DatabaseKind = kind.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                let db = facade_core::templates::database_service(
+                    kind,
+                    args.version.as_deref(),
+                    &stack,
+                    &service,
+                    || uuid::Uuid::new_v4().simple().to_string(),
+                )?;
+                settings = db.service.merged_over(&settings);
+                db_env = db.env;
+                url_var = db.url_var;
+            }
+            args.apply(&mut settings)?;
+            spec.services.insert(service.clone(), settings);
+            let view: StackView = api
+                .json(
+                    api.request(Method::PUT, &format!("/api/stacks/{stack}"))
+                        .json(&spec),
+                )
+                .await?;
+            if !db_env.is_empty() {
+                let set = db_env
+                    .into_iter()
+                    .map(|(k, value, sensitive)| (k, SetEnv { value, sensitive }))
+                    .collect();
+                api.send(
+                    api.request(Method::PATCH, &format!("/api/apps/{stack}.{service}/env"))
+                        .json(&EnvPatch { set, unset: vec![] }),
+                )
+                .await?;
+                if !json {
+                    eprintln!(
+                        "the other services connect with: facade env set {stack}.<service> {url_var}='{}' --public",
+                        facade_core::env::reference(&format!("{stack}.{service}"), url_var)
+                    );
+                }
+            }
+            if json {
+                return print_json(&view);
+            }
+            eprintln!(
+                "saved {stack}.{service}; it applies from the next deploy: facade deploy {stack}"
+            );
+        }
+        ServiceCommand::Remove { stack, service } => {
+            let mut spec = api
+                .get::<StackView>(&format!("/api/stacks/{stack}"))
+                .await?
+                .spec;
+            if spec.services.remove(&service).is_none() {
+                bail!("{stack} has no settings for {service}");
+            }
+            save_stack(api, &spec, json).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn git(api: &Api, cmd: GitCommand, json: bool) -> anyhow::Result<()> {
+    match cmd {
+        GitCommand::List => {
+            let list: Vec<GitCredentialView> = api.get("/api/git/credentials").await?;
+            if json {
+                return print_json(&list);
+            }
+            if list.is_empty() {
+                println!("no git credentials; public repositories need none");
+            }
+            table(
+                &["NAME", "KIND", "SCOPE", "APPS"],
+                list.iter().map(|c| {
+                    vec![
+                        c.name.clone(),
+                        match c.kind {
+                            GitCredentialKind::SshKey => "deploy key".into(),
+                            GitCredentialKind::Token => "token".into(),
+                        },
+                        c.scope.clone(),
+                        c.apps.join(", "),
+                    ]
+                }),
+            );
+        }
+        GitCommand::Key {
+            name,
+            repo,
+            private_key,
+        } => {
+            let private_key = match private_key {
+                Some(path) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?,
+                ),
+                None => None,
+            };
+            let created: GitCredentialView = api
+                .json(api.request(Method::POST, "/api/git/credentials").json(
+                    &CreateGitCredential {
+                        name,
+                        scope: repo,
+                        secret: NewGitSecret::SshKey { private_key },
+                    },
+                ))
+                .await?;
+            if json {
+                return print_json(&created);
+            }
+            println!("{}", created.public_key.as_deref().unwrap_or(""));
+            eprintln!();
+            match &created.add_key_url {
+                Some(url) => eprintln!(
+                    "Add this public key as a read-only deploy key at
+  {url}"
+                ),
+                None => eprintln!(
+                    "Add this public key as a read-only deploy key of {}",
+                    created.scope
+                ),
+            }
+            eprintln!("then `facade scan` or `facade deploy` the repository.");
+        }
+        GitCommand::Token {
+            name,
+            scope,
+            username,
+        } => {
+            let token = if std::io::stdin().is_terminal() {
+                rpassword::prompt_password("token: ")?
+            } else {
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)?;
+                s.trim().to_string()
+            };
+            let created: GitCredentialView = api
+                .json(api.request(Method::POST, "/api/git/credentials").json(
+                    &CreateGitCredential {
+                        name,
+                        scope,
+                        secret: NewGitSecret::Token { username, token },
+                    },
+                ))
+                .await?;
+            if json {
+                return print_json(&created);
+            }
+            eprintln!(
+                "token {} stored for {}{}",
+                created.name,
+                created.scope,
+                if created.apps.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (covers {})", created.apps.join(", "))
+                }
+            );
+        }
+        GitCommand::Remove { name } => {
+            api.send(api.request(Method::DELETE, &format!("/api/git/credentials/{name}")))
+                .await?;
+            eprintln!("{name} removed");
+        }
+    }
+    Ok(())
 }
 
 async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
@@ -989,6 +2312,14 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
             eprintln!(
                 "node {name} removed (stop its agent: systemctl disable --now facaded-agent)"
             );
+        }
+        NodeCommand::Prune { name, aggressive } => {
+            api.send(
+                api.request(Method::POST, &format!("/api/nodes/{name}/prune"))
+                    .query(&[("aggressive", aggressive)]),
+            )
+            .await?;
+            eprintln!("cleanup started on {name}; `facade node ls` shows the result in a minute");
         }
         NodeCommand::Ip { name, ip } => {
             let public_ip = (ip != "auto").then_some(ip);
@@ -1086,6 +2417,12 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 host_network: false,
                 limits: Limits::default(),
                 enabled: true,
+                command: vec![],
+                release_command: None,
+                volumes: vec![],
+                links: vec![],
+                stack: None,
+                healthcheck: None,
             };
             args.apply(&mut spec, None)?;
             if spec.is_static() {
@@ -1124,13 +2461,24 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
             }
             eprintln!("updated {name}");
         }
-        AppCommand::Remove { name, yes } => {
-            if !yes && !confirm(&format!("Delete {name}, its container and its variables?"))? {
+        AppCommand::Remove { name, volumes, yes } => {
+            let what = if volumes {
+                "its container, its variables and its volumes (its data)"
+            } else {
+                "its container and its variables"
+            };
+            if !yes && !confirm(&format!("Delete {name}, {what}?"))? {
                 bail!("aborted");
             }
-            api.send(api.request(Method::DELETE, &format!("/api/apps/{name}")))
-                .await?;
+            api.send(
+                api.request(Method::DELETE, &format!("/api/apps/{name}"))
+                    .query(&[("volumes", volumes)]),
+            )
+            .await?;
             eprintln!("{name} deleted");
+            if !volumes {
+                eprintln!("its volumes, if any, stay on the node (`facade volume ls`)");
+            }
         }
     }
     Ok(())
@@ -1181,12 +2529,22 @@ async fn default_node(api: &Api) -> anyhow::Result<String> {
         .context("no local node; pass --node")
 }
 
+/// Variables of an app (or a stack's service), or of a stack (what its compose
+/// file reads, like `${DB_PASSWORD}`).
+async fn env_path(api: &Api, target: &str) -> String {
+    if stack_of(api, target).await.is_some() {
+        format!("/api/stacks/{target}/env")
+    } else {
+        format!("/api/apps/{target}/env")
+    }
+}
+
 async fn env(api: &Api, cmd: EnvCommand, json: bool) -> anyhow::Result<()> {
     match cmd {
         EnvCommand::List { app, reveal } => {
             let vars: Vec<EnvView> = api
                 .json(
-                    api.request(Method::GET, &format!("/api/apps/{app}/env"))
+                    api.request(Method::GET, &env_path(api, &app).await)
                         .query(&[("reveal", reveal)]),
                 )
                 .await?;
@@ -1229,16 +2587,20 @@ async fn env(api: &Api, cmd: EnvCommand, json: bool) -> anyhow::Result<()> {
                 );
             }
             let keys: Vec<String> = set.keys().cloned().collect();
+            let path = env_path(api, &app).await;
             api.send(
-                api.request(Method::PATCH, &format!("/api/apps/{app}/env"))
+                api.request(Method::PATCH, &path)
                     .json(&EnvPatch { set, unset: vec![] }),
             )
             .await?;
             eprintln!("set {} on {app}", keys.join(", "));
+            if path.starts_with("/api/stacks/") {
+                eprintln!("stack variables apply from its next deploy: facade deploy {app}");
+            }
         }
         EnvCommand::Unset { app, keys } => {
             api.send(
-                api.request(Method::PATCH, &format!("/api/apps/{app}/env"))
+                api.request(Method::PATCH, &env_path(api, &app).await)
                     .json(&EnvPatch {
                         set: BTreeMap::new(),
                         unset: keys.clone(),
@@ -1260,6 +2622,7 @@ fn print_nodes(nodes: &[NodeView]) {
             "CPU",
             "MEMORY",
             "DISK",
+            "IMAGES / BUILD CACHE",
             "SEEN",
         ],
         nodes.iter().map(|n| {
@@ -1277,6 +2640,10 @@ fn print_nodes(nodes: &[NodeView]) {
                 s.map(|s| format!("{} / {}", bytes(s.mem_used), bytes(s.mem_total)))
                     .unwrap_or_default(),
                 s.map(|s| format!("{} / {}", bytes(s.disk_used), bytes(s.disk_total)))
+                    .unwrap_or_default(),
+                n.storage
+                    .as_ref()
+                    .map(|st| format!("{} / {}", bytes(st.images), bytes(st.build_cache)))
                     .unwrap_or_default(),
                 n.last_seen
                     .map(output::ago)
@@ -1319,6 +2686,9 @@ fn print_app_detail(view: &AppView) {
         println!("message:   {message}");
     }
     println!("revision:  {}", view.revision);
+    if let Some(commit) = &view.commit {
+        println!("commit:    {commit}");
+    }
     match &spec.source {
         Source::Image { image } => println!("source:    image {image}"),
         Source::Executable {
@@ -1385,6 +2755,29 @@ fn print_app_detail(view: &AppView) {
     }
     if spec.host_network {
         println!("network:   host");
+    }
+    if !spec.command.is_empty() {
+        println!("command:   {}", facade_core::join_command(&spec.command));
+    }
+    if let Some(release) = &spec.release_command {
+        println!("release:   {release}");
+    }
+    for volume in &spec.volumes {
+        println!("volume:    {volume}");
+    }
+    for link in &spec.links {
+        println!("link:      {} (reachable as {})", link.app, link.host());
+    }
+    if let Some(check) = &spec.healthcheck {
+        println!("health:    {}", check.command());
+    }
+    if let Some(stack) = &spec.stack {
+        println!(
+            "stack:     service {} of {} (reached as {})",
+            spec.service().unwrap_or_default(),
+            stack.stack,
+            stack.host
+        );
     }
     if let Some(mb) = spec.limits.memory_mb {
         println!("memory:    {mb} MB max");

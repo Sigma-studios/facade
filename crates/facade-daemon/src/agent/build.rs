@@ -8,40 +8,118 @@ use anyhow::{Context, bail};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use super::DeployLog;
+use facade_core::proto::GitAuth;
 
+use super::DeployLog;
+use crate::gitauth::Access;
+
+/// Fetches `commit` (or, without one, the tip of `branch` or the default branch)
+/// into `dest`, with submodules. Returns the full hash and subject checked out.
 pub async fn git_checkout(
-    repo: &str,
+    access: &Access,
     branch: Option<&str>,
+    commit: Option<&str>,
     dest: &Path,
     log: &DeployLog,
-) -> anyhow::Result<()> {
-    log.line(format!(
-        "cloning {repo} ({})",
-        branch.unwrap_or("default branch")
-    ));
-    let mut cmd = Command::new("git");
-    cmd.args(["clone", "--depth", "1", "--single-branch"]);
-    if let Some(branch) = branch {
-        cmd.args(["--branch", branch]);
+) -> anyhow::Result<(String, String)> {
+    let target = commit.or(branch).unwrap_or("HEAD");
+    log.line(format!("fetching {} at {target}", access.url));
+    tokio::fs::create_dir_all(dest).await?;
+    let git = |args: &[&str]| {
+        let mut cmd = access.git();
+        cmd.arg("-C").arg(dest).args(args);
+        cmd
+    };
+    run_logged(git(&["init", "-q"]), log).await?;
+    run_logged(git(&["remote", "add", "--", "origin", &access.url]), log).await?;
+    let fetched = run_logged(git(&["fetch", "--depth", "1", "origin", target]), log).await;
+    if let Err(e) = fetched {
+        // Some servers only hand out commits by name when they are a branch tip.
+        let Some(commit) = commit else {
+            return Err(e.context("git fetch failed"));
+        };
+        log.line("fetching the full history to find the commit");
+        run_logged(git(&["fetch", "origin"]), log)
+            .await
+            .context("git fetch failed")?;
+        run_logged(git(&["checkout", "-q", "--detach", commit]), log)
+            .await
+            .with_context(|| format!("commit {commit} is not in the repository"))?;
+    } else {
+        run_logged(git(&["checkout", "-q", "--detach", "FETCH_HEAD"]), log).await?;
     }
-    cmd.arg("--")
-        .arg(repo)
-        .arg(dest)
-        .env("GIT_TERMINAL_PROMPT", "0");
-    run_logged(cmd, log).await.context("git clone failed")?;
+    if dest.join(".gitmodules").is_file() {
+        log.line("fetching submodules");
+        let shallow = run_logged(
+            git(&[
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+                "--depth",
+                "1",
+            ]),
+            log,
+        )
+        .await;
+        if shallow.is_err() {
+            run_logged(git(&["submodule", "update", "--init", "--recursive"]), log)
+                .await
+                .context("fetching submodules failed")?;
+        }
+    }
+    let out = git(&["log", "-1", "--format=%H%x00%s"]).output().await?;
+    let out = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (sha, title) = out.split_once('\0').unwrap_or((&out, ""));
+    log.line(format!("at commit {} {title}", &sha[..sha.len().min(12)]));
+    Ok((sha.to_string(), title.to_string()))
+}
 
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dest)
-        .args(["log", "-1", "--format=%h %s"])
-        .output()
-        .await?;
-    log.line(format!(
-        "at commit {}",
-        String::from_utf8_lossy(&out.stdout).trim()
-    ));
-    Ok(())
+/// Extra `docker build` arguments. The app's git credential is handed over as
+/// build secrets, so Dockerfiles can fetch private dependencies with
+/// `RUN --mount=type=secret,id=gitconfig,target=/root/.gitconfig` (tokens) or
+/// `RUN --mount=type=ssh` (keys); neither ends up in the image.
+pub struct BuildOptions {
+    args: Vec<String>,
+}
+
+impl BuildOptions {
+    /// Writes what the credential needs into `dir`, which must be outside the
+    /// build context and is deleted with the build. `no_cache` rebuilds every layer.
+    pub fn new(auth: Option<&GitAuth>, dir: &Path, no_cache: bool) -> anyhow::Result<Self> {
+        let mut args = vec![];
+        if no_cache {
+            args.push("--no-cache".to_string());
+        }
+        match auth {
+            Some(GitAuth::Token {
+                scope,
+                username,
+                token,
+            }) => {
+                let host = scope.split('/').next().unwrap_or(scope);
+                let path = dir.join("gitconfig");
+                let config = format!(
+                    "[url \"https://{username}:{token}@{host}/\"]\n\tinsteadOf = https://{host}/\n\tinsteadOf = git@{host}:\n\tinsteadOf = ssh://git@{host}/\n"
+                );
+                crate::tls::write_private(&path, config.as_bytes())?;
+                args.push("--secret".into());
+                args.push(format!("id=gitconfig,src={}", path.display()));
+            }
+            Some(GitAuth::SshKey { private_key }) => {
+                let path = dir.join("ssh-key");
+                crate::tls::write_private(&path, format!("{}\n", private_key.trim()).as_bytes())?;
+                args.push("--ssh".into());
+                args.push(format!("default={}", path.display()));
+                let hosts = dir.join("known_hosts");
+                std::fs::write(&hosts, facade_core::git::KNOWN_HOSTS)?;
+                args.push("--secret".into());
+                args.push(format!("id=known_hosts,src={}", hosts.display()));
+            }
+            None => {}
+        }
+        Ok(Self { args })
+    }
 }
 
 pub async fn docker_build(
@@ -49,6 +127,7 @@ pub async fn docker_build(
     tag: &str,
     dockerfile: &Path,
     context: &Path,
+    options: &BuildOptions,
     log: &DeployLog,
 ) -> anyhow::Result<()> {
     if !dockerfile.is_file() {
@@ -61,6 +140,7 @@ pub async fn docker_build(
     let mut cmd = Command::new("docker");
     cmd.args(["build", "--progress=plain", "--pull", "-t", tag])
         .args(["--label", &format!("facade.app={app}")])
+        .args(&options.args)
         .arg("-f")
         .arg(dockerfile)
         .arg(context)
@@ -69,7 +149,7 @@ pub async fn docker_build(
 }
 
 /// Runs `cmd`, forwarding stdout and stderr line by line to the deploy log.
-async fn run_logged(mut cmd: Command, log: &DeployLog) -> anyhow::Result<()> {
+pub async fn run_logged(mut cmd: Command, log: &DeployLog) -> anyhow::Result<()> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -96,7 +176,11 @@ async fn run_logged(mut cmd: Command, log: &DeployLog) -> anyhow::Result<()> {
     let status = child.wait().await?;
     if !status.success() {
         // The full output is in the deploy log; the error only needs its last word.
-        bail!("{}", last.unwrap_or_else(|| status.to_string()));
+        let last = last.unwrap_or_else(|| status.to_string());
+        if cmd.as_std().get_program() == "git" {
+            bail!("{}", crate::gitauth::explain(&last));
+        }
+        bail!("{last}");
     }
     Ok(())
 }

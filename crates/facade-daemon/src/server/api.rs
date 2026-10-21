@@ -1,7 +1,7 @@
 //! The HTTP API used by the CLI (and later the web UI). Served on `api_listen` with
 //! the server's pinned certificate, and on `api_domain` through the ingress.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +50,12 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/nodes/{name}/token", post(rotate_node_token))
         .route("/api/nodes/{name}/metrics", get(node_metrics))
         .route("/api/nodes/{name}/ip", put(set_node_ip))
+        .route("/api/nodes/{name}/prune", post(prune_node))
+        .route(
+            "/api/nodes/{node}/volumes/{volume}",
+            axum::routing::delete(delete_volume),
+        )
+        .route("/api/volumes", get(list_volumes))
         .route("/api/dns", get(dns_settings).put(update_dns))
         .route("/api/domains", get(domains))
         .route("/api/apps", get(list_apps).post(create_app))
@@ -66,6 +72,45 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/apps/{name}/metrics", get(app_metrics))
         .route("/api/apps/{name}/deployments", get(list_deployments))
         .route("/api/deployments/{id}", get(get_deployment))
+        .route("/api/deployments/{id}/cancel", post(cancel_deployment))
+        .route("/api/builds", get(builds))
+        .route("/api/databases", post(create_database))
+        .route(
+            "/api/stacks",
+            get(super::stack::list).post(super::stack::create),
+        )
+        .route("/api/stacks/plan", post(super::stack::plan))
+        .route(
+            "/api/stacks/{name}",
+            get(super::stack::get)
+                .put(super::stack::update)
+                .delete(super::stack::delete),
+        )
+        .route("/api/stacks/{name}/deploy", post(super::stack::deploy))
+        .route(
+            "/api/stacks/{name}/deployments",
+            get(super::stack::deployments),
+        )
+        .route(
+            "/api/stacks/{name}/env",
+            get(super::stack::get_env).patch(super::stack::patch_env),
+        )
+        .route(
+            "/api/stack-deployments/{id}",
+            get(super::stack::get_deployment),
+        )
+        .route(
+            "/api/stack-deployments/{id}/cancel",
+            post(super::stack::cancel),
+        )
+        .route(
+            "/api/git/credentials",
+            get(super::git::list).post(super::git::create),
+        )
+        .route(
+            "/api/git/credentials/{name}",
+            axum::routing::delete(super::git::delete),
+        )
         .route("/api/export", get(export))
         .route("/api/apply", post(apply))
         .route(
@@ -159,7 +204,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
 
 // ---------------------------------------------------------------- errors & auth
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -170,6 +215,12 @@ impl IntoResponse for ApiError {
 impl ApiError {
     pub fn bad_request(msg: impl ToString) -> Self {
         ApiError(StatusCode::BAD_REQUEST, msg.to_string())
+    }
+    pub fn not_found(msg: impl ToString) -> Self {
+        ApiError(StatusCode::NOT_FOUND, msg.to_string())
+    }
+    pub fn conflict(msg: impl ToString) -> Self {
+        ApiError(StatusCode::CONFLICT, msg.to_string())
     }
 }
 
@@ -295,13 +346,14 @@ fn node_views(server: &Server) -> anyhow::Result<Vec<NodeView>> {
                 agent_version: n.agent_version,
                 last_seen: n.last_seen,
                 stats: live.nodes.get(&n.name).and_then(|l| l.stats.clone()),
+                storage: live.nodes.get(&n.name).and_then(|l| l.storage.clone()),
                 name: n.name,
             }
         })
         .collect())
 }
 
-fn app_view(server: &Server, spec: AppSpec, revision: u64) -> AppView {
+pub fn app_view(server: &Server, spec: AppSpec, revision: u64, commit: Option<String>) -> AppView {
     let live = server.live.read();
     let entry = live.apps.get(&spec.name);
     let mut state = entry.map(|e| e.state).unwrap_or(AppState::Unknown);
@@ -317,6 +369,7 @@ fn app_view(server: &Server, spec: AppSpec, revision: u64) -> AppView {
         message,
         stats: entry.and_then(|e| e.stats.clone()),
         revision,
+        commit,
         spec,
     }
 }
@@ -326,7 +379,7 @@ fn app_views(server: &Server) -> anyhow::Result<Vec<AppView>> {
         .store
         .list_apps()?
         .into_iter()
-        .map(|a| app_view(server, a.spec, a.revision))
+        .map(|a| app_view(server, a.spec, a.revision, a.commit))
         .collect())
 }
 
@@ -508,9 +561,91 @@ fn load_app(server: &Server, name: &str) -> ApiResult<super::store::AppRow> {
         .ok_or_else(|| not_found(format!("no app named {name}")))
 }
 
+/// Links only work between apps on the same node, to apps with a private network.
+/// `apps` is every app as it will be once the change is made.
+fn check_links(spec: &AppSpec, apps: &HashMap<String, AppSpec>) -> ApiResult<()> {
+    for link in &spec.links {
+        let Some(target) = apps.get(&link.app) else {
+            return Err(bad_request(format!(
+                "{}: links to {}, which does not exist",
+                spec.name, link.app
+            )));
+        };
+        if target.node != spec.node {
+            return Err(bad_request(format!(
+                "{} runs on {} and {} on {}: links only work between apps on the same node",
+                spec.name, spec.node, target.name, target.node
+            )));
+        }
+        if target.host_network || target.is_static() {
+            return Err(bad_request(format!(
+                "{} has no private network to link to ({})",
+                target.name,
+                if target.is_static() {
+                    "static site"
+                } else {
+                    "it uses the node's network"
+                }
+            )));
+        }
+    }
+    // Apps linking to this one must stay with it.
+    for other in apps.values() {
+        if other.name != spec.name
+            && other.links.iter().any(|l| l.app == spec.name)
+            && (other.node != spec.node || spec.host_network || spec.is_static())
+        {
+            return Err(bad_request(format!(
+                "{} links to {}: move them together (links only work on one node, to apps with a private network)",
+                other.name, spec.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Every app as it would be with `changed` applied.
+fn apps_with(server: &Server, changed: &[&AppSpec]) -> ApiResult<HashMap<String, AppSpec>> {
+    let mut apps: HashMap<String, AppSpec> = server
+        .store
+        .list_apps()?
+        .into_iter()
+        .map(|a| (a.spec.name.clone(), a.spec))
+        .collect();
+    for spec in changed {
+        apps.insert(spec.name.clone(), (*spec).clone());
+    }
+    Ok(apps)
+}
+
+/// Volumes stay on their node: moving an app that has some would leave its data
+/// behind.
+fn check_move(old: &AppSpec, new: &AppSpec) -> ApiResult<()> {
+    if old.node != new.node {
+        let kept: Vec<String> = new
+            .volumes
+            .iter()
+            .filter(|v| old.volumes.iter().any(|o| o.name == v.name))
+            .map(|v| v.name.clone())
+            .collect();
+        if !kept.is_empty() {
+            return Err(conflict(format!(
+                "{} keeps its data in volumes on {} ({}), which do not move with it. Remove \
+                 them from the app first (their data stays on {}), or copy the data yourself",
+                new.name,
+                old.node,
+                kept.join(", "),
+                old.node
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Checks that apply to a spec in the context of the whole installation.
 fn check_spec(server: &Server, spec: &AppSpec) -> ApiResult<()> {
     spec.validate().map_err(bad_request)?;
+    check_links(spec, &apps_with(server, &[spec])?)?;
     if let facade_core::Source::Executable {
         sha256,
         arch,
@@ -563,7 +698,7 @@ async fn list_apps(State(server): S, _: User) -> ApiResult<Json<Vec<AppView>>> {
 
 async fn get_app(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<Json<AppView>> {
     let row = load_app(&server, &name)?;
-    Ok(Json(app_view(&server, row.spec, row.revision)))
+    Ok(Json(app_view(&server, row.spec, row.revision, row.commit)))
 }
 
 async fn create_app(
@@ -571,14 +706,23 @@ async fn create_app(
     _: User,
     Json(spec): Json<AppSpec>,
 ) -> ApiResult<(StatusCode, Json<AppView>)> {
+    if spec.stack.is_some() || spec.name.contains('.') {
+        return Err(bad_request(
+            "the services of a stack are created by the stack (`facade stack`)",
+        ));
+    }
     if server.store.get_app(&spec.name)?.is_some() {
         return Err(conflict(format!("app {} exists", spec.name)));
+    }
+    if server.store.get_stack(&spec.name)?.is_some() {
+        return Err(conflict(format!("{} is the name of a stack", spec.name)));
     }
     check_spec(&server, &spec)?;
     server.store.put_app(&spec)?;
     server.refresh_routes()?;
+    push_link_targets(&server, None, &spec).await;
     // Created, not deployed: env vars usually come first, then `facade deploy`.
-    Ok((StatusCode::CREATED, Json(app_view(&server, spec, 0))))
+    Ok((StatusCode::CREATED, Json(app_view(&server, spec, 0, None))))
 }
 
 async fn update_app(
@@ -591,9 +735,25 @@ async fn update_app(
         return Err(bad_request("apps cannot be renamed"));
     }
     let old = load_app(&server, &name)?;
+    managed_by_stack(&old.spec)?;
+    if spec.stack.is_some() {
+        return Err(bad_request("apps cannot join a stack"));
+    }
     check_spec(&server, &spec)?;
+    check_move(&old.spec, &spec)?;
     save_spec(&server, &old.spec, &spec).await?;
-    Ok(Json(app_view(&server, spec, old.revision)))
+    Ok(Json(app_view(&server, spec, old.revision, old.commit)))
+}
+
+/// A stack's services are changed through their stack, and deployed with it.
+fn managed_by_stack(spec: &AppSpec) -> ApiResult<()> {
+    match (&spec.stack, spec.service()) {
+        (Some(stack), Some(service)) => Err(conflict(format!(
+            "{} is service {service} of stack {}: change it in the stack (`facade stack service update {} {service} …`, or its compose file) and deploy the stack",
+            spec.name, stack.stack, stack.stack
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Stores a changed spec and moves the app between nodes if needed.
@@ -607,6 +767,7 @@ async fn save_spec(server: &Server, old: &AppSpec, new: &AppSpec) -> ApiResult<(
                 &old.node,
                 AgentRequest::Remove {
                     app: new.name.clone(),
+                    volumes: false,
                 },
             )
             .await
@@ -615,17 +776,83 @@ async fn save_spec(server: &Server, old: &AppSpec, new: &AppSpec) -> ApiResult<(
     if let Err(e) = server.push(&new.name).await {
         warn!(app = %new.name, "push failed: {e:#}");
     }
+    push_link_targets(server, Some(old), new).await;
     Ok(())
 }
 
-async fn delete_app(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<StatusCode> {
+/// Apps linked to (before or after a change) learn the names they are reached by.
+async fn push_link_targets(server: &Server, old: Option<&AppSpec>, new: &AppSpec) {
+    let mut targets: Vec<&str> = new.links.iter().map(|l| l.app.as_str()).collect();
+    targets.extend(
+        old.into_iter()
+            .flat_map(|o| o.links.iter().map(|l| l.app.as_str())),
+    );
+    targets.sort();
+    targets.dedup();
+    for target in targets {
+        if let Err(e) = server.push(target).await {
+            warn!(app = %target, "push failed: {e:#}");
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteQuery {
+    /// Delete the app's volumes (its data) too.
+    #[serde(default)]
+    volumes: bool,
+}
+
+async fn delete_app(
+    State(server): S,
+    _: User,
+    Path(name): Path<String>,
+    Query(q): Query<DeleteQuery>,
+) -> ApiResult<StatusCode> {
     let row = load_app(&server, &name)?;
+    if let Some(stack) = &row.spec.stack {
+        return Err(conflict(format!(
+            "{name} is a service of stack {}: remove it from the stack (or its file) and deploy, or delete the stack",
+            stack.stack
+        )));
+    }
+    let linked: Vec<String> = server
+        .store
+        .list_apps()?
+        .into_iter()
+        .filter(|a| a.spec.links.iter().any(|l| l.app == name))
+        .map(|a| a.spec.name)
+        .collect();
+    if !linked.is_empty() {
+        return Err(conflict(format!(
+            "{} link to {name}: remove those links first",
+            linked.join(", ")
+        )));
+    }
+    let dependents = server.dependents(&name)?;
+    if !dependents.is_empty() {
+        return Err(conflict(format!(
+            "variables of {} refer to {name}'s: change them first",
+            dependents.join(", ")
+        )));
+    }
     if server.hub.is_connected(&row.spec.node) {
         server
             .hub
-            .request(&row.spec.node, AgentRequest::Remove { app: name.clone() })
+            .request(
+                &row.spec.node,
+                AgentRequest::Remove {
+                    app: name.clone(),
+                    volumes: q.volumes,
+                },
+            )
             .await
             .map_err(|e| unavailable(format!("{e:#}")))?;
+    } else if q.volumes && !row.spec.volumes.is_empty() {
+        return Err(unavailable(format!(
+            "node {} is offline: its volumes cannot be deleted now",
+            row.spec.node
+        )));
     }
     // An offline node drops the app when it reconnects and syncs.
     server.store.delete_app(&name)?;
@@ -638,37 +865,217 @@ async fn deploy_app(
     State(server): S,
     _: User,
     Path(name): Path<String>,
+    body: axum::body::Bytes,
 ) -> ApiResult<(StatusCode, Json<DeploymentView>)> {
-    let row = load_app(&server, &name)?;
+    let req: DeployRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        DeployRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| bad_request(format!("invalid body: {e}")))?
+    };
+    if let Some(stack) = load_app(&server, &name)?.spec.stack {
+        return Err(conflict(format!(
+            "{name} is deployed with its stack: facade deploy {}",
+            stack.stack
+        )));
+    }
+    let view = start_deploy(&server, &name, &req).await?;
+    Ok((StatusCode::ACCEPTED, Json(view)))
+}
+
+/// Resolves the commit, records a deployment and hands it to the app's node, where
+/// it waits for the build slot.
+async fn start_deploy(
+    server: &Server,
+    name: &str,
+    req: &DeployRequest,
+) -> ApiResult<DeploymentView> {
+    let row = load_app(server, name)?;
     if !server.hub.is_connected(&row.spec.node) {
         return Err(unavailable(format!("node {} is offline", row.spec.node)));
     }
-    let revision = server.store.bump_revision(&name)?;
+    let commit = super::git::resolve_commit(server, &row.spec.source, req.commit.as_deref())
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    // Check the variables resolve before anything changes.
+    server
+        .workload(name)
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let revision = server.store.bump_revision(name, commit.as_deref())?;
     let id = Uuid::new_v4();
-    server.store.create_deployment(id, &name, revision)?;
-    let mut workload = server.workload(&name)?;
+    server
+        .store
+        .create_deployment(id, name, revision, commit.as_deref())?;
+    // A commit built before is not checked out again: its subject is known already.
+    if let Some(commit) = &commit
+        && let Some(title) = server.store.commit_title(commit)?
+    {
+        server.store.set_deployment_commit(id, commit, &title)?;
+    }
+    let mut workload = server.workload(name)?;
     workload.spec.enabled = true;
     if !row.spec.enabled {
         let mut spec = row.spec.clone();
         spec.enabled = true;
         server.store.put_app(&spec)?;
     }
-    server.set_app_state(&name, AppState::Pending, None);
+    server.set_app_state(name, AppState::Pending, None);
     let request = AgentRequest::Apply {
         workload,
         deployment: Some(id),
+        rebuild: req.rebuild,
+        phase: facade_core::proto::ApplyPhase::All,
     };
     if let Err(e) = server.hub.request(&row.spec.node, request).await {
         server
             .store
-            .finish_deployment(id, Some(&format!("{e:#}")))?;
+            .finish_deployment(id, Some(&format!("{e:#}")), false)?;
         return Err(unavailable(format!("{e:#}")));
     }
-    let view = server
+    Ok(server
         .store
         .get_deployment(id)?
-        .context("deployment vanished")?;
-    Ok((StatusCode::ACCEPTED, Json(view)))
+        .context("deployment vanished")?)
+}
+
+async fn cancel_deployment(
+    State(server): S,
+    _: User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let d = server
+        .store
+        .get_deployment(id)?
+        .ok_or_else(|| not_found("no such deployment"))?;
+    if d.status.is_finished() {
+        return Err(conflict(format!("the deployment already {}", d.status)));
+    }
+    let node = server.store.get_app(&d.app)?.map(|row| row.spec.node);
+    let online = node.as_deref().is_some_and(|n| server.hub.is_connected(n));
+    if let Some(node) = node.filter(|_| online) {
+        // The agent stops it and reports it cancelled before answering.
+        server
+            .hub
+            .request(&node, AgentRequest::Cancel { deployment: id })
+            .await
+            .map_err(|e| unavailable(format!("{e:#}")))?;
+    }
+    let now = server
+        .store
+        .get_deployment(id)?
+        .ok_or_else(|| not_found("no such deployment"))?;
+    match now.status {
+        DeploymentStatus::Running if online => {
+            return Err(conflict(
+                "too late to cancel: the build is done and the new version is starting",
+            ));
+        }
+        DeploymentStatus::Queued | DeploymentStatus::Running => {
+            // Never reached the node, or the node is gone.
+            server
+                .store
+                .finish_deployment(id, Some("cancelled"), true)?;
+        }
+        _ => {}
+    }
+    if server.store.get_deployment(id)?.map(|d| d.status) == Some(DeploymentStatus::Cancelled) {
+        restore_after_cancel(&server, &d).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A cancelled deploy must not come back on the next sync: the app's desired state
+/// goes back to its last successful deployment (or to "not deployed").
+async fn restore_after_cancel(server: &Server, d: &DeploymentView) -> ApiResult<()> {
+    let Some(row) = server.store.get_app(&d.app)? else {
+        return Ok(());
+    };
+    // A later deploy was asked for meanwhile: that one stands.
+    if row.revision != d.revision {
+        return Ok(());
+    }
+    let (revision, commit) = server.store.last_success(&d.app)?.unwrap_or((0, None));
+    server
+        .store
+        .set_revision(&d.app, revision, commit.as_deref())?;
+    let node = row.spec.node.clone();
+    if !server.hub.is_connected(&node) {
+        return Ok(());
+    }
+    let result = if revision == 0 {
+        // Never deployed: the node forgets it (it has nothing running for it).
+        server
+            .hub
+            .request(
+                &node,
+                AgentRequest::Remove {
+                    app: d.app.clone(),
+                    volumes: false,
+                },
+            )
+            .await
+    } else {
+        server.push(&d.app).await
+    };
+    if let Err(e) = result {
+        warn!(app = %d.app, "restoring after cancel: {e:#}");
+    }
+    Ok(())
+}
+
+async fn builds(State(server): S, _: User) -> ApiResult<Json<BuildsView>> {
+    let mut queue = Vec::new();
+    {
+        let live = server.live.read();
+        let mut nodes: Vec<_> = live.nodes.iter().collect();
+        nodes.sort_by(|a, b| a.0.cmp(b.0));
+        for (node, l) in nodes {
+            let mut position = 0;
+            for b in &l.builds {
+                let pos = if b.state == facade_core::proto::BuildState::Building {
+                    0
+                } else {
+                    position += 1;
+                    position
+                };
+                queue.push(QueuedBuild {
+                    node: node.clone(),
+                    app: b.app.clone(),
+                    deployment: b.deployment,
+                    commit: b.commit.clone(),
+                    state: b.state,
+                    since: b.since,
+                    position: pos,
+                });
+            }
+        }
+    }
+    // Deployments waiting for an earlier one of the same app are not in the node's
+    // queue yet; they come after it.
+    let recent = server.store.recent_deployments(40)?;
+    let mut waiting: Vec<&DeploymentView> = recent
+        .iter()
+        .filter(|d| {
+            d.status == DeploymentStatus::Queued
+                && !queue.iter().any(|q| q.deployment == Some(d.id))
+        })
+        .collect();
+    waiting.sort_by_key(|d| d.created_at);
+    for d in waiting {
+        let Some(node) = server.routes.read().nodes.get(&d.app).cloned() else {
+            continue;
+        };
+        let position = queue.iter().filter(|q| q.node == node).count();
+        queue.push(QueuedBuild {
+            node,
+            app: d.app.clone(),
+            deployment: Some(d.id),
+            commit: d.commit.clone(),
+            state: facade_core::proto::BuildState::Queued,
+            since: d.created_at,
+            position: position.max(1),
+        });
+    }
+    Ok(Json(BuildsView { queue, recent }))
 }
 
 async fn restart_app(State(server): S, _: User, Path(name): Path<String>) -> ApiResult<StatusCode> {
@@ -732,7 +1139,7 @@ async fn get_env(
     Ok(Json(vars))
 }
 
-fn valid_env_key(key: &str) -> bool {
+pub fn valid_env_key(key: &str) -> bool {
     !key.is_empty()
         && !key.starts_with(|c: char| c.is_ascii_digit())
         && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -759,8 +1166,13 @@ async fn patch_env(
     for key in &patch.unset {
         server.store.delete_env(&name, key)?;
     }
-    if let Err(e) = server.push(&name).await {
-        warn!(app = %name, "push failed: {e:#}");
+    // Apps whose variables refer to these get the new values too.
+    let mut apps = vec![name.clone()];
+    apps.extend(server.dependents(&name)?);
+    for app in apps {
+        if let Err(e) = server.push(&app).await {
+            warn!(%app, "push failed: {e:#}");
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -840,9 +1252,9 @@ async fn export(State(server): S, _: User) -> ApiResult<Response> {
     for node in server.store.list_nodes()? {
         manifest.nodes.push(NodeDecl { name: node.name });
     }
-    for app in server.store.list_apps()? {
+    let exported = |rows: Vec<super::store::EnvRow>| -> anyhow::Result<BTreeMap<String, EnvEntry>> {
         let mut env = BTreeMap::new();
-        for var in server.store.list_env(&app.spec.name)? {
+        for var in rows {
             let entry = if var.sensitive {
                 EnvEntry::Detailed {
                     value: None,
@@ -853,8 +1265,33 @@ async fn export(State(server): S, _: User) -> ApiResult<Response> {
             };
             env.insert(var.key, entry);
         }
+        Ok(env)
+    };
+    let apps = server.store.list_apps()?;
+    for app in &apps {
+        if app.spec.stack.is_some() {
+            continue;
+        }
         manifest.apps.push(AppManifest {
-            spec: app.spec,
+            spec: app.spec.clone(),
+            env: exported(server.store.list_env(&app.spec.name)?)?,
+        });
+    }
+    for stack in server.store.list_stacks()? {
+        let mut env = BTreeMap::new();
+        for app in &apps {
+            if let (Some(s), Some(service)) = (&app.spec.stack, app.spec.service())
+                && s.stack == stack.spec.name
+            {
+                let vars = exported(server.store.list_env(&app.spec.name)?)?;
+                if !vars.is_empty() {
+                    env.insert(service.to_string(), vars);
+                }
+            }
+        }
+        manifest.stacks.push(facade_core::manifest::StackManifest {
+            variables: exported(server.store.list_stack_vars(&stack.spec.name)?)?,
+            spec: stack.spec,
             env,
         });
     }
@@ -903,8 +1340,14 @@ async fn apply(State(server): S, _: User, body: String) -> ApiResult<Json<ApplyR
         }
         let names: std::collections::HashSet<&str> =
             manifest.apps.iter().map(|a| a.spec.name.as_str()).collect();
+        let specs: Vec<&AppSpec> = manifest.apps.iter().map(|a| &a.spec).collect();
+        let all = apps_with(&server, &specs)?;
         for app in &manifest.apps {
             check_spec_for_apply(&server, &app.spec, &names)?;
+            check_links(&app.spec, &all)?;
+            if let Some(old) = server.store.get_app(&app.spec.name)? {
+                check_move(&old.spec, &app.spec)?;
+            }
             for key in app.env.keys() {
                 if !valid_env_key(key) {
                     return Err(bad_request(format!(
@@ -974,6 +1417,9 @@ async fn apply(State(server): S, _: User, body: String) -> ApiResult<Json<ApplyR
             Some(_) => report.unchanged.push(name),
         }
     }
+    for stack in manifest.stacks {
+        super::stack::apply(&server, stack, &mut report).await?;
+    }
     Ok(Json(report))
 }
 
@@ -1004,4 +1450,174 @@ fn check_spec_for_apply(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- databases, import
+
+async fn create_database(
+    State(server): S,
+    _: User,
+    Json(req): Json<CreateDatabase>,
+) -> ApiResult<(StatusCode, Json<AppView>)> {
+    validate_name("app name", &req.name).map_err(bad_request)?;
+    if server.store.get_stack(&req.name)?.is_some() {
+        return Err(conflict(format!("{} is the name of a stack", req.name)));
+    }
+    if server.store.get_app(&req.name)?.is_some() {
+        return Err(conflict(format!("app {} exists", req.name)));
+    }
+    let node = req
+        .node
+        .clone()
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| server.cfg.local_node.clone());
+    let db = facade_core::templates::database(&req, &node, || random_token()[..32].to_string())
+        .map_err(bad_request)?;
+    let var = req
+        .env_var
+        .clone()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| db.url_var.to_string());
+    if !valid_env_key(&var) {
+        return Err(bad_request(format!("`{var}` is not a valid variable name")));
+    }
+    // The apps that will use it, with their link added.
+    let mut consumers = Vec::new();
+    for app in &req.link {
+        let row = load_app(&server, app)?;
+        let mut spec = row.spec.clone();
+        if !spec.links.iter().any(|l| l.app == req.name) {
+            spec.links.push(facade_core::Link {
+                app: req.name.clone(),
+                alias: None,
+            });
+        }
+        consumers.push((row.spec, spec));
+    }
+    check_spec(&server, &db.spec)?;
+    let mut changed: Vec<&AppSpec> = vec![&db.spec];
+    changed.extend(consumers.iter().map(|(_, new)| new));
+    let all = apps_with(&server, &changed)?;
+    for spec in &changed {
+        spec.validate().map_err(bad_request)?;
+        check_links(spec, &all)?;
+    }
+
+    server.store.put_app(&db.spec)?;
+    for (key, value, sensitive) in &db.env {
+        server.store.set_env(
+            &req.name,
+            key,
+            &server.secrets.seal(value.as_bytes()),
+            *sensitive,
+        )?;
+    }
+    let reference = facade_core::env::reference(&req.name, db.url_var);
+    for (old, new) in &consumers {
+        server.store.set_env(
+            &new.name,
+            &var,
+            &server.secrets.seal(reference.as_bytes()),
+            false,
+        )?;
+        save_spec(&server, old, new).await?;
+    }
+    server.refresh_routes()?;
+    if server.hub.is_connected(&node) {
+        start_deploy(&server, &req.name, &DeployRequest::default()).await?;
+    }
+    let row = load_app(&server, &req.name)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(app_view(&server, row.spec, row.revision, row.commit)),
+    ))
+}
+
+// ---------------------------------------------------------------- volumes & disk
+
+async fn list_volumes(State(server): S, _: User) -> ApiResult<Json<Vec<VolumeView>>> {
+    let apps = server.store.list_apps()?;
+    let live = server.live.read();
+    let mut views = Vec::new();
+    let mut nodes: Vec<_> = live.nodes.iter().collect();
+    nodes.sort_by(|a, b| a.0.cmp(b.0));
+    for (node, l) in nodes {
+        for v in l.storage.iter().flat_map(|s| &s.volumes) {
+            let declared = apps.iter().any(|a| {
+                a.spec.node == *node
+                    && a.spec
+                        .volumes
+                        .iter()
+                        .any(|d| a.spec.volume_name(d) == v.name)
+            });
+            views.push(VolumeView {
+                node: node.clone(),
+                name: v.name.clone(),
+                app: v.app.clone(),
+                volume: v.volume.clone(),
+                size: v.size,
+                in_use: v.in_use,
+                declared,
+            });
+        }
+    }
+    Ok(Json(views))
+}
+
+async fn delete_volume(
+    State(server): S,
+    _: User,
+    Path((node, volume)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    let declared = server.store.list_apps()?.into_iter().find(|a| {
+        a.spec.node == node
+            && a.spec
+                .volumes
+                .iter()
+                .any(|v| a.spec.volume_name(v) == volume)
+    });
+    if let Some(app) = declared {
+        return Err(conflict(match &app.spec.stack {
+            Some(stack) => format!(
+                "{volume} is used by service {} of stack {}: remove it from the service first",
+                app.spec.service().unwrap_or_default(),
+                stack.stack
+            ),
+            None => format!(
+                "{volume} is {}'s: remove it from the app's volumes first",
+                app.spec.name
+            ),
+        }));
+    }
+    server
+        .hub
+        .request(&node, AgentRequest::RemoveVolume { name: volume })
+        .await
+        .map_err(|e| unavailable(format!("{e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PruneQuery {
+    #[serde(default)]
+    aggressive: bool,
+}
+
+async fn prune_node(
+    State(server): S,
+    _: User,
+    Path(name): Path<String>,
+    Query(q): Query<PruneQuery>,
+) -> ApiResult<StatusCode> {
+    server
+        .hub
+        .request(
+            &name,
+            AgentRequest::Prune {
+                aggressive: q.aggressive,
+            },
+        )
+        .await
+        .map_err(|e| unavailable(format!("{e:#}")))?;
+    Ok(StatusCode::ACCEPTED)
 }

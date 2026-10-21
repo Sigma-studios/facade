@@ -8,6 +8,7 @@
 mod agent;
 mod config;
 mod framing;
+mod gitauth;
 mod lang;
 mod server;
 mod tls;

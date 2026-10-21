@@ -1,13 +1,14 @@
 use std::time::Duration;
 
-use facade_core::api::{CreateNode, CreatedNode, NodeView, SetNodeIp};
+use facade_core::api::{CreateNode, CreatedNode, NodeView, SetNodeIp, VolumeView};
+use facade_core::proto::StorageReport;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use super::overview::NodeCard;
 use crate::api;
 use crate::components::{CopyField, ErrorNote, Loading, Modal};
-use crate::util::{polled, run, toasts};
+use crate::util::{ago, bytes, polled, run, toasts};
 
 #[component]
 pub fn Nodes() -> impl IntoView {
@@ -87,6 +88,33 @@ pub fn Nodes() -> impl IntoView {
             },
         );
     };
+    let prune = move |name: String, aggressive: bool| {
+        let path = format!("/api/nodes/{name}/prune?aggressive={aggressive}");
+        run(
+            format!("Cleaning up {name}; the figures update in a minute"),
+            async move { api::act(&path).await },
+            move || {},
+        );
+    };
+    let volumes = polled(Some(Duration::from_secs(30)), || async {
+        api::get::<Vec<VolumeView>>("/api/volumes").await
+    });
+    let volume_target = RwSignal::new(None::<VolumeView>);
+    let volume_open = RwSignal::new(false);
+    let delete_volume = move |_| {
+        let Some(v) = volume_target.get_untracked() else {
+            return;
+        };
+        let path = format!("/api/nodes/{}/volumes/{}", v.node, v.name);
+        run(
+            format!("{} deleted", v.name),
+            async move { api::delete(&path).await },
+            move || {
+                volume_open.set(false);
+                volumes.reload();
+            },
+        );
+    };
     let join_command = Signal::derive(move || {
         joined
             .get()
@@ -113,18 +141,35 @@ pub fn Nodes() -> impl IntoView {
             <Show when=move || nodes.loaded() fallback=Loading>
                 <div class="grid-cards">
                     <For each=move || nodes.data.get().unwrap_or_default()
-                        key=|n| (n.name.clone(), n.connected, n.last_seen, n.public_ip.clone(), n.stats.as_ref().map(|s| s.mem_used))
+                        key=|n| (n.name.clone(), n.connected, n.last_seen, n.public_ip.clone(), n.stats.as_ref().map(|s| s.mem_used), n.storage.as_ref().map(|s| s.at))
                         let:node>
                         {
                             let name = node.name.clone();
                             let name2 = node.name.clone();
                             let name3 = node.name.clone();
+                            let name4 = node.name.clone();
+                            let name5 = node.name.clone();
                             let current_ip = node.public_ip.clone().unwrap_or_default();
                             let local = node.local;
+                            let connected = node.connected;
+                            let storage = node.storage.clone();
                             view! {
                                 <div class="node-wrap">
                                     <NodeCard node=node/>
+                                    {storage.map(|s| view! { <StorageLine storage=s/> })}
                                     <div class="card-actions">
+                                        <Show when=move || connected>
+                                            <button class="link-button" title="Remove dangling images and build cache unused for a week"
+                                                on:click={
+                                                    let name = name4.clone();
+                                                    move |_| prune(name.clone(), false)
+                                                }>"Clean up"</button>
+                                            <button class="link-button" title="Also drop the whole build cache (next builds start from scratch) and the images kept for rollbacks"
+                                                on:click={
+                                                    let name = name5.clone();
+                                                    move |_| prune(name.clone(), true)
+                                                }>"Deep clean"</button>
+                                        </Show>
                                         <button class="link-button" on:click=move |_| {
                                             ip_target.set(Some(name3.clone()));
                                             ip_value.set(current_ip.clone());
@@ -149,8 +194,69 @@ pub fn Nodes() -> impl IntoView {
                         }
                     </For>
                 </div>
+                <p class="muted small after-cards">
+                    "Nodes clean up after builds on their own: every 6 hours, and harder when the disk is 85 % full."
+                </p>
             </Show>
+            <section>
+                <h2 class="section-title">"Volumes"</h2>
+                <Show when=move || volumes.data.with(|v| v.as_ref().is_some_and(|v| !v.is_empty()))
+                    fallback=|| view! { <p class="muted small">"No volumes yet. Apps get one when their settings list it (databases have one)."</p> }>
+                    <div class="table-wrap">
+                        <table class="table">
+                            <thead><tr><th>"Volume"</th><th>"Node"</th><th>"App"</th><th class="num">"Size"</th><th>"State"</th><th></th></tr></thead>
+                            <tbody>
+                                <For each=move || volumes.data.get().unwrap_or_default()
+                                    key=|v| (v.node.clone(), v.name.clone(), v.size, v.in_use, v.declared)
+                                    let:v>
+                                    {
+                                        let target = v.clone();
+                                        view! {
+                                            <tr>
+                                                <td><code>{v.name.clone()}</code></td>
+                                                <td class="muted">{v.node.clone()}</td>
+                                                <td>{v.app.clone()}</td>
+                                                <td class="num">{v.size.map(bytes).unwrap_or_else(|| "—".into())}</td>
+                                                <td>{if !v.declared {
+                                                    view! { <span class="badge badge-neutral">"orphaned"</span> }.into_any()
+                                                } else if v.in_use {
+                                                    view! { <span class="badge badge-good">"in use"</span> }.into_any()
+                                                } else {
+                                                    view! { <span class="muted small">"not mounted"</span> }.into_any()
+                                                }}</td>
+                                                <td class="row-actions">
+                                                    <Show when=move || !v.declared>
+                                                        <button class="link-button danger" on:click={
+                                                            let target = target.clone();
+                                                            move |_| {
+                                                                volume_target.set(Some(target.clone()));
+                                                                volume_open.set(true);
+                                                            }
+                                                        }>"Delete"</button>
+                                                    </Show>
+                                                </td>
+                                            </tr>
+                                        }
+                                    }
+                                </For>
+                            </tbody>
+                        </table>
+                    </div>
+                    <p class="muted small">"Orphaned volumes belong to deleted apps, or were removed from an app's settings. Their data stays until you delete them."</p>
+                </Show>
+            </section>
         </div>
+
+        <Modal open=volume_open title="Delete volume">
+            <p>
+                "Delete " <code>{move || volume_target.get().map(|v| v.name).unwrap_or_default()}</code>
+                " and all the data in it? This cannot be undone."
+            </p>
+            <div class="form-actions">
+                <button class="button" on:click=move |_| volume_open.set(false)>"Cancel"</button>
+                <button class="button button-danger" on:click=delete_volume>"Delete"</button>
+            </div>
+        </Modal>
 
         <Modal open=add_open title="Add a node">
             <Show
@@ -213,5 +319,26 @@ pub fn Nodes() -> impl IntoView {
                 <button class="button button-danger" on:click=remove>"Remove"</button>
             </div>
         </Modal>
+    }
+}
+
+/// Docker's share of the node's disk, and the last cleanup.
+#[component]
+fn StorageLine(storage: StorageReport) -> impl IntoView {
+    let cleanup = storage.last_cleanup.as_ref().map(|c| {
+        format!(
+            "{}cleaned {}, freed {}",
+            if c.aggressive { "deep-" } else { "" },
+            ago(c.at),
+            bytes(c.freed)
+        )
+    });
+    view! {
+        <div class="storage-line small muted">
+            {format!("Images {} · build cache {}", bytes(storage.images), bytes(storage.build_cache))}
+            {(storage.build_cache_reclaimable > 0).then(|| format!(" ({} unused)", bytes(storage.build_cache_reclaimable)))}
+            {(!storage.volumes.is_empty()).then(|| format!(" · {} volume{}", storage.volumes.len(), if storage.volumes.len() == 1 { "" } else { "s" }))}
+            {cleanup.map(|c| view! { <br/>{c} })}
+        </div>
     }
 }

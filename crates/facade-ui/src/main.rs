@@ -7,7 +7,7 @@ mod util;
 
 use std::time::Duration;
 
-use facade_core::api::{AlertView, LoginRequest, LoginResponse};
+use facade_core::api::{AlertView, BuildsView, LoginRequest, LoginResponse};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::{A, Outlet, ParentRoute, Route, Router, Routes};
@@ -31,6 +31,9 @@ fn App() -> impl IntoView {
                     <Route path=path!("") view=pages::overview::Overview/>
                     <Route path=path!("apps") view=pages::apps::Apps/>
                     <Route path=path!("apps/new") view=pages::apps::NewApp/>
+                    <Route path=path!("stacks/new") view=pages::stack::NewStack/>
+                    <Route path=path!("stacks/:name") view=pages::stack::StackPage/>
+                    <Route path=path!("builds") view=pages::builds::Builds/>
                     <Route path=path!("apps/:name") view=pages::app::AppPage/>
                     <Route path=path!("nodes") view=pages::nodes::Nodes/>
                     <Route path=path!("domains") view=pages::domains::Domains/>
@@ -60,6 +63,14 @@ fn Shell() -> impl IntoView {
                 .map_or(0, |a| a.iter().filter(|x| x.resolved_at.is_none()).count())
         })
     };
+    let builds = polled(Some(Duration::from_secs(5)), || async {
+        api::get::<BuildsView>("/api/builds").await
+    });
+    let building = move || {
+        builds
+            .data
+            .with(|b| b.as_ref().map_or(0, |b| b.queue.len()))
+    };
     let logout = move |_| {
         spawn_local(async move {
             let _ = api::act("/api/logout").await;
@@ -77,6 +88,14 @@ fn Shell() -> impl IntoView {
                 <ul class="nav">
                     <li><A href="/" exact=true>"Overview"</A></li>
                     <li><A href="/apps">"Apps"</A></li>
+                    <li>
+                        <A href="/builds">
+                            "Builds"
+                            <Show when=move || { building() > 0 }>
+                                <span class="nav-count nav-count-busy" title="building or queued">{building}</span>
+                            </Show>
+                        </A>
+                    </li>
                     <li><A href="/nodes">"Nodes"</A></li>
                     <li><A href="/domains">"Domains"</A></li>
                     <li>

@@ -289,13 +289,12 @@ async fn control(
         let mut nodes = server.hub.nodes.write();
         if nodes.get(&node).is_some_and(|c| Arc::ptr_eq(c, &conn)) {
             nodes.remove(&node);
-            server
-                .live
-                .write()
-                .nodes
-                .entry(node.clone())
-                .or_default()
-                .offline_since = Some(facade_core::now());
+            {
+                let mut live = server.live.write();
+                let entry = live.nodes.entry(node.clone()).or_default();
+                entry.offline_since = Some(facade_core::now());
+                entry.builds.clear();
+            }
             let apps: Vec<String> = server
                 .routes
                 .read()
@@ -358,11 +357,39 @@ fn on_event(server: &Server, node: &str, event: AgentEvent) {
             server.set_app_state(&app, state, message);
             Ok(())
         }
+        AgentEvent::DeployStarted { deployment } => server.store.start_deployment(deployment),
+        AgentEvent::DeployCommit {
+            deployment,
+            commit,
+            title,
+        } => server
+            .store
+            .set_deployment_commit(deployment, &commit, &title),
         AgentEvent::DeployLog { deployment, line } => {
             server.store.append_deploy_log(deployment, &line)
         }
-        AgentEvent::DeployDone { deployment, error } => {
-            server.store.finish_deployment(deployment, error.as_deref())
+        AgentEvent::DeployDone {
+            deployment,
+            error,
+            cancelled,
+        } => server
+            .store
+            .finish_deployment(deployment, error.as_deref(), cancelled),
+        AgentEvent::BuildDone { deployment, error } => match error {
+            Some(error) => server
+                .store
+                .finish_deployment(deployment, Some(&error), false),
+            None => server.store.deployment_built(deployment),
+        },
+        AgentEvent::Builds { builds } => {
+            server
+                .live
+                .write()
+                .nodes
+                .entry(node.to_string())
+                .or_default()
+                .builds = builds;
+            Ok(())
         }
     };
     if let Err(e) = result {
