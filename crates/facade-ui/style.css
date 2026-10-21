@@ -754,8 +754,9 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 
 .domains-editor { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
 .domain-row { display: flex; gap: 8px; align-items: center; width: 100%; }
-.domain-row input[type="text"] { flex: 1; min-width: 0; }
-.domain-row select { flex: 0 1 auto; min-width: 0; }
+.domain-row input[type="text"] { flex: 1 1 10em; min-width: 6em; }
+/* As wide as its longest domain, never the whole row. */
+.domain-row select { width: auto; flex: 0 1 auto; min-width: 0; max-width: 60%; }
 
 /* ---------------------------------------------------------------- amount sliders */
 
