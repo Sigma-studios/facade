@@ -4,7 +4,7 @@
 //! * `facaded upgrade-check`: what installing this binary would do to the apps
 //!   running on the server's node. A new build can change how container
 //!   fingerprints or image names are computed; then containers are recreated,
-//!   or rebuilt from the latest commit of their branch, at the next convergence.
+//!   or rebuilt at their deployed commit, at the next convergence.
 //! * `facaded backup-state`: a copy of the database and master key, next to the
 //!   scheduled ones.
 
@@ -31,7 +31,7 @@ pub enum Change {
     Unchanged,
     /// Its container is recreated (a few seconds down).
     Restart,
-    /// Its image is rebuilt (git: from the branch's latest commit) or pulled.
+    /// Its image is rebuilt (git: at the deployed commit) or pulled.
     Rebuild,
     /// Not running on this node now; nothing to compare.
     NotRunning,
@@ -112,7 +112,15 @@ async fn check_copy(cfg: &ServerConfig, copy: &std::path::Path, json: bool) -> a
             Change::Restart => "RESTARTS: its container is recreated (a few seconds down)".into(),
             Change::Rebuild => match &spec.source {
                 Source::Git { build, .. } if !matches!(build, Build::Static { .. }) => {
-                    "REBUILDS from the latest commit of its branch, then restarts".into()
+                    match &row.commit {
+                        Some(sha) => format!(
+                            "REBUILDS at its deployed commit {}, then restarts",
+                            &sha[..sha.len().min(7)]
+                        ),
+                        None => {
+                            "REBUILDS from the latest commit of its branch, then restarts".into()
+                        }
+                    }
                 }
                 Source::Image { .. } => "PULLS its image again, then restarts".into(),
                 _ => "REBUILDS its image, then restarts".into(),
