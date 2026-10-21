@@ -63,6 +63,7 @@ pub fn router(server: Arc<Server>) -> Router {
         )
         .route("/api/volumes", get(list_volumes))
         .route("/api/dns", get(dns_settings).put(update_dns))
+        .route("/api/dns/zones", get(dns_zones))
         .route("/api/domains", get(domains))
         .route("/api/apps", get(list_apps).post(create_app))
         .route(
@@ -748,6 +749,11 @@ async fn set_node_ip(
 async fn dns_settings(State(server): S, user: User) -> ApiResult<Json<DnsSettings>> {
     user.require_admin()?;
     Ok(Json(server.dns.settings()))
+}
+
+/// Domains the DNS provider manages, offered when choosing an app's domains.
+async fn dns_zones(State(server): S, _user: User) -> Json<Vec<String>> {
+    Json(server.dns.settings().zones)
 }
 
 async fn update_dns(

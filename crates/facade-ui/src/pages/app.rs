@@ -144,6 +144,17 @@ pub fn AppPage() -> impl IntoView {
         app.data
             .with(|a| a.as_ref().is_some_and(|a| !a.spec.volumes.is_empty()))
     });
+    // A memo, so the tabs are only rebuilt when this changes, not at every poll
+    // (which would reset the settings form while it is being edited).
+    let stack_service = Memo::new(move |_| {
+        app.data.with(|a| {
+            let spec = &a.as_ref()?.spec;
+            Some((
+                spec.stack.as_ref()?.stack.clone(),
+                spec.service()?.to_string(),
+            ))
+        })
+    });
 
     view! {
         <div class="page">
@@ -259,12 +270,9 @@ pub fn AppPage() -> impl IntoView {
                     }.into_any(),
                     "volumes" => view! { <VolumesTab name=name app=Signal::derive(move || app.data.get())/> }.into_any(),
                     // Stacks are managed by admins; members edit a service as a plain app.
-                    "settings" => match view_of()
-                        .filter(|_| me.is_admin())
-                        .and_then(|a| a.spec.stack.clone().zip(a.spec.service().map(str::to_string)))
-                    {
+                    "settings" => match stack_service.get().filter(|_| me.is_admin()) {
                         Some((stack, service)) => view! {
-                            <super::stack::ServiceSettings stack=stack.stack service=service
+                            <super::stack::ServiceSettings stack=stack service=service
                                 on_saved=Callback::new(move |_| app.reload())/>
                         }.into_any(),
                         None => view! {
