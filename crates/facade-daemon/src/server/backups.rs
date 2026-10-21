@@ -109,9 +109,10 @@ pub async fn backup_volume(server: &Server, app: &str, volume: &str) -> anyhow::
         .store
         .get_app(app)?
         .ok_or_else(|| anyhow!("no app named {app}"))?;
-    if !row.spec.volumes.iter().any(|v| v.name == volume) {
+    let Some(declared) = row.spec.volumes.iter().find(|v| v.name == volume) else {
         bail!("{app} has no volume named {volume}");
-    }
+    };
+    let docker_name = row.spec.volume_name(declared);
     let dir = root(server).join(app).join(volume);
     create_dirs(&dir)?;
     let id = facade_core::now();
@@ -120,7 +121,7 @@ pub async fn backup_volume(server: &Server, app: &str, volume: &str) -> anyhow::
     let result = async {
         let mut stream = server
             .hub
-            .open_volume_export(&row.spec.node, app, volume)
+            .open_volume_export(&row.spec.node, app, &docker_name)
             .await?;
         let mut file = tls::private_file(&partial).await?;
         let size = tokio::io::copy(&mut stream, &mut file).await?;
@@ -228,7 +229,7 @@ pub fn list(server: &Server, app: Option<&str>) -> anyhow::Result<Vec<BackupView
 
 /// The file of one backup, if it exists.
 pub fn path(server: &Server, app: &str, volume: &str, id: u64) -> anyhow::Result<PathBuf> {
-    facade_core::validate_name("app name", app)?;
+    facade_core::validate_app_name(app)?;
     facade_core::validate_name("volume name", volume)?;
     let path = root(server)
         .join(app)
@@ -246,12 +247,22 @@ pub async fn restore(server: &Server, app: &str, volume: &str, id: u64) -> anyho
         .store
         .get_app(app)?
         .ok_or_else(|| anyhow!("no app named {app}"))?;
-    if !row.spec.volumes.iter().any(|v| v.name == volume) {
+    let Some(declared) = row.spec.volumes.iter().find(|v| v.name == volume) else {
         bail!("{app} has no volume named {volume}");
-    }
+    };
+    let create = facade_core::proto::NewVolume {
+        name: declared.name.clone(),
+        stack: row.spec.stack.as_ref().map(|s| s.stack.clone()),
+    };
     server
         .hub
-        .import_volume(&row.spec.node, app, volume, &path)
+        .import_volume(
+            &row.spec.node,
+            app,
+            &row.spec.volume_name(declared),
+            Some(create),
+            &path,
+        )
         .await
         .with_context(|| format!("restoring {app}/{volume} from backup {id}"))
 }

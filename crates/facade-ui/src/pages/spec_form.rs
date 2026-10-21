@@ -1,12 +1,18 @@
 //! The app settings form, shared by "New app" and an app's Settings tab.
 
-use facade_core::api::{ArtifactView, Candidate, InspectReport, InspectRequest, NodeView};
-use facade_core::{AppSpec, Build, DEFAULT_PYTHON, Limits, PortMap, Protocol, Source, Volume};
+use facade_core::api::{
+    AppView, ArtifactView, Candidate, CreateGitCredential, GitCredentialView, InspectReport,
+    InspectRequest, NewGitSecret, NodeView,
+};
+use facade_core::{
+    AppSpec, Build, DEFAULT_PYTHON, Limits, Link, PortMap, Protocol, Source, Volume,
+};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use leptos_router::components::A;
 
 use crate::api;
-use crate::components::{Amount, AmountSlider, ErrorNote};
+use crate::components::{Amount, AmountSlider, CopyField, ErrorNote};
 use crate::util::{bytes, me};
 
 #[derive(Clone, Copy)]
@@ -40,8 +46,12 @@ pub struct SpecForm {
     /// count as available in the owner's share.
     own_memory: Option<f64>,
     own_cpus: Option<f64>,
+    command: RwSignal<String>,
+    release: RwSignal<String>,
+    health: RwSignal<String>,
+    links: RwSignal<Vec<Link>>,
     artifact: RwSignal<Option<ArtifactView>>,
-    args: RwSignal<String>,
+    exec_args: RwSignal<String>,
     scan: RwSignal<Option<InspectReport>>,
     scan_error: RwSignal<Option<String>>,
     scanning: RwSignal<bool>,
@@ -89,8 +99,12 @@ impl SpecForm {
             enabled: RwSignal::new(true),
             own_memory: None,
             own_cpus: None,
+            command: s(""),
+            release: s(""),
+            health: s(""),
+            links: RwSignal::new(vec![]),
             artifact: RwSignal::new(None),
-            args: s(""),
+            exec_args: s(""),
             scan: RwSignal::new(None),
             scan_error: RwSignal::new(None),
             scanning: RwSignal::new(false),
@@ -111,6 +125,7 @@ impl SpecForm {
                 sha256,
                 filename,
                 arch,
+                args,
             } => {
                 form.source.set("executable");
                 form.artifact.set(Some(ArtifactView {
@@ -119,6 +134,7 @@ impl SpecForm {
                     arch: arch.clone(),
                     size: 0,
                 }));
+                form.exec_args.set(facade_core::join_command(args));
             }
             Source::Git {
                 repo,
@@ -167,7 +183,6 @@ impl SpecForm {
         form.ports
             .set(spec.ports.iter().map(PortRow::from_map).collect());
         form.host_network.set(spec.host_network);
-        form.args.set(join_args(&spec.args));
         form.volumes.set(
             spec.volumes
                 .iter()
@@ -182,6 +197,16 @@ impl SpecForm {
             form.own_memory = spec.limits.memory_mb.map(|m| m as f64);
             form.own_cpus = spec.limits.cpus;
         }
+        form.command.set(facade_core::join_command(&spec.command));
+        form.release
+            .set(spec.release_command.clone().unwrap_or_default());
+        form.health.set(
+            spec.healthcheck
+                .as_ref()
+                .map(facade_core::HealthCheck::command)
+                .unwrap_or_default(),
+        );
+        form.links.set(spec.links.clone());
         form
     }
 
@@ -192,7 +217,7 @@ impl SpecForm {
         }
     }
 
-    /// Fills the build settings (and the port and arguments, if empty) from a scan
+    /// Fills the build settings (and the port and command, if empty) from a scan
     /// candidate.
     fn choose(&self, index: usize) {
         let Some(candidate) = self
@@ -238,8 +263,9 @@ impl SpecForm {
         {
             self.http_port.set(port.to_string());
         }
-        if !candidate.args.is_empty() && self.args.with_untracked(|a| a.trim().is_empty()) {
-            self.args.set(join_args(&candidate.args));
+        if !candidate.command.is_empty() && self.command.with_untracked(|c| c.trim().is_empty()) {
+            self.command
+                .set(facade_core::join_command(&candidate.command));
         }
     }
 
@@ -306,15 +332,6 @@ impl SpecForm {
         }
     }
 
-    /// The program comes from an image, so arguments replace its `CMD`.
-    fn uses_cmd(&self) -> bool {
-        match self.source.get() {
-            "image" => true,
-            "git" => self.build.get() == "dockerfile",
-            _ => false,
-        }
-    }
-
     fn is_static(&self) -> bool {
         self.source.get() == "git" && self.build.get() == "static"
     }
@@ -343,6 +360,8 @@ impl SpecForm {
                 sha256: artifact.sha256,
                 filename: artifact.filename,
                 arch: artifact.arch,
+                args: facade_core::split_command(&self.exec_args.get_untracked())
+                    .map_err(|e| e.to_string())?,
             }
         } else {
             let build = match self.build.get_untracked() {
@@ -397,22 +416,6 @@ impl SpecForm {
                 .map(|row| row.port_map(host_network))
                 .collect::<Result<_, _>>()?
         };
-        let args = if is_static {
-            vec![]
-        } else {
-            split_args(&self.args.get_untracked())?
-        };
-        let volumes = if is_static {
-            vec![]
-        } else {
-            self.volumes
-                .get_untracked()
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(|l| l.parse::<Volume>().map_err(|e| e.to_string()))
-                .collect::<Result<_, _>>()?
-        };
         let memory_mb = optional(self.memory)
             .map(|m| {
                 m.parse::<u64>()
@@ -425,6 +428,31 @@ impl SpecForm {
                     .map_err(|_| "CPUs must be a number".to_string())
             })
             .transpose()?;
+        let host_network = !is_static && self.host_network.get_untracked();
+        let (command, release_command, volumes, links) = if is_static {
+            (vec![], None, vec![], vec![])
+        } else {
+            let command = if self.source.get_untracked() == "executable" {
+                vec![]
+            } else {
+                facade_core::split_command(&self.command.get_untracked())
+                    .map_err(|e| e.to_string())?
+            };
+            let volumes = self
+                .volumes
+                .get_untracked()
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(|l| l.parse::<Volume>().map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let links = if host_network {
+                vec![]
+            } else {
+                self.links.get_untracked()
+            };
+            (command, optional(self.release), volumes, links)
+        };
         let spec = AppSpec {
             name: text(self.name),
             node: text(self.node),
@@ -439,60 +467,22 @@ impl SpecForm {
                 .map(|d| d.to_lowercase())
                 .collect(),
             ports,
-            host_network: !is_static && self.host_network.get_untracked(),
-            args,
-            volumes,
+            host_network,
             limits: Limits { memory_mb, cpus },
             enabled: self.enabled.get_untracked(),
+            command,
+            release_command,
+            volumes,
+            links,
+            stack: None,
+            healthcheck: (!is_static)
+                .then(|| optional(self.health))
+                .flatten()
+                .map(|h| facade_core::HealthCheck::shell(&h)),
         };
         spec.validate().map_err(|e| e.to_string())?;
         Ok(spec)
     }
-}
-
-/// Splits arguments on spaces, keeping "quoted parts" together.
-fn split_args(line: &str) -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut started = false;
-    for c in line.chars() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), c) => current.push(c),
-            (None, '"' | '\'') => {
-                quote = Some(c);
-                started = true;
-            }
-            (None, c) if c.is_whitespace() => {
-                if started || !current.is_empty() {
-                    args.push(std::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            (None, c) => current.push(c),
-        }
-    }
-    if quote.is_some() {
-        return Err("unclosed quote in the arguments".into());
-    }
-    if started || !current.is_empty() {
-        args.push(current);
-    }
-    Ok(args)
-}
-
-fn join_args(args: &[String]) -> String {
-    args.iter()
-        .map(|a| {
-            if a.is_empty() || a.contains(char::is_whitespace) {
-                format!("\"{a}\"")
-            } else {
-                a.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// One line of the ports editor: a port or a range, and where it goes inside the
@@ -658,6 +648,9 @@ fn Segmented(
 pub fn SpecFields(
     form: SpecForm,
     #[prop(into)] nodes: Signal<Vec<NodeView>>,
+    /// Every app, to offer links to those on the same node.
+    #[prop(into)]
+    apps: Signal<Vec<AppView>>,
     /// The name is fixed once an app exists.
     editing: bool,
 ) -> impl IntoView {
@@ -673,6 +666,21 @@ pub fn SpecFields(
                 .map(pick)
                 .filter(|v| *v > 0.0)
         })
+    };
+    // Apps of the chosen node with a private network: what this one can link to.
+    let linkable = move || {
+        let node = f.node.get();
+        let own = f.name.get();
+        apps.get()
+            .into_iter()
+            .filter(|a| {
+                a.spec.node == node
+                    && a.spec.name != own
+                    && !a.spec.host_network
+                    && !a.spec.is_static()
+            })
+            .map(|a| a.spec.name)
+            .collect::<Vec<_>>()
     };
     view! {
         <fieldset class="form-section">
@@ -719,12 +727,17 @@ pub fn SpecFields(
             </Show>
             <Show when=move || f.source.get() == "executable">
                 <DropZone form=f nodes=nodes/>
+                <label class="field">
+                    <span>"Arguments"</span>
+                    <input type="text" bind:value=f.exec_args placeholder="--port 8080" autocomplete="off"/>
+                    <small>"Passed to the program. Separate with spaces; put an argument containing spaces in quotes."</small>
+                </label>
             </Show>
             <Show when=move || f.source.get() == "git">
                 <div class="form-row repo-row">
                     <label class="field grow">
                         <span>"Repository URL"</span>
-                        <input type="url" bind:value=f.repo placeholder="https://github.com/me/repo"
+                        <input type="text" inputmode="url" autocomplete="off" spellcheck="false" bind:value=f.repo placeholder="https://github.com/me/repo"
                             on:change=move |_| if !editing { f.scan(true) }/>
                     </label>
                     <label class="field">
@@ -739,6 +752,9 @@ pub fn SpecFields(
                     </button>
                 </div>
                 <ErrorNote error=f.scan_error/>
+                <Show when=move || f.scan_error.with(|e| e.as_deref().is_some_and(|e| e.contains(facade_core::api::NO_ACCESS)))>
+                    <PrivateRepo form=f editing=editing/>
+                </Show>
                 <ScanResults form=f/>
                 <details class="build-details"
                     prop:open=move || f.scan.with(|r| r.as_ref().is_some_and(|r| r.candidates.is_empty()))>
@@ -807,18 +823,6 @@ pub fn SpecFields(
                     </div>
                 </details>
             </Show>
-            <Show when=move || !f.is_static()>
-                <label class="field">
-                    <span>"Arguments"</span>
-                    <input type="text" bind:value=f.args autocomplete="off"
-                        placeholder=move || if f.uses_cmd() { "(the image's CMD)" } else { "--port 8080" }/>
-                    <small>{move || if f.uses_cmd() {
-                        "Replace the image's CMD. Separate with spaces; put an argument containing spaces in quotes."
-                    } else {
-                        "Passed to the program. Separate with spaces; put an argument containing spaces in quotes."
-                    }}</small>
-                </label>
-            </Show>
         </fieldset>
 
         <fieldset class="form-section">
@@ -869,13 +873,80 @@ pub fn SpecFields(
 
         <Show when=move || !f.is_static()>
             <fieldset class="form-section">
-                <legend>"Storage"</legend>
+                <legend>"Run"</legend>
+                <Show when=move || f.source.get() != "executable">
+                    <label class="field">
+                        <span>"Command"</span>
+                        <input type="text" bind:value=f.command autocomplete="off"
+                            placeholder="(the image's own command)"/>
+                        <small>"Replaces the image's command, e.g. to run a worker from the same build."</small>
+                    </label>
+                </Show>
                 <label class="field">
-                    <span>"Volumes"</span>
-                    <textarea rows="2" bind:value=f.volumes placeholder="data:/data"></textarea>
-                    <small>"name:/path, one per line. These directories keep their files across deploys and restarts; they live on the app's node."</small>
+                    <span>"Release command"</span>
+                    <input type="text" bind:value=f.release autocomplete="off" placeholder="./migrate up"/>
+                    <small>
+                        "Runs with " <code>"sh -c"</code> " in a container of the new build before it replaces the running one, "
+                        "with the same variables, volumes and links. Use it for database migrations: if it fails, the deploy stops and the running version stays."
+                    </small>
+                </label>
+                <label class="field">
+                    <span>"Health check"</span>
+                    <input type="text" bind:value=f.health autocomplete="off" placeholder="curl -fs localhost:8080/health"/>
+                    <small>"Run in the container; exit 0 means ready. A deploy waits for it before counting as done."</small>
                 </label>
             </fieldset>
+
+            <fieldset class="form-section">
+                <legend>"Data and connections"</legend>
+                <label class="field">
+                    <span>"Volumes"</span>
+                    <textarea rows="2" class="mono" bind:value=f.volumes placeholder="data:/var/lib/data"></textarea>
+                    <small>
+                        "name:/path, one per line. What the app writes there survives restarts and deploys. "
+                        "Volumes live on the app's node; moving the app copies them over when you ask to."
+                    </small>
+                </label>
+                <div class="field">
+                    <span>"Links"</span>
+                    <Show when=move || !f.host_network.get()
+                        fallback=|| view! { <small>"Apps on the node's network reach others through their published ports."</small> }>
+                        <Show when=move || !linkable().is_empty()
+                            fallback=|| view! { <small>"No other app on this node to link to yet."</small> }>
+                            <div class="checks">
+                                {move || linkable().into_iter().map(|app| {
+                                    let checked_app = app.clone();
+                                    let toggled_app = app.clone();
+                                    let alias = {
+                                        let app = app.clone();
+                                        move || f.links.with(|l| l.iter().find(|l| l.app == app).and_then(|l| l.alias.clone()))
+                                    };
+                                    view! {
+                                        <label class="check">
+                                            <input type="checkbox"
+                                                prop:checked=move || f.links.with(|l| l.iter().any(|l| l.app == checked_app))
+                                                on:change=move |ev| {
+                                                    let on = event_target_checked(&ev);
+                                                    let app = toggled_app.clone();
+                                                    f.links.update(|l| {
+                                                        l.retain(|x| x.app != app);
+                                                        if on {
+                                                            l.push(Link { app, alias: None });
+                                                        }
+                                                    });
+                                                }/>
+                                            {app.clone()}
+                                            {move || alias().map(|a| view! { <span class="muted small">{format!(" as {a}")}</span> })}
+                                        </label>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        </Show>
+                        <small>"A linked app is reachable from this one by its name (e.g. " <code>"postgres://…@db:5432"</code> "), over a network private to them."</small>
+                    </Show>
+                </div>
+            </fieldset>
+
             <fieldset class="form-section">
                 <legend>"Limits"</legend>
                 <div class="form-row limits-row">
@@ -912,7 +983,25 @@ fn ScanResults(form: SpecForm) -> impl IntoView {
             let empty = candidates.is_empty();
             view! {
                 <div class="scan">
-                    <div class="muted small">"Scanned " <code>{commit}</code></div>
+                    <div class="muted small">
+                        "Scanned " <code>{commit}</code>
+                        {r.credential.clone().map(|c| view! { " · fetched with " <strong>{c}</strong> })}
+                    </div>
+                    {r.compose_files.first().cloned().map(|file| {
+                        let href = format!(
+                            "/stacks/new?repo={}&branch={}&file={}",
+                            encode(&f.repo.get_untracked()),
+                            encode(&f.branch.get_untracked()),
+                            encode(&file)
+                        );
+                        view! {
+                            <div class="note">
+                                "This repository has " <code>{file.clone()}</code> ". "
+                                <A href=href>"Deploy it as a stack"</A>
+                                " (its services together, at one commit, on a network of their own), or pick one thing to deploy below."
+                            </div>
+                        }
+                    })}
                     {empty.then(|| view! {
                         <div class="note">"Nothing recognised in this repository. Set the build up below."</div>
                     })}
@@ -930,9 +1019,9 @@ fn ScanResults(form: SpecForm) -> impl IntoView {
                                         "Reads " {c.env.join(", ")}
                                     </span>
                                 })}
-                                {(!c.args.is_empty()).then(|| view! {
+                                {(!c.command.is_empty()).then(|| view! {
                                     <span class="candidate-env">
-                                        "Runs with " {join_args(&c.args)}
+                                        "Runs " {facade_core::join_command(&c.command)}
                                     </span>
                                 })}
                                 {c.notes.iter().map(|n| view! {
@@ -1051,5 +1140,86 @@ fn DropZone(form: SpecForm, #[prop(into)] nodes: Signal<Vec<NodeView>>) -> impl 
         </div>
         <ErrorNote error=error/>
         <ErrorNote error=Signal::derive(mismatch)/>
+    }
+}
+
+fn encode(s: &str) -> String {
+    String::from(js_sys::encode_uri_component(s))
+}
+
+/// When a scan was refused: create a deploy key for the repository, show where to
+/// add it, and scan again.
+#[component]
+fn PrivateRepo(form: SpecForm, editing: bool) -> impl IntoView {
+    let f = form;
+    let key = RwSignal::new(None::<GitCredentialView>);
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+    let create = move |_| {
+        let repo = f.repo.get_untracked().trim().to_string();
+        let base: String = facade_core::git::parse(&repo)
+            .and_then(|l| l.path.rsplit('/').next().map(str::to_lowercase))
+            .unwrap_or_else(|| "repo".into())
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .take(30)
+            .collect();
+        let name = format!("{}-deploy-key", base.trim_matches('-'));
+        let body = CreateGitCredential {
+            name,
+            scope: repo,
+            secret: NewGitSecret::SshKey { private_key: None },
+        };
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match api::post::<_, GitCredentialView>("/api/git/credentials", &body).await {
+                Ok(created) => {
+                    key.try_set(Some(created));
+                }
+                Err(e) => {
+                    error.try_set(Some(e));
+                }
+            }
+            busy.try_set(false);
+        });
+    };
+    let rescan = move |_| {
+        f.scanned.set(Default::default());
+        f.scan(!editing);
+    };
+    view! {
+        <div class="note private-repo">
+            <Show when=move || key.with(Option::is_none) fallback=move || view! {
+                <p><strong>"Add this deploy key to the repository"</strong> " (read-only access is enough):"</p>
+                <CopyField value=Signal::derive(move || key.get().and_then(|k| k.public_key).unwrap_or_default())/>
+                <p class="small">
+                    {move || match key.get().and_then(|k| k.add_key_url) {
+                        Some(url) => view! {
+                            <a href=url target="_blank" rel="noopener">"Open the repository's deploy key page ↗"</a>
+                            ", paste the key, save, then scan again."
+                        }.into_any(),
+                        None => view! { "Add it in the repository's settings, then scan again." }.into_any(),
+                    }}
+                </p>
+                <button type="button" class="button button-primary" on:click=rescan
+                    disabled=move || f.scanning.get()>
+                    {move || if f.scanning.get() { "Scanning…" } else { "Scan again" }}
+                </button>
+            }>
+                <p>
+                    <strong>"façade cannot read this repository."</strong>
+                    " If it is private, give façade read access with a deploy key: façade makes one, you add it to the repository."
+                </p>
+                <button type="button" class="button" on:click=create disabled=busy>
+                    {move || if busy.get() { "Creating…" } else { "Create a deploy key" }}
+                </button>
+                <span class="muted small">
+                    " Several private repositories? Add one access token for all of them in "
+                    <A href="/settings">"Settings → Git access"</A> "."
+                </span>
+            </Show>
+            <ErrorNote error=error/>
+        </div>
     }
 }

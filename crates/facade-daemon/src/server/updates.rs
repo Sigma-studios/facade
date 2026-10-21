@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use facade_core::Source;
 use facade_core::api::{CommitView, UpdateCheck};
-use facade_core::{AppSpec, Source};
-use tokio::process::Command;
 
 use super::Server;
+use super::store::AppRow;
+use crate::gitauth::Access;
 
 /// Commits listed at most.
 const MAX_COMMITS: usize = 50;
@@ -20,23 +21,25 @@ fn repo_dir(server: &Server, app: &str) -> PathBuf {
     server.cfg.data_dir.join("repos").join(format!("{app}.git"))
 }
 
-/// `owner`: whose logins fetch (the app's owner, or the admins).
-pub async fn check(server: &Server, spec: &AppSpec, owner: i64) -> anyhow::Result<UpdateCheck> {
+/// The app's repository is fetched with its owner's credential, if one covers it.
+pub async fn check(server: &Server, row: &AppRow) -> anyhow::Result<UpdateCheck> {
+    let spec = &row.spec;
     let Source::Git { repo, branch, .. } = &spec.source else {
         bail!("{} is not built from git", spec.name);
     };
     let dir = repo_dir(server, &spec.name);
-    let env = crate::gitauth::git_env(repo, &server.credentials(owner)?);
-    // A repository URL change starts over.
-    let url = git(&dir, &["config", "--get", "remote.origin.url"], &env)
+    let owner = row.owner.unwrap_or(super::store::ADMINS);
+    let (access, _) = super::git::access(server, owner, repo)?;
+    let env = &access;
+    // A repository URL (or credential kind) change starts over.
+    let url = git(&dir, &["config", "--get", "remote.origin.url"], env)
         .await
         .unwrap_or_default();
-    if url.trim() != repo {
+    if url.trim() != access.url {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await?;
-        git(&dir, &["init", "--bare", "--quiet"], &env).await?;
-        // The spec rejects URLs starting with `-`.
-        git(&dir, &["remote", "add", "origin", repo], &env).await?;
+        git(&dir, &["init", "--bare", "--quiet"], env).await?;
+        git(&dir, &["remote", "add", "--", "origin", &access.url], env).await?;
     }
     let refspec = match branch {
         Some(b) => format!("+refs/heads/{b}:refs/facade/head"),
@@ -45,22 +48,22 @@ pub async fn check(server: &Server, spec: &AppSpec, owner: i64) -> anyhow::Resul
     git(
         &dir,
         &["fetch", "--quiet", "--filter=tree:0", "origin", &refspec],
-        &env,
+        env,
     )
     .await
     .context("fetching the repository")?;
 
-    let latest = log(&dir, &["-1", "refs/facade/head"], &env)
+    let latest = log(&dir, &["-1", "refs/facade/head"], env)
         .await?
         .into_iter()
         .next()
         .context("the branch has no commits")?;
-    let deployed = server.store.deployed_commit(&spec.name)?;
+    let deployed = row.commit.clone();
     let known = match &deployed {
         Some(c) => git(
             &dir,
             &["merge-base", "--is-ancestor", c, "refs/facade/head"],
-            &env,
+            env,
         )
         .await
         .is_ok(),
@@ -69,14 +72,14 @@ pub async fn check(server: &Server, spec: &AppSpec, owner: i64) -> anyhow::Resul
     let (behind, commits) = match (&deployed, known) {
         (Some(c), true) => {
             let range = format!("{c}..refs/facade/head");
-            let count: u32 = git(&dir, &["rev-list", "--count", &range], &env)
+            let count: u32 = git(&dir, &["rev-list", "--count", &range], env)
                 .await?
                 .trim()
                 .parse()?;
             let max = format!("-{MAX_COMMITS}");
-            (Some(count), log(&dir, &[&max, &range], &env).await?)
+            (Some(count), log(&dir, &[&max, &range], env).await?)
         }
-        _ => (None, log(&dir, &["-5", "refs/facade/head"], &env).await?),
+        _ => (None, log(&dir, &["-5", "refs/facade/head"], env).await?),
     };
     Ok(UpdateCheck {
         branch: branch.clone(),
@@ -92,15 +95,11 @@ pub async fn forget(server: &Server, app: &str) {
     let _ = tokio::fs::remove_dir_all(repo_dir(server, app)).await;
 }
 
-async fn log(
-    dir: &Path,
-    args: &[&str],
-    env: &[(String, String)],
-) -> anyhow::Result<Vec<CommitView>> {
+async fn log(dir: &Path, args: &[&str], access: &Access) -> anyhow::Result<Vec<CommitView>> {
     let format = format!("--format=%H{SEP}%s{SEP}%an{SEP}%ct");
     let mut all = vec!["log", format.as_str()];
     all.extend_from_slice(args);
-    let out = git(dir, &all, env).await?;
+    let out = git(dir, &all, access).await?;
     Ok(out
         .lines()
         .filter_map(|line| {
@@ -115,15 +114,11 @@ async fn log(
         .collect())
 }
 
-/// Runs git in `dir`, returning stdout, or the last line of stderr as the error.
-async fn git(dir: &Path, args: &[&str], env: &[(String, String)]) -> anyhow::Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .envs(env.iter().cloned())
-        .kill_on_drop(true);
+/// Runs git in `dir` with the app's credential, returning stdout, or the last
+/// line of stderr as the error.
+async fn git(dir: &Path, args: &[&str], access: &Access) -> anyhow::Result<String> {
+    let mut cmd = access.git();
+    cmd.arg("-C").arg(dir).args(args);
     let out = tokio::time::timeout(Duration::from_secs(120), cmd.output())
         .await
         .context("git took longer than two minutes")?

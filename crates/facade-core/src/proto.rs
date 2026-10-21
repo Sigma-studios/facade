@@ -57,63 +57,74 @@ pub struct Workload {
     pub spec: AppSpec,
     /// Resolved environment, secrets included. Only ever sent over the pinned TLS link.
     pub env: Vec<(String, String)>,
-    /// Bumped by every explicit deploy. A new revision forces a fresh build.
+    /// Bumped by every explicit deploy; a new revision recreates the container.
     pub revision: u64,
-    /// Logins for private registries and git hosts, used by pulls, clones and
-    /// builds. Every configured one is sent: a Dockerfile's `FROM` can name any
-    /// registry.
+    /// The commit git sources are built from, resolved when the app was deployed.
+    /// Builds are keyed by it, so a rebuild (on another node, after a cleanup) gets
+    /// the same code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// How to fetch the repository, when a credential covers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_auth: Option<GitAuth>,
+    /// Identifies what a stack service's image is built from (its build context's
+    /// content at the commit), so services whose code did not change keep their
+    /// image across commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_key: Option<String>,
+    /// Extra host names the app answers to on its private network, asked for by
+    /// apps linking to it under another name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub credentials: Vec<Credential>,
+    pub aliases: Vec<String>,
+    /// Logins for private container registries, used by pulls and by builds (a
+    /// Dockerfile's `FROM` can name any registry): those of the app's owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registries: Vec<RegistryLogin>,
 }
 
 impl Workload {
-    /// What the running container depends on: credentials only matter while
-    /// fetching, so changing them does not restart anything.
-    pub fn run_identity(&self) -> (&AppSpec, &Vec<(String, String)>, u64) {
-        (&self.spec, &self.env, self.revision)
-    }
-
-    pub fn credential(&self, kind: CredentialKind, host: &str) -> Option<&Credential> {
-        self.credentials
+    pub fn registry(&self, host: &str) -> Option<&RegistryLogin> {
+        self.registries
             .iter()
-            .find(|c| c.kind == kind && c.host.eq_ignore_ascii_case(host))
+            .find(|r| r.host.eq_ignore_ascii_case(host))
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialKind {
-    /// A container registry (`ghcr.io`, `docker.io`).
-    Registry,
-    /// A git host, for HTTPS clones (`github.com`).
-    Git,
-}
-
-impl std::fmt::Display for CredentialKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            CredentialKind::Registry => "registry",
-            CredentialKind::Git => "git",
-        })
-    }
-}
-
+/// A login for a container registry (`ghcr.io`, `docker.io`).
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct Credential {
-    pub kind: CredentialKind,
+pub struct RegistryLogin {
     pub host: String,
     pub username: String,
     /// Token or password.
     pub secret: String,
 }
 
-impl std::fmt::Debug for Credential {
+impl std::fmt::Debug for RegistryLogin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Credential({} {} as {})",
-            self.kind, self.host, self.username
-        )
+        write!(f, "RegistryLogin({} as {})", self.host, self.username)
+    }
+}
+
+/// A credential for fetching a private repository.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GitAuth {
+    /// An SSH private key (OpenSSH format); the repository is fetched over SSH.
+    SshKey { private_key: String },
+    /// An access token, sent over HTTPS to URLs under `scope` only.
+    Token {
+        scope: String,
+        username: String,
+        token: String,
+    },
+}
+
+impl std::fmt::Debug for GitAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitAuth::SshKey { .. } => f.write_str("SshKey(..)"),
+            GitAuth::Token { scope, .. } => write!(f, "Token({scope}, ..)"),
+        }
     }
 }
 
@@ -141,16 +152,60 @@ pub enum AgentRequest {
     Sync {
         workloads: Vec<Workload>,
     },
-    /// Desired state of one app. Rebuilds when the revision changed.
+    /// Desired state of one app. Builds when the commit (or source) changed.
     Apply {
         workload: Workload,
         deployment: Option<Uuid>,
+        /// Build again even if an image of this commit exists.
+        #[serde(default)]
+        rebuild: bool,
+        #[serde(default)]
+        phase: ApplyPhase,
     },
-    /// Remove the app's container (and with `delete_volumes`, its data).
     Remove {
         app: String,
+        /// Delete its volumes too. Otherwise they stay on the node.
         #[serde(default)]
-        delete_volumes: bool,
+        volumes: bool,
+    },
+    /// What listens on the node right now. Answers `Vec<Listener>`.
+    Ports,
+    /// Replace the agent's executable with the server's (fetched by its SHA-256),
+    /// hand the node's entry point over to it, and restart.
+    Upgrade {
+        sha256: String,
+    },
+    /// Dial a data connection and write a gzipped tar of the volume (by its Docker
+    /// name) to it. A running
+    /// app is paused meanwhile, so files are copied as they were at one instant.
+    VolumeExport {
+        tunnel: Uuid,
+        app: String,
+        volume: String,
+    },
+    /// Dial a data connection, read `<size>\n` and then that many bytes of a tar
+    /// (gzipped or not), replace the volume's contents with it, and answer `ok\n`
+    /// or `error <message>\n` on the same connection. The app is stopped meanwhile.
+    VolumeImport {
+        tunnel: Uuid,
+        app: String,
+        volume: String,
+        /// How to create the volume if the app never ran yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        create: Option<NewVolume>,
+    },
+    /// Stop a deployment that is queued or building.
+    Cancel {
+        deployment: Uuid,
+    },
+    /// Free disk space now; `aggressive` also drops the whole build cache and the
+    /// images kept for rollbacks.
+    Prune {
+        aggressive: bool,
+    },
+    /// Delete a facade volume no app uses any more.
+    RemoveVolume {
+        name: String,
     },
     Restart {
         app: String,
@@ -173,30 +228,20 @@ pub enum AgentRequest {
         tail: u32,
         follow: bool,
     },
-    /// Replace the agent's executable with the server's (fetched by its SHA-256),
-    /// hand the node's entry point over to it, and restart.
-    Upgrade {
-        sha256: String,
-    },
-    /// Every facade volume on the node, with sizes. Answers `Vec<VolumeInfo>`.
-    Volumes,
-    /// What listens on the node right now. Answers `Vec<Listener>`.
-    Ports,
-    /// Dial a data connection and write a gzipped tar of the volume to it. A running
-    /// app is paused meanwhile, so files are copied as they were at one instant.
-    VolumeExport {
-        tunnel: Uuid,
-        app: String,
-        volume: String,
-    },
-    /// Dial a data connection, read `<size>\n` and then that many bytes of a tar
-    /// (gzipped or not), replace the volume's contents with it, and answer `ok\n`
-    /// or `error <message>\n` on the same connection. The app is stopped meanwhile.
-    VolumeImport {
-        tunnel: Uuid,
-        app: String,
-        volume: String,
-    },
+}
+
+/// Stacks deploy in two phases: every service is built first (nothing changes if
+/// one fails), then replaced in dependency order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyPhase {
+    /// Build (or pull) and replace the container.
+    #[default]
+    All,
+    /// Only build or pull the image; the desired state does not change.
+    Build,
+    /// Replace the container with the image built before (no new pull).
+    Release,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +270,16 @@ pub enum AgentEvent {
         state: AppState,
         message: Option<String>,
     },
+    /// The deployment left the build queue and is being worked on.
+    DeployStarted {
+        deployment: Uuid,
+    },
+    /// The commit a deployment checked out.
+    DeployCommit {
+        deployment: Uuid,
+        commit: String,
+        title: String,
+    },
     DeployLog {
         deployment: Uuid,
         line: String,
@@ -232,10 +287,36 @@ pub enum AgentEvent {
     DeployDone {
         deployment: Uuid,
         error: Option<String>,
-        /// The commit that was built, for sources from git.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        commit: Option<String>,
+        #[serde(default)]
+        cancelled: bool,
     },
+    /// The build phase of a stack deployment is over (an error ends the deployment).
+    BuildDone {
+        deployment: Uuid,
+        error: Option<String>,
+    },
+    /// The node's build queue, sent whenever it changes.
+    Builds {
+        builds: Vec<BuildEntry>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildState {
+    Queued,
+    Building,
+}
+
+/// One build waiting for, or holding, the node's build slot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BuildEntry {
+    pub app: String,
+    pub deployment: Option<Uuid>,
+    pub commit: Option<String>,
+    pub state: BuildState,
+    /// When it entered its current state.
+    pub since: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -271,6 +352,9 @@ impl std::fmt::Display for AppState {
 pub struct NodeReport {
     pub node: NodeStats,
     pub apps: Vec<AppStats>,
+    /// Refreshed every few minutes, so only in some reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageReport>,
     /// Every listening socket on the machine, facade's or not.
     #[serde(default)]
     pub listeners: Vec<Listener>,
@@ -295,13 +379,34 @@ pub struct Listener {
     pub app: Option<String>,
 }
 
-/// A volume on a node.
+/// What Docker keeps on a node's disk, and the last cleanup.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StorageReport {
+    pub at: u64,
+    pub images: u64,
+    pub build_cache: u64,
+    /// Build cache Docker could drop right away.
+    pub build_cache_reclaimable: u64,
+    pub volumes: Vec<VolumeUsage>,
+    pub last_cleanup: Option<Cleanup>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VolumeInfo {
-    pub app: String,
+pub struct VolumeUsage {
+    /// Docker volume name, `facade-<app>-<volume>`.
     pub name: String,
-    /// Bytes used, when it could be measured.
+    pub app: String,
+    pub volume: String,
     pub size: Option<u64>,
+    /// Mounted by a container right now.
+    pub in_use: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cleanup {
+    pub at: u64,
+    pub freed: u64,
+    pub aggressive: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -370,4 +475,14 @@ impl JoinToken {
             .map_err(|e| format!("join token is not valid base64: {e}"))?;
         serde_json::from_slice(&bytes).map_err(|e| format!("join token is malformed: {e}"))
     }
+}
+
+/// The labels of a facade volume created ahead of its app's first deploy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewVolume {
+    /// The volume's name in the app's spec (`data`).
+    pub name: String,
+    /// The stack it belongs to, for the volumes a stack's services share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
 }

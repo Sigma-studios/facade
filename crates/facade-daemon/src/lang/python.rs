@@ -96,16 +96,17 @@ impl Detector for Python {
                 let source = file.as_deref().and_then(read_small).unwrap_or_default();
                 let cli = cli_hints(&source);
                 let http_port = cli.port.or_else(|| port_hint(&source));
-                let mut args = Vec::new();
+                let mut command = Vec::new();
                 let mut notes = Vec::new();
                 match cli.host.as_deref() {
                     Some("127.0.0.1" | "localhost" | "::1") => {
-                        args.extend(["--host".to_string(), "0.0.0.0".to_string()]);
-                        notes.push(
+                        command = entry.command();
+                        command.extend(["--host".to_string(), "0.0.0.0".to_string()]);
+                        notes.push(format!(
                             "listens on 127.0.0.1 by default, which is unreachable from outside \
-                             its container: suggested args --host 0.0.0.0"
-                                .into(),
-                        );
+                             its container: suggested command {}",
+                            facade_core::join_command(&command)
+                        ));
                     }
                     None if binds_loopback(&source) => notes.push(
                         "binds 127.0.0.1 in its code: it must listen on 0.0.0.0 to be reachable \
@@ -150,7 +151,7 @@ impl Detector for Python {
                         },
                         http_port,
                         env: env.clone(),
-                        args,
+                        command,
                         notes,
                     },
                 )
@@ -341,11 +342,9 @@ fn python_sources(root: &Path) -> Vec<PathBuf> {
 /// build a project that does not say how.
 pub fn dockerfile(version: Option<&str>, entry: &str) -> Result<String, SpecError> {
     let version = version.unwrap_or(DEFAULT_PYTHON);
-    let entrypoint = match PythonEntry::parse(entry)? {
-        PythonEntry::Script(path) => serde_json::json!(["python", path]),
-        PythonEntry::Module(module) => serde_json::json!(["python", "-m", module]),
-        PythonEntry::Command(command) => serde_json::json!([command]),
-    };
+    // A CMD, which an app's `command` replaces (with arguments added, say).
+    let cmd =
+        serde_json::to_string(&PythonEntry::parse(entry)?.command()).expect("strings serialize");
     Ok(format!(
         r#"FROM docker.io/library/python:{version}-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_ROOT_USER_ACTION=ignore
@@ -374,7 +373,7 @@ if os.path.exists("pyproject.toml"):
     elif data.get("project", {{}}).get("dependencies"):
         pip(*data["project"]["dependencies"])
 EOF
-ENTRYPOINT {entrypoint}
+CMD {cmd}
 "#
     ))
 }
@@ -423,7 +422,7 @@ if __name__ == "__main__":
         assert_eq!(found.len(), 1);
         let c = &found[0];
         assert_eq!(c.http_port, Some(8000));
-        assert_eq!(c.args, ["--host", "0.0.0.0"]);
+        assert_eq!(c.command, ["python", "server.py", "--host", "0.0.0.0"]);
         assert_eq!(c.env, ["POKER_SECRET"]);
         assert_eq!(
             c.build,
@@ -458,7 +457,7 @@ if __name__ == "__main__":
                 entry: "bot.py".into()
             }
         );
-        assert!(found[0].args.is_empty());
+        assert!(found[0].command.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -509,16 +508,16 @@ if __name__ == "__main__":
         assert!(df.starts_with(&format!(
             "FROM docker.io/library/python:{DEFAULT_PYTHON}-slim"
         )));
-        assert!(df.contains(r#"ENTRYPOINT ["python","server.py"]"#));
+        assert!(df.contains(r#"CMD ["python","server.py"]"#));
         assert!(
             dockerfile(Some("3.12"), "-m poker")
                 .unwrap()
-                .contains(r#"ENTRYPOINT ["python","-m","poker"]"#)
+                .contains(r#"CMD ["python","-m","poker"]"#)
         );
         assert!(
             dockerfile(None, "mybot")
                 .unwrap()
-                .contains(r#"ENTRYPOINT ["mybot"]"#)
+                .contains(r#"CMD ["mybot"]"#)
         );
         assert!(dockerfile(None, "../evil.py").is_err());
     }

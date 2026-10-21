@@ -17,7 +17,7 @@ use facade_core::{Build, Source};
 use serde::Serialize;
 
 use crate::config::ServerConfig;
-use crate::server::{load_workload, secrets::SecretBox, store::Store};
+use crate::server::{Catalog, secrets::SecretBox, store::Store};
 
 #[derive(Debug, Serialize)]
 pub struct Planned {
@@ -88,7 +88,11 @@ async fn check_copy(cfg: &ServerConfig, copy: &std::path::Path, json: bool) -> a
         if spec.node != cfg.local_node || row.revision == 0 || !spec.enabled || spec.is_static() {
             continue;
         }
-        let w = load_workload(&store, &secrets, &spec.name)?;
+        let w = Catalog {
+            store: &store,
+            secrets: &secrets,
+        }
+        .workload(&spec.name)?;
         let image = crate::agent::planned_image(&w).expect("only static sites have no image");
         let change = match running.get(&spec.name) {
             None => Change::NotRunning,

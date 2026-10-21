@@ -7,7 +7,7 @@ mod util;
 
 use std::time::Duration;
 
-use facade_core::api::{AlertView, LoginRequest, LoginResponse, WhoAmI};
+use facade_core::api::{AlertView, BuildsView, LoginRequest, LoginResponse, WhoAmI};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::{A, Outlet, ParentRoute, Route, Router, Routes};
@@ -31,11 +31,14 @@ fn App() -> impl IntoView {
                     <Route path=path!("") view=pages::overview::Overview/>
                     <Route path=path!("apps") view=pages::apps::Apps/>
                     <Route path=path!("apps/new") view=pages::apps::NewApp/>
+                    <Route path=path!("stacks/new") view=|| view! { <AdminOnly><pages::stack::NewStack/></AdminOnly> }/>
+                    <Route path=path!("stacks/:name") view=|| view! { <AdminOnly><pages::stack::StackPage/></AdminOnly> }/>
+                    <Route path=path!("builds") view=pages::builds::Builds/>
                     <Route path=path!("apps/:name") view=pages::app::AppPage/>
                     <Route path=path!("nodes") view=pages::nodes::Nodes/>
                     <Route path=path!("domains") view=pages::domains::Domains/>
                     <Route path=path!("alerts") view=pages::alerts::Alerts/>
-                    <Route path=path!("users") view=pages::users::Users/>
+                    <Route path=path!("users") view=|| view! { <AdminOnly><pages::users::Users/></AdminOnly> }/>
                     <Route path=path!("settings") view=pages::settings::Settings/>
                 </ParentRoute>
             </Routes>
@@ -72,6 +75,14 @@ fn Shell() -> impl IntoView {
                 .map_or(0, |a| a.iter().filter(|x| x.resolved_at.is_none()).count())
         })
     };
+    let builds = polled(Some(Duration::from_secs(5)), || async {
+        api::get::<BuildsView>("/api/builds").await
+    });
+    let building = move || {
+        builds
+            .data
+            .with(|b| b.as_ref().map_or(0, |b| b.queue.len()))
+    };
     let logout = move |_| {
         spawn_local(async move {
             let _ = api::act("/api/logout").await;
@@ -89,6 +100,14 @@ fn Shell() -> impl IntoView {
                 <ul class="nav">
                     <li><A href="/" exact=true>"Overview"</A></li>
                     <li><A href="/apps">"Apps"</A></li>
+                    <li>
+                        <A href="/builds">
+                            "Builds"
+                            <Show when=move || { building() > 0 }>
+                                <span class="nav-count nav-count-busy" title="building or queued">{building}</span>
+                            </Show>
+                        </A>
+                    </li>
                     <li><A href="/nodes">"Nodes"</A></li>
                     <li><A href="/domains">"Domains"</A></li>
                     <li>
@@ -125,6 +144,28 @@ fn Shell() -> impl IntoView {
                 <Outlet/>
             </main>
         </div>
+    }
+}
+
+/// A page only admins can use; members get a short explanation instead.
+#[component]
+fn AdminOnly(children: ChildrenFn) -> impl IntoView {
+    let me = util::me();
+    let children = StoredValue::new(children);
+    view! {
+        <Show when=move || me.0.loaded() fallback=components::Loading>
+            <Show
+                when=move || me.is_admin()
+                fallback=|| view! {
+                    <div class="page">
+                        <h1>"Admins only"</h1>
+                        <p class="muted lead">"Ask an admin of this façade server if you need this."</p>
+                    </div>
+                }
+            >
+                {children.read_value()()}
+            </Show>
+        </Show>
     }
 }
 
