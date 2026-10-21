@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AppMetric, AppView, BackupReport, BackupRequest, BackupView, CommitView, DeploymentStatus,
-    DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, SetOwner, UpdateCheck,
-    UserView, VolumeView,
+    AppMetric, AppView, BackupReport, BackupRequest, BackupView, CommitView, DeployRequest,
+    DeploymentStatus, DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, SetOwner,
+    UpdateCheck, UserView, VolumeView,
 };
 use facade_core::proto::AppState;
 use facade_core::{Build, Source};
@@ -57,18 +57,45 @@ pub fn AppPage() -> impl IntoView {
     };
 
     let busy = RwSignal::new(false);
+    // The stack a service belongs to, which deploys it.
+    let stack = move || {
+        app.data.with(|a| {
+            a.as_ref()
+                .and_then(|a| a.spec.stack.as_ref().map(|s| s.stack.clone()))
+        })
+    };
     let deploy = {
         let set_tab = set_tab.clone();
-        move || {
+        let navigate = navigate.clone();
+        // `commit`: a specific one to deploy (the update check's), or the branch's latest.
+        move |commit: Option<String>| {
             busy.set(true);
             let set_tab = set_tab.clone();
+            if let Some(stack) = stack() {
+                let navigate = navigate.clone();
+                spawn_local(async move {
+                    match api::act_json::<facade_core::api::StackDeploymentView>(&format!(
+                        "/api/stacks/{stack}/deploy"
+                    ))
+                    .await
+                    {
+                        Ok(_) => navigate(
+                            &format!("/stacks/{stack}?tab=deployments"),
+                            Default::default(),
+                        ),
+                        Err(e) => toasts().err(e),
+                    }
+                    busy.set(false);
+                });
+                return;
+            }
+            let path = format!("/api/apps/{}/deploy", name.get_untracked());
+            let body = DeployRequest {
+                commit,
+                rebuild: false,
+            };
             spawn_local(async move {
-                match api::act_json::<DeploymentView>(&format!(
-                    "/api/apps/{}/deploy",
-                    name.get_untracked()
-                ))
-                .await
-                {
+                match api::post::<_, DeploymentView>(&path, &body).await {
                     Ok(d) => {
                         selected_deployment.set(Some(d.id));
                         set_tab("deployments");
@@ -83,7 +110,7 @@ pub fn AppPage() -> impl IntoView {
     // For the Update button of the overview's update check.
     let on_deploy = Callback::new({
         let deploy = deploy.clone();
-        move |()| deploy()
+        move |commit: Option<String>| deploy(commit)
     });
     let simple = move |action: &'static str, done: &'static str| {
         let path = format!("/api/apps/{}/{action}", name.get_untracked());
@@ -94,20 +121,16 @@ pub fn AppPage() -> impl IntoView {
 
     let confirm_delete = RwSignal::new(false);
     let typed = RwSignal::new(String::new());
-    let delete_data = RwSignal::new(false);
+    let delete_volumes = RwSignal::new(false);
     let delete = {
         let navigate = navigate.clone();
         move |_| {
             let navigate = navigate.clone();
             let n = name.get_untracked();
-            let path = if delete_data.get_untracked() {
-                format!("/api/apps/{n}?delete_data=true")
-            } else {
-                format!("/api/apps/{n}")
-            };
+            let volumes = delete_volumes.get_untracked();
             run(
                 format!("{n} deleted"),
-                async move { api::delete(&path).await },
+                async move { api::delete(&format!("/api/apps/{n}?volumes={volumes}")).await },
                 move || navigate("/apps", Default::default()),
             );
         }
@@ -126,7 +149,12 @@ pub fn AppPage() -> impl IntoView {
         <div class="page">
             <header class="page-head">
                 <div>
-                    <A href="/apps" attr:class="crumb">"← Apps"</A>
+                    {move || match stack() {
+                        Some(stack) => view! {
+                            <A href=format!("/stacks/{stack}") attr:class="crumb">{format!("← Stack {stack}")}</A>
+                        }.into_any(),
+                        None => view! { <A href="/apps" attr:class="crumb">"← Apps"</A> }.into_any(),
+                    }}
                     <h1 class="title-row">
                         {move || name.get()}
                         <Show when=move || app.loaded()>
@@ -147,10 +175,18 @@ pub fn AppPage() -> impl IntoView {
                     <button class="button button-primary" disabled=move || busy.get() || !app.loaded()
                         on:click={
                             let deploy = deploy.clone();
-                            move |_| deploy()
+                            move |_| deploy(None)
                         }
                         title="Fetch the latest code or image, rebuild and restart">
-                        {move || if busy.get() { "Starting…" } else if deployed() { "Deploy" } else { "First deploy" }}
+                        {move || if busy.get() {
+                            "Starting…"
+                        } else if stack().is_some() {
+                            "Deploy stack"
+                        } else if deployed() {
+                            "Deploy"
+                        } else {
+                            "First deploy"
+                        }}
                     </button>
                     <button class="button" disabled=move || !deployed()
                         on:click=move |_| simple("restart", "Restarted")>"Restart"</button>
@@ -166,6 +202,18 @@ pub fn AppPage() -> impl IntoView {
                 </div>
             </header>
             <ErrorNote error=app.error/>
+            {move || view_of().and_then(|a| {
+                let stack = a.spec.stack.clone()?;
+                let service = a.spec.service()?.to_string();
+                Some(view! {
+                    <div class="note">
+                        "Service " <strong>{service}</strong> " of stack "
+                        <A href=format!("/stacks/{}", stack.stack)>{stack.stack.clone()}</A>
+                        ", reached by the other services as " <code>{stack.host.clone()}</code>
+                        ". It is deployed with its stack; its settings come from the stack (and its compose file)."
+                    </div>
+                })
+            })}
             <Show when=move || state.get() == AppState::Crashed && view_of().is_some_and(|a| a.message.is_none())>
                 <div class="note note-error">
                     "The container keeps stopping. Its "
@@ -196,14 +244,35 @@ pub fn AppPage() -> impl IntoView {
             <Show when=move || app.loaded() fallback=Loading>
                 {move || match tab.get().as_str() {
                     "logs" => view! { <LogsTab name=name/> }.into_any(),
-                    "deployments" => view! { <DeploymentsTab name=name selected=selected_deployment/> }.into_any(),
-                    "env" => view! { <EnvTab name=name deployed=Signal::derive(deployed)/> }.into_any(),
-                    "volumes" => view! { <VolumesTab name=name/> }.into_any(),
-                    "settings" => view! {
-                        <SettingsTab app=app.data.get_untracked().expect("loaded")
-                            live=Signal::derive(move || app.data.get())
-                            on_saved=move || app.reload() on_delete=move || confirm_delete.set(true)/>
+                    "deployments" => view! {
+                        <DeploymentsTab name=name selected=selected_deployment
+                            current=Signal::derive(move || view_of().and_then(|a| a.commit))
+                            on_deployed=move || app.reload()/>
                     }.into_any(),
+                    "env" => view! {
+                        <EnvTab path=Signal::derive(move || format!("/api/apps/{}/env", name.get()))
+                            saved=Signal::derive(move || if deployed() {
+                                "Saved. The app restarts with the new values.".to_string()
+                            } else {
+                                "Saved. It will be used from the first deploy.".to_string()
+                            })/>
+                    }.into_any(),
+                    "volumes" => view! { <VolumesTab name=name app=Signal::derive(move || app.data.get())/> }.into_any(),
+                    // Stacks are managed by admins; members edit a service as a plain app.
+                    "settings" => match view_of()
+                        .filter(|_| me.is_admin())
+                        .and_then(|a| a.spec.stack.clone().zip(a.spec.service().map(str::to_string)))
+                    {
+                        Some((stack, service)) => view! {
+                            <super::stack::ServiceSettings stack=stack.stack service=service
+                                on_saved=Callback::new(move |_| app.reload())/>
+                        }.into_any(),
+                        None => view! {
+                            <SettingsTab app=app.data.get_untracked().expect("loaded")
+                                live=Signal::derive(move || app.data.get())
+                                on_saved=move || app.reload() on_delete=move || confirm_delete.set(true)/>
+                        }.into_any(),
+                    },
                     _ => view! {
                         <OverviewTab name=name app=Signal::derive(move || app.data.get())
                             deploying=busy on_deploy=on_deploy/>
@@ -215,15 +284,15 @@ pub fn AppPage() -> impl IntoView {
                 <p>"This removes the container, its image and all its environment variables. It cannot be undone."</p>
                 <Show when=move || has_volumes.get()>
                     <label class="check">
-                        <input type="checkbox" bind:checked=delete_data/>
-                        "Also delete its volumes' data"
+                        <input type="checkbox" bind:checked=delete_volumes/>
+                        "Also delete its volumes and the data in them"
                     </label>
                     <p class="muted small">
-                        {move || if delete_data.get() {
+                        {move || if delete_volumes.get() {
                             "The volumes and their files are deleted with the app. Backups are kept.".to_string()
                         } else {
                             format!(
-                                "Unchecked, the volumes and their files stay on {}.",
+                                "Otherwise they stay on {} (Nodes page), and an app created with the same name gets them back.",
                                 view_of().map(|a| a.spec.node).unwrap_or_default()
                             )
                         }}
@@ -263,10 +332,10 @@ fn subtitle(app: &AppView) -> String {
             format!("{} · {kind}{commit}", repo.trim_start_matches("https://"))
         }
     };
-    let deployed = if app.revision == 0 {
-        "never deployed".to_string()
-    } else {
-        format!("revision {}", app.revision)
+    let deployed = match (&app.commit, app.revision) {
+        (_, 0) => "never deployed".to_string(),
+        (Some(commit), _) => format!("commit {}", &commit[..commit.len().min(7)]),
+        (None, revision) => format!("revision {revision}"),
     };
     format!("on {} · {source} · {deployed}", app.spec.node)
 }
@@ -278,7 +347,7 @@ fn OverviewTab(
     name: Memo<String>,
     #[prop(into)] app: Signal<Option<AppView>>,
     deploying: RwSignal<bool>,
-    on_deploy: Callback<()>,
+    on_deploy: Callback<Option<String>>,
 ) -> impl IntoView {
     let metrics = polled(Some(Duration::from_secs(15)), move || {
         let name = name.get();
@@ -361,7 +430,10 @@ fn OverviewTab(
                     <dt>"Source"</dt>
                     <dd>{match &s.source {
                         Source::Image { image } => format!("Docker image {image}"),
-                        Source::Executable { filename, arch, .. } => format!("Executable {filename} ({arch})"),
+                        Source::Executable { filename, arch, args, .. } => format!(
+                            "Executable {filename} ({arch}){}",
+                            if args.is_empty() { String::new() } else { format!(", run with {}", facade_core::join_command(args)) }
+                        ),
                         Source::Git { repo, branch, .. } => format!("{repo} ({})", branch.clone().unwrap_or_else(|| "default branch".into())),
                     }}</dd>
                     {matches!(s.source, Source::Git { .. }).then(|| view! {
@@ -371,16 +443,18 @@ fn OverviewTab(
                             None => view! { <span>"—"</span> }.into_any(),
                         }}</dd>
                     })}
-                    {(!s.args.is_empty()).then(|| view! {
-                        <dt>"Arguments"</dt>
-                        <dd><code>{s.args.join(" ")}</code></dd>
-                    })}
                     <dt>"HTTP port"</dt>
                     <dd>{s.http_port.map(|p| p.to_string()).unwrap_or_else(|| "—".into())}</dd>
                     <dt>"Published ports"</dt>
                     <dd>{if s.host_network { "node network".to_string() } else if s.ports.is_empty() { "—".into() } else {
                         s.ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
                     }}</dd>
+                    {(!s.command.is_empty()).then(|| view! {
+                        <dt>"Command"</dt><dd><code>{facade_core::join_command(&s.command)}</code></dd>
+                    })}
+                    {s.release_command.clone().map(|r| view! {
+                        <dt>"Release command"</dt><dd><code>{r}</code></dd>
+                    })}
                     {(!s.redirects.is_empty()).then(|| view! {
                         <dt>"Redirects"</dt>
                         <dd>{format!("{} → {}", s.redirects.join(", "), s.domains.first().cloned().unwrap_or_default())}</dd>
@@ -388,6 +462,14 @@ fn OverviewTab(
                     {(!s.volumes.is_empty()).then(|| view! {
                         <dt>"Volumes"</dt>
                         <dd>{s.volumes.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")}</dd>
+                    })}
+                    {(!s.links.is_empty()).then(|| view! {
+                        <dt>"Links"</dt>
+                        <dd>{s.links.iter().map(|l| if l.host() == l.app {
+                            l.app.clone()
+                        } else {
+                            format!("{} (as {})", l.app, l.host())
+                        }).collect::<Vec<_>>().join(", ")}</dd>
                     })}
                 </dl>
             })}
@@ -404,7 +486,7 @@ fn OverviewTab(
 fn UpdateCheckPanel(
     name: Memo<String>,
     deploying: RwSignal<bool>,
-    on_deploy: Callback<()>,
+    on_deploy: Callback<Option<String>>,
 ) -> impl IntoView {
     let checking = RwSignal::new(false);
     let result = RwSignal::new(None::<UpdateCheck>);
@@ -456,7 +538,7 @@ fn UpdateCheckPanel(
                 <span>{summary}</span>
                 <Show when=outdated>
                     <button class="button button-primary push-right" disabled=deploying
-                        on:click=move |_| on_deploy.run(())>
+                        on:click=move |_| on_deploy.run(result.get_untracked().map(|r| r.latest.hash))>
                         "Update"
                     </button>
                 </Show>
@@ -610,7 +692,14 @@ fn LogLine(text: String) -> impl IntoView {
 // ---------------------------------------------------------------- deployments
 
 #[component]
-fn DeploymentsTab(name: Memo<String>, selected: RwSignal<Option<Uuid>>) -> impl IntoView {
+fn DeploymentsTab(
+    name: Memo<String>,
+    selected: RwSignal<Option<Uuid>>,
+    /// The commit the app runs now.
+    #[prop(into)]
+    current: Signal<Option<String>>,
+    on_deployed: impl Fn() + Clone + Send + Sync + 'static,
+) -> impl IntoView {
     let list = polled(Some(Duration::from_secs(3)), move || {
         let name = name.get();
         async move { api::get::<Vec<DeploymentView>>(&format!("/api/apps/{name}/deployments")).await }
@@ -641,11 +730,39 @@ fn DeploymentsTab(name: Memo<String>, selected: RwSignal<Option<Uuid>>) -> impl 
         let running = detail.data.with(|d| {
             d.as_ref()
                 .and_then(|d| d.as_ref())
-                .is_some_and(|d| d.status == DeploymentStatus::Running)
+                .is_some_and(|d| !d.status.is_finished())
         });
         if running && let Some(el) = log_pane.get() {
             el.set_scroll_top(el.scroll_height());
         }
+    });
+    let cancel = move |id: Uuid| {
+        run(
+            "Deployment cancelled",
+            async move { api::act(&format!("/api/deployments/{id}/cancel")).await },
+            move || {
+                list.reload();
+                detail.reload();
+            },
+        );
+    };
+    let redeploy = Callback::new(move |commit: String| {
+        let path = format!("/api/apps/{}/deploy", name.get_untracked());
+        let on_deployed = on_deployed.clone();
+        spawn_local(async move {
+            let body = DeployRequest {
+                commit: Some(commit),
+                rebuild: false,
+            };
+            match api::post::<_, DeploymentView>(&path, &body).await {
+                Ok(d) => {
+                    selected.set(Some(d.id));
+                    list.reload();
+                    on_deployed();
+                }
+                Err(e) => toasts().err(e),
+            }
+        });
     });
 
     view! {
@@ -655,35 +772,70 @@ fn DeploymentsTab(name: Memo<String>, selected: RwSignal<Option<Uuid>>) -> impl 
             <div class="split">
                 <ul class="deploy-list">
                     <For each=move || list.data.get().unwrap_or_default()
-                        key=|d| (d.id, d.status, d.finished_at)
+                        key=|d| (d.id, d.status, d.finished_at, d.commit_title.clone())
                         let:d>
                         <li>
                             <button class=move || if selected.get() == Some(d.id) { "deploy-item active" } else { "deploy-item" }
                                 on:click=move |_| selected.set(Some(d.id))>
                                 <DeployStatus status=d.status/>
-                                <span class="deploy-rev">{format!("rev {}", d.revision)}</span>
-                                <span class="muted small">
-                                    {ago(d.started_at)}
-                                    {d.commit.as_deref().map(|c| format!(" · {}", short_hash(c)))}
+                                <span class="deploy-rev">
+                                    {match &d.commit {
+                                        Some(c) => short_hash(c).to_string(),
+                                        None => format!("rev {}", d.revision),
+                                    }}
                                 </span>
+                                <span class="muted small">{ago(d.created_at)}</span>
+                                {d.commit_title.clone().map(|t| view! { <span class="deploy-title small">{t}</span> })}
                             </button>
                         </li>
                     </For>
                 </ul>
                 <div class="deploy-detail">
-                    {move || detail.data.get().flatten().map(|d| view! {
-                        <div class="deploy-head">
-                            <DeployStatus status=d.status/>
-                            <span>{format!("Revision {}", d.revision)}</span>
-                            {d.commit.clone().map(|c| view! {
-                                <code title=c.clone()>{short_hash(&c).to_string()}</code>
-                            })}
-                            <span class="muted small">
-                                {format!("started {}", ago(d.started_at))}
-                                {d.finished_at.map(|f| format!(" · took {}s", f.saturating_sub(d.started_at)))}
-                            </span>
-                        </div>
-                        {d.error.clone().map(|e| view! { <div class="note note-error">{e}</div> })}
+                    {move || detail.data.get().flatten().map(|d| {
+                        let id = d.id;
+                        let status = d.status;
+                        let commit = d.commit.clone();
+                        let is_current = commit.is_some() && commit == current.get();
+                        // A stack's services are redeployed with their stack.
+                        let member = name.get_untracked().contains('.');
+                        let can_redeploy = status == DeploymentStatus::Succeeded
+                            && commit.is_some()
+                            && !is_current
+                            && !member;
+                        view! {
+                            <div class="deploy-head">
+                                <DeployStatus status=status/>
+                                <span>{format!("Revision {}", d.revision)}</span>
+                                {d.commit.clone().map(|c| view! {
+                                    <code title=c.clone()>{c[..c.len().min(12)].to_string()}</code>
+                                })}
+                                <span class="muted small">
+                                    {format!("requested {}", ago(d.created_at))}
+                                    {match (d.started_at, d.finished_at) {
+                                        (Some(s), Some(f)) => Some(format!(" · took {}s", f.saturating_sub(s))),
+                                        (None, None) => Some(" · waiting for the build slot".to_string()),
+                                        _ => None,
+                                    }}
+                                </span>
+                                <span class="push-right">
+                                    {(!status.is_finished()).then(|| view! {
+                                        <button class="button" on:click=move |_| cancel(id)>"Cancel"</button>
+                                    })}
+                                    {can_redeploy.then(|| view! {
+                                        <button class="button"
+                                            title="Deploy this commit again (a rollback). Its image is reused if it is still on the node."
+                                            on:click=move |_| { if let Some(c) = commit.clone() { redeploy.run(c) } }>
+                                            "Redeploy this commit"
+                                        </button>
+                                    })}
+                                    {(is_current && status == DeploymentStatus::Succeeded).then(|| view! {
+                                        <span class="muted small">"running now"</span>
+                                    })}
+                                </span>
+                            </div>
+                            {d.commit_title.clone().map(|t| view! { <p class="deploy-commit-title">{t}</p> })}
+                            {d.error.clone().filter(|_| status != DeploymentStatus::Cancelled).map(|e| view! { <div class="note note-error">{e}</div> })}
+                        }
                     })}
                     <pre class="deploy-log" node_ref=log_pane>
                         {move || detail.data.get().flatten().map(|d| strip_ansi(&d.log)).unwrap_or_default()}
@@ -695,11 +847,13 @@ fn DeploymentsTab(name: Memo<String>, selected: RwSignal<Option<Uuid>>) -> impl 
 }
 
 #[component]
-fn DeployStatus(status: DeploymentStatus) -> impl IntoView {
+pub fn DeployStatus(status: DeploymentStatus) -> impl IntoView {
     let (class, icon, label) = match status {
+        DeploymentStatus::Queued => ("busy", "○", "queued"),
         DeploymentStatus::Running => ("busy", "◐", "running"),
         DeploymentStatus::Succeeded => ("good", "✓", "succeeded"),
         DeploymentStatus::Failed => ("critical", "✕", "failed"),
+        DeploymentStatus::Cancelled => ("neutral", "■", "cancelled"),
     };
     view! {
         <span class=format!("badge badge-{class}")>
@@ -710,12 +864,16 @@ fn DeployStatus(status: DeploymentStatus) -> impl IntoView {
 
 // ---------------------------------------------------------------- environment
 
+/// Variables at `path` (an app's, or a stack's); `saved` says what saving does.
 #[component]
-fn EnvTab(name: Memo<String>, #[prop(into)] deployed: Signal<bool>) -> impl IntoView {
+pub fn EnvTab(
+    #[prop(into)] path: Signal<String>,
+    #[prop(into)] saved: Signal<String>,
+) -> impl IntoView {
     let reveal = RwSignal::new(false);
     let vars = polled(None, move || {
-        let (name, reveal) = (name.get(), reveal.get());
-        async move { api::get::<Vec<EnvView>>(&format!("/api/apps/{name}/env?reveal={reveal}")).await }
+        let (path, reveal) = (path.get(), reveal.get());
+        async move { api::get::<Vec<EnvView>>(&format!("{path}?reveal={reveal}")).await }
     });
 
     // One modal for adding and editing a variable.
@@ -741,13 +899,7 @@ fn EnvTab(name: Memo<String>, #[prop(into)] deployed: Signal<bool>) -> impl Into
         }
         editor_open.set(true);
     };
-    let saved_message = move || {
-        if deployed.get_untracked() {
-            "Saved. The app restarts with the new values."
-        } else {
-            "Saved. It will be used from the first deploy."
-        }
-    };
+    let saved_message = move || saved.get_untracked();
     let save = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let patch = EnvPatch {
@@ -761,7 +913,7 @@ fn EnvTab(name: Memo<String>, #[prop(into)] deployed: Signal<bool>) -> impl Into
             .into(),
             unset: vec![],
         };
-        let path = format!("/api/apps/{}/env", name.get_untracked());
+        let path = path.get_untracked();
         run(
             saved_message(),
             async move { api::patch(&path, &patch).await },
@@ -772,7 +924,7 @@ fn EnvTab(name: Memo<String>, #[prop(into)] deployed: Signal<bool>) -> impl Into
         );
     };
     let remove = move |k: String| {
-        let path = format!("/api/apps/{}/env", name.get_untracked());
+        let path = path.get_untracked();
         let patch = EnvPatch {
             set: Default::default(),
             unset: vec![k.clone()],
@@ -817,7 +969,7 @@ fn EnvTab(name: Memo<String>, #[prop(into)] deployed: Signal<bool>) -> impl Into
             return toasts().err("No KEY=VALUE lines found");
         }
         let count = patch.set.len();
-        let path = format!("/api/apps/{}/env", name.get_untracked());
+        let path = path.get_untracked();
         run(
             format!("{count} variables saved"),
             async move { api::patch(&path, &patch).await },
@@ -927,7 +1079,18 @@ fn EnvTab(name: Memo<String>, #[prop(into)] deployed: Signal<bool>) -> impl Into
 // ---------------------------------------------------------------- volumes
 
 #[component]
-fn VolumesTab(name: Memo<String>) -> impl IntoView {
+fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) -> impl IntoView {
+    // Where the app mounts a volume, if it still declares it.
+    let mount = move |volume: &str| {
+        app.with(|a| {
+            a.as_ref()?
+                .spec
+                .volumes
+                .iter()
+                .find(|v| v.name == volume)
+                .map(|v| v.path.clone())
+        })
+    };
     let volumes = polled(Some(Duration::from_secs(30)), move || {
         let name = name.get();
         async move {
@@ -998,11 +1161,11 @@ fn VolumesTab(name: Memo<String>) -> impl IntoView {
             return;
         };
         replacing.set(true);
-        let path = format!("/api/apps/{}/volumes/{}/archive", v.app, v.name);
+        let path = format!("/api/apps/{}/volumes/{}/archive", v.app, v.volume);
         spawn_local(async move {
             match api::put_file(&path, &file).await {
                 Ok(()) => {
-                    toasts().ok(format!("{} replaced; the app is starting again", v.name));
+                    toasts().ok(format!("{} replaced; the app is starting again", v.volume));
                     replace_open.try_set(false);
                     volumes.reload();
                 }
@@ -1056,16 +1219,17 @@ fn VolumesTab(name: Memo<String>) -> impl IntoView {
                     </thead>
                     <tbody>
                         <For each=move || volumes.data.get().unwrap_or_default()
-                            key=|v| (v.name.clone(), v.path.clone(), v.size, v.last_backup)
+                            key=|v| (v.node.clone(), v.name.clone(), v.size, v.last_backup, v.declared)
                             let:v>
                             {
-                                let export = format!("/api/apps/{}/volumes/{}/archive", v.app, v.name);
-                                let fallback = format!("{}-{}.tar.gz", v.app, v.name);
+                                let export = format!("/api/apps/{}/volumes/{}/archive", v.app, v.volume);
+                                let fallback = format!("{}-{}.tar.gz", v.app, v.volume);
                                 let target = v.clone();
+                                let mounted = mount(&v.volume).filter(|_| v.declared);
                                 view! {
                                     <tr>
-                                        <td><code>{v.name.clone()}</code></td>
-                                        <td>{match v.path.clone() {
+                                        <td><code>{v.volume.clone()}</code></td>
+                                        <td>{match mounted {
                                             Some(p) => view! { <code>{p}</code> }.into_any(),
                                             None => view! { <span class="muted">"not used any more"</span> }.into_any(),
                                         }}</td>
@@ -1138,7 +1302,7 @@ fn VolumesTab(name: Memo<String>) -> impl IntoView {
         <Modal open=replace_open title="Replace volume contents">
             <p>
                 "The app is stopped, everything in "
-                <code>{move || replace_target.get().and_then(|v| v.path.or(Some(v.name))).unwrap_or_default()}</code>
+                <code>{move || replace_target.get().map(|v| mount(&v.volume).unwrap_or(v.volume)).unwrap_or_default()}</code>
                 " is replaced by the archive's files, then the app starts again. Download a copy first if you may need the current files."
             </p>
             <label class="field">
@@ -1190,6 +1354,9 @@ fn SettingsTab(
     let nodes = polled(None, || async {
         api::get::<Vec<NodeView>>("/api/nodes").await
     });
+    let apps = polled(None, || async {
+        api::get::<Vec<AppView>>("/api/apps").await
+    });
     let form = SpecForm::from_spec(&app.spec);
     let error = RwSignal::new(None::<String>);
     let name = app.spec.name.clone();
@@ -1220,7 +1387,8 @@ fn SettingsTab(
     };
     view! {
         <form class="card form" on:submit=submit>
-            <SpecFields form nodes=Signal::derive(move || nodes.data.get().unwrap_or_default()) editing=true/>
+            <SpecFields form nodes=Signal::derive(move || nodes.data.get().unwrap_or_default())
+                apps=Signal::derive(move || apps.data.get().unwrap_or_default()) editing=true/>
             <Show when=moving>
                 <div class="note">
                     <label class="check">

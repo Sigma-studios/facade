@@ -40,8 +40,9 @@ if ! command -v docker >/dev/null; then
     echo "installing Docker…"
     curl -fsSL https://get.docker.com | sh
 fi
-if ! command -v git >/dev/null; then
-    apt-get update -qq && apt-get install -y -qq git
+# git fetches repositories, over SSH for deploy keys.
+if ! command -v git >/dev/null || ! command -v ssh >/dev/null; then
+    apt-get update -qq && apt-get install -y -qq git openssh-client
 fi
 
 install -m 0755 "$binary" /usr/local/bin/facaded

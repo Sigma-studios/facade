@@ -2,7 +2,9 @@
 //! desired workloads, and dials data connections on request.
 
 mod build;
+mod maintenance;
 mod ports;
+mod queue;
 mod routes;
 mod runtime;
 mod stats;
@@ -15,16 +17,19 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use facade_core::proto::{
-    AgentEvent, AgentMsg, AgentRequest, AppState, CertBundle, Hello, JoinToken, NodeReport,
-    PROTOCOL_VERSION, ProxyRoute, ServerMsg, Workload,
+    AgentEvent, AgentMsg, AgentRequest, AppState, ApplyPhase, CertBundle, Cleanup, Hello,
+    JoinToken, NodeReport, PROTOCOL_VERSION, ProxyRoute, ServerMsg, StorageReport, Workload,
 };
+use futures_util::future::AbortHandle;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::framing::{JsonLines, write_json};
 use crate::tls;
+use queue::BuildQueue;
 pub use routes::IngressMode;
 use runtime::Runtime;
 pub use runtime::{planned_image, run_key};
@@ -82,6 +87,20 @@ pub struct Agent {
     proxies: Mutex<Vec<ProxyRoute>>,
     challenges: Mutex<std::collections::BTreeMap<String, String>>,
     link: routes::Link,
+    /// One build at a time; the others wait here.
+    queue: Arc<BuildQueue>,
+    /// Deployments still queued or building, which a cancel can stop.
+    cancellable: Mutex<HashMap<Uuid, Cancellable>>,
+    /// Latest storage report, and whether the server still has to get it.
+    storage: Mutex<(Option<StorageReport>, bool)>,
+    last_cleanup: Mutex<Option<Cleanup>>,
+}
+
+struct Cancellable {
+    app: String,
+    /// The workload's hash, marked as failed so healing does not build it again.
+    hash: String,
+    abort: AbortHandle,
 }
 
 impl Agent {
@@ -103,12 +122,21 @@ impl Agent {
             proxies: Default::default(),
             challenges: Default::default(),
             link,
+            queue: BuildQueue::new(1),
+            cancellable: Default::default(),
+            storage: Default::default(),
+            last_cleanup: Default::default(),
         }))
+    }
+
+    fn set_storage(&self, report: StorageReport) {
+        *self.storage.lock() = (Some(report), true);
     }
 
     pub async fn run(self: Arc<Self>) {
         // Apps stay reachable while the server is away.
         self.start_routing();
+        tokio::spawn(maintenance::run(self.clone()));
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = std::time::Instant::now();
@@ -152,7 +180,25 @@ impl Agent {
         });
         let reporter = tokio::spawn(self.clone().report_loop(tx.clone()));
         let healer = tokio::spawn(self.clone().heal_loop());
-        let _guard = AbortOnDrop(vec![writer, reporter, healer]);
+        // The build queue, now and whenever it changes.
+        let builds = tokio::spawn({
+            let tx = tx.clone();
+            let mut rx = self.queue.subscribe();
+            async move {
+                loop {
+                    let builds = rx.borrow_and_update().clone();
+                    let event = AgentEvent::Builds { builds };
+                    if tx.send(AgentMsg::Event { event }).await.is_err() {
+                        break;
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        self.storage.lock().1 = true;
+        let _guard = AbortOnDrop(vec![writer, reporter, healer, builds]);
 
         let mut lines = JsonLines::new(read);
         let mut connected = false;
@@ -201,7 +247,7 @@ impl Agent {
     }
 
     /// Requests answer quickly; long work (builds) runs in the background and
-    /// reports through events. Some requests answer with data.
+    /// reports through events.
     async fn handle(
         self: &Arc<Self>,
         req: AgentRequest,
@@ -218,21 +264,83 @@ impl Agent {
             AgentRequest::Apply {
                 workload,
                 deployment,
+                rebuild,
+                phase,
             } => {
-                self.workloads
-                    .lock()
-                    .insert(workload.spec.name.clone(), workload.clone());
-                tokio::spawn(self.clone().converge(workload, deployment));
+                let app = workload.spec.name.clone();
+                let hash = workload_hash(&workload);
+                let task: futures_util::future::BoxFuture<'static, ()> = match phase {
+                    // Only the image: what runs, and should run, stays as it is.
+                    ApplyPhase::Build => {
+                        Box::pin(self.clone().prepare(workload, deployment, rebuild))
+                    }
+                    ApplyPhase::All | ApplyPhase::Release => {
+                        self.workloads
+                            .lock()
+                            .insert(workload.spec.name.clone(), workload.clone());
+                        let pull = phase == ApplyPhase::All;
+                        Box::pin(self.clone().converge(workload, deployment, rebuild, pull))
+                    }
+                };
+                match deployment {
+                    Some(id) => {
+                        let (task, abort) = futures_util::future::abortable(task);
+                        self.cancellable
+                            .lock()
+                            .insert(id, Cancellable { app, hash, abort });
+                        tokio::spawn(task);
+                    }
+                    None => {
+                        tokio::spawn(task);
+                    }
+                }
             }
-            AgentRequest::Remove {
-                app,
-                delete_volumes,
-            } => {
+            AgentRequest::Cancel { deployment } => {
+                let Some(c) = self.cancellable.lock().remove(&deployment) else {
+                    // Finished, or past its build: the server sees which.
+                    return Ok(None);
+                };
+                c.abort.abort();
+                self.failed.lock().insert(c.app.clone(), c.hash);
+                self.emit(AgentEvent::DeployLog {
+                    deployment,
+                    line: "cancelled".into(),
+                });
+                self.emit(AgentEvent::DeployDone {
+                    deployment,
+                    error: Some("cancelled".into()),
+                    cancelled: true,
+                });
+                // The version that ran before keeps running.
+                let workload = self.workloads.lock().get(&c.app).cloned();
+                let state = match workload {
+                    Some(w) => self.runtime.app_stats(&[w]).await[0].state,
+                    None => AppState::Unknown,
+                };
+                self.emit(AgentEvent::AppState {
+                    app: c.app,
+                    state,
+                    message: Some("deployment cancelled".into()),
+                });
+            }
+            AgentRequest::Remove { app, volumes } => {
                 self.workloads.lock().remove(&app);
-                self.refresh_routes().await;
                 let lock = self.lock_for(&app);
                 let _held = lock.lock().await;
-                self.runtime.remove(&app, delete_volumes).await?;
+                self.runtime.remove(&app, volumes).await?;
+                self.refresh_routes().await;
+            }
+            AgentRequest::Prune { aggressive } => {
+                let agent = self.clone();
+                tokio::spawn(async move {
+                    maintenance::cleanup(&agent, aggressive).await;
+                    maintenance::refresh_report(&agent).await;
+                });
+            }
+            AgentRequest::RemoveVolume { name } => {
+                self.runtime.remove_volume(&name).await?;
+                let agent = self.clone();
+                tokio::spawn(async move { maintenance::refresh_report(&agent).await });
             }
             AgentRequest::Restart { app } => self.runtime.restart(&app).await?,
             AgentRequest::Ingress { certs, proxies } => {
@@ -271,11 +379,6 @@ impl Agent {
                 return Ok(Some(serde_json::to_value(self.listeners().await)?));
             }
             AgentRequest::Upgrade { sha256 } => self.upgrade(sha256).await?,
-            AgentRequest::Volumes => {
-                return Ok(Some(serde_json::to_value(
-                    self.runtime.list_volumes().await?,
-                )?));
-            }
             AgentRequest::VolumeExport {
                 tunnel,
                 app,
@@ -297,6 +400,7 @@ impl Agent {
                 tunnel,
                 app,
                 volume,
+                create,
             } => {
                 let stream = self.dial_data(tunnel).await?;
                 let agent = self.clone();
@@ -313,7 +417,7 @@ impl Agent {
                         let upload = (&mut stream).take(size);
                         agent
                             .runtime
-                            .import_volume(&app, &volume, upload, size)
+                            .import_volume(&app, &volume, create.as_ref(), upload, size)
                             .await
                     }
                     .await;
@@ -335,7 +439,8 @@ impl Agent {
         Ok(None)
     }
 
-    async fn converge(self: Arc<Self>, workload: Workload, deployment: Option<Uuid>) {
+    /// The build phase of a stack deployment: the image only.
+    async fn prepare(self: Arc<Self>, workload: Workload, deployment: Option<Uuid>, rebuild: bool) {
         let app = workload.spec.name.clone();
         let lock = self.lock_for(&app);
         let _held = lock.lock().await;
@@ -343,11 +448,54 @@ impl Agent {
             agent: self.clone(),
             deployment,
             app: app.clone(),
-            commit: Default::default(),
+            started: AtomicBool::new(false),
         };
-        let result = self.runtime.converge(&workload, &log).await;
+        let result = self.runtime.prepare(&workload, &log, rebuild).await;
+        log.build_done();
+        if let Err(e) = &result {
+            log.line(format!("error: {e:#}"));
+        }
+        // The running version is untouched.
+        let current = self.workloads.lock().get(&app).cloned();
+        let state = match current {
+            Some(w) => self.runtime.app_stats(&[w]).await[0].state,
+            None => AppState::Pending,
+        };
+        self.emit(AgentEvent::AppState {
+            app,
+            state,
+            message: None,
+        });
+        if let Some(deployment) = deployment {
+            self.emit(AgentEvent::BuildDone {
+                deployment,
+                error: result.err().map(|e| format!("{e:#}")),
+            });
+        }
+    }
+
+    /// `pull`: pull images again (an explicit deploy) rather than use the one the
+    /// build phase pulled.
+    async fn converge(
+        self: Arc<Self>,
+        workload: Workload,
+        deployment: Option<Uuid>,
+        rebuild: bool,
+        pull: bool,
+    ) {
+        let app = workload.spec.name.clone();
+        let lock = self.lock_for(&app);
+        let _held = lock.lock().await;
+        let log = DeployLog {
+            agent: self.clone(),
+            deployment,
+            app: app.clone(),
+            started: AtomicBool::new(false),
+        };
+        let result = self.runtime.converge(&workload, &log, rebuild, pull).await;
         // A new container listens on a new local port.
         self.refresh_routes().await;
+        log.build_done();
         let hash = workload_hash(&workload);
         match &result {
             Ok(_) => self.failed.lock().remove(&app),
@@ -365,11 +513,16 @@ impl Agent {
             state,
             message,
         });
+        if deployment.is_some() && result.is_ok() {
+            // New volumes show up without waiting for the periodic report.
+            let agent = self.clone();
+            tokio::spawn(async move { maintenance::refresh_report(&agent).await });
+        }
         if let Some(deployment) = deployment {
             self.emit(AgentEvent::DeployDone {
                 deployment,
                 error: result.err().map(|e| format!("{e:#}")),
-                commit: log.commit.lock().take(),
+                cancelled: false,
             });
         }
     }
@@ -392,7 +545,7 @@ impl Agent {
         }
         // One at a time: parallel builds would starve a small VPS.
         for workload in workloads {
-            self.clone().converge(workload, None).await;
+            self.clone().converge(workload, None, false, false).await;
         }
     }
 
@@ -409,7 +562,7 @@ impl Agent {
                     .get(&workload.spec.name)
                     .is_some_and(|h| *h == workload_hash(&workload));
                 if !known_bad {
-                    self.clone().converge(workload, None).await;
+                    self.clone().converge(workload, None, false, false).await;
                 }
             }
         }
@@ -421,10 +574,17 @@ impl Agent {
         loop {
             tick.tick().await;
             let workloads: Vec<Workload> = self.workloads.lock().values().cloned().collect();
+            let storage = {
+                let mut storage = self.storage.lock();
+                std::mem::take(&mut storage.1)
+                    .then(|| storage.0.clone())
+                    .flatten()
+            };
             let listeners = self.listeners().await;
             let report = NodeReport {
                 node: sampler.sample(),
                 apps: self.runtime.app_stats(&workloads).await,
+                storage,
                 listeners,
                 ingress_errors: self.link.errors(),
             };
@@ -559,21 +719,60 @@ pub struct DeployLog {
     agent: Arc<Agent>,
     deployment: Option<Uuid>,
     app: String,
-    /// The commit checked out, when the source is git and it was fetched.
-    commit: Mutex<Option<String>>,
+    started: AtomicBool,
 }
 
 impl DeployLog {
+    /// The deployment is out of the queue and being worked on.
+    pub fn begin(&self) {
+        if let Some(deployment) = self.deployment
+            && !self.started.swap(true, Ordering::Relaxed)
+        {
+            self.agent.emit(AgentEvent::DeployStarted { deployment });
+        }
+    }
+
+    /// Waits for the node's build slot, saying so if others are ahead.
+    pub async fn build_slot(&self, commit: Option<String>) -> queue::Slot {
+        let ahead = self.agent.queue.subscribe().borrow().len();
+        if ahead > 0 {
+            self.line(format!(
+                "waiting for {ahead} other build{} on this node",
+                if ahead == 1 { "" } else { "s" }
+            ));
+        }
+        let slot = self
+            .agent
+            .queue
+            .acquire(&self.app, self.deployment, commit)
+            .await;
+        self.begin();
+        slot
+    }
+
+    /// Past the build: from here on, cancelling would leave the app half-replaced.
+    pub fn build_done(&self) {
+        if let Some(deployment) = self.deployment {
+            self.agent.cancellable.lock().remove(&deployment);
+        }
+    }
+
+    pub fn commit(&self, sha: &str, title: &str) {
+        if let Some(deployment) = self.deployment {
+            self.agent.emit(AgentEvent::DeployCommit {
+                deployment,
+                commit: sha.to_string(),
+                title: title.to_string(),
+            });
+        }
+    }
+
     pub fn line(&self, line: impl Into<String>) {
         let line = line.into();
         tracing::debug!(app = %self.app, "{line}");
         if let Some(deployment) = self.deployment {
             self.agent.emit(AgentEvent::DeployLog { deployment, line });
         }
-    }
-
-    pub fn state(&self, state: AppState) {
-        self.state_with(state, None);
     }
 
     pub fn state_with(&self, state: AppState, message: Option<String>) {
@@ -584,12 +783,16 @@ impl DeployLog {
         });
     }
 
-    pub fn is_deployment(&self) -> bool {
-        self.deployment.is_some()
+    pub fn state(&self, state: AppState) {
+        self.agent.emit(AgentEvent::AppState {
+            app: self.app.clone(),
+            state,
+            message: None,
+        });
     }
 
-    pub fn set_commit(&self, commit: String) {
-        *self.commit.lock() = Some(commit);
+    pub fn is_deployment(&self) -> bool {
+        self.deployment.is_some()
     }
 }
 

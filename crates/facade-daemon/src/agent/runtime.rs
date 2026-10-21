@@ -6,39 +6,41 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::models::{
-    ContainerCreateBody, HostConfig, HostConfigLogConfig, Mount, MountType, NetworkCreateRequest,
-    PortBinding, RestartPolicy, RestartPolicyNameEnum, VolumeCreateRequest,
+    ContainerCreateBody, EndpointSettings, HealthConfig, HostConfig, HostConfigLogConfig, Mount,
+    MountType, NetworkConnectRequest, NetworkCreateRequest, NetworkDisconnectRequest,
+    NetworkingConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
     ListImagesOptions, ListVolumesOptions, LogsOptions, RemoveContainerOptions, RemoveImageOptions,
     RemoveVolumeOptions, RestartContainerOptions, StartContainerOptions, StatsOptions,
-    StopContainerOptions,
+    StopContainerOptions, WaitContainerOptions,
 };
-use facade_core::proto::{AppState, AppStats, CredentialKind, JoinToken, VolumeInfo, Workload};
+use facade_core::proto::{AppState, AppStats, JoinToken, VolumeUsage, Workload};
 use facade_core::{Build, Protocol, Source};
 use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::time::Duration;
+
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::DeployLog;
 use super::build;
 use super::volumes;
+use crate::gitauth::Access;
 use crate::lang;
 
 const LABEL_APP: &str = "facade.app";
 const LABEL_RUN: &str = "facade.run";
 const LABEL_NODE: &str = "facade.node";
 const LABEL_VOLUME: &str = "facade.volume";
-/// How long a deployment waits for another program to free its ports.
-const PORT_WAIT: Duration = Duration::from_secs(30 * 60);
+const LABEL_STACK: &str = "facade.stack";
 
 #[derive(Clone)]
 pub struct Runtime(Arc<Inner>);
@@ -59,42 +61,89 @@ fn network(app: &str) -> String {
     format!("facade-{app}")
 }
 
+/// A stack's network. The dot keeps it apart from app networks.
+fn stack_network(stack: &str) -> String {
+    format!("facade.{stack}")
+}
+
 fn image_repo(app: &str) -> String {
     format!("facade-{app}")
-}
-
-/// `_` cannot appear in app or volume names, so this never collides.
-fn volume_name(app: &str, volume: &str) -> String {
-    format!("facade-{app}_{volume}")
-}
-
-/// The image an app runs: its registry reference, or the tag its build gets
-/// (named after its source and revision, so it is reused until either changes).
-/// `None` for static sites.
-pub fn planned_image(w: &Workload) -> Option<String> {
-    match &w.spec.source {
-        Source::Image { image } => Some(facade_core::image_with_tag(image)),
-        Source::Git {
-            build: Build::Static { .. },
-            ..
-        } => None,
-        Source::Executable { .. } | Source::Git { .. } => Some(format!(
-            "{}:{}",
-            image_repo(&w.spec.name),
-            short_hash(&(&w.spec.source, w.revision))
-        )),
-    }
-}
-
-/// Fingerprint of everything a container is created from. A container whose
-/// `facade.run` label differs is replaced.
-pub fn run_key(w: &Workload, image: &str) -> String {
-    short_hash(&(w.run_identity(), image))
 }
 
 fn short_hash(value: &impl Serialize) -> String {
     let json = serde_json::to_vec(value).expect("serializable");
     hex::encode(&Sha256::digest(json)[..8])
+}
+
+/// Identifies the container a workload needs. Credentials and aliases are left
+/// out: they change without the container having to.
+pub fn run_key(w: &Workload, image: &str) -> String {
+    short_hash(&(&w.spec, &w.env, w.revision, &w.commit, image))
+}
+
+/// The image an app runs: its registry reference, or the tag its build gets
+/// (named after its source and commit, or a stack service's build context
+/// content), so a build is reused until either changes. `None` for static sites.
+pub fn planned_image(w: &Workload) -> Option<String> {
+    let key = match &w.spec.source {
+        Source::Image { image } => return Some(facade_core::image_with_tag(image)),
+        Source::Git {
+            build: Build::Static { .. },
+            ..
+        } => return None,
+        Source::Executable { .. } => short_hash(&w.spec.source),
+        Source::Git { .. } => match (&w.build_key, &w.commit) {
+            (Some(content), _) => short_hash(&(&w.spec.source, content)),
+            (None, Some(commit)) => short_hash(&(&w.spec.source, commit)),
+            (None, None) => short_hash(&(&w.spec.source, w.revision)),
+        },
+    };
+    Some(format!("{}:{key}", image_repo(&w.spec.name)))
+}
+
+/// How long a deployment waits for another program to free its ports.
+const PORT_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// The names an app answers to on its own network.
+fn aliases(w: &Workload) -> Vec<String> {
+    let mut names = vec![w.spec.name.clone()];
+    names.extend(w.aliases.iter().cloned());
+    names.dedup();
+    names
+}
+
+/// Built images kept besides the running one, for rollbacks.
+const KEEP_IMAGES: usize = 2;
+
+/// Longest a build may take before it is stopped.
+const BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+async fn within_build_time<T>(
+    build: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(BUILD_TIMEOUT, build)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "the build took longer than {} minutes and was stopped",
+                BUILD_TIMEOUT.as_secs() / 60
+            )
+        })?
+}
+
+/// A working directory removed when dropped, even when the build is cancelled.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn is_not_found(e: &bollard::errors::Error) -> bool {
@@ -119,7 +168,7 @@ fn is_not_modified(e: &bollard::errors::Error) -> bool {
 
 impl Runtime {
     pub async fn new(dir: PathBuf, token: JoinToken) -> anyhow::Result<Self> {
-        let docker = Docker::connect_with_local_defaults().context("connecting to Docker")?;
+        let docker = Docker::connect_with_defaults().context("connecting to Docker")?;
         docker
             .ping()
             .await
@@ -127,10 +176,16 @@ impl Runtime {
         for sub in ["static", "builds"] {
             std::fs::create_dir_all(dir.join(sub))?;
         }
+        // Left over by builds interrupted when the agent stopped.
+        if let Ok(entries) = std::fs::read_dir(dir.join("builds")) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
         Ok(Self(Arc::new(Inner { docker, dir, token })))
     }
 
-    fn docker(&self) -> &Docker {
+    pub fn docker(&self) -> &Docker {
         &self.0.docker
     }
 
@@ -138,22 +193,48 @@ impl Runtime {
         self.0.dir.join("static").join(app)
     }
 
-    /// Bring one app to its desired state.
-    pub async fn converge(&self, w: &Workload, log: &DeployLog) -> anyhow::Result<AppState> {
+    /// Bring one app to its desired state. `rebuild` builds again even when an
+    /// image of the commit exists.
+    /// The build phase of a stack deployment: build or pull the image only.
+    pub async fn prepare(
+        &self,
+        w: &Workload,
+        log: &DeployLog,
+        rebuild: bool,
+    ) -> anyhow::Result<()> {
+        if w.spec.is_static() {
+            bail!("static sites are not stack services");
+        }
+        let image = self.ensure_image(w, log, rebuild, true).await?;
+        log.line(format!("built {image}"));
+        Ok(())
+    }
+
+    pub async fn converge(
+        &self,
+        w: &Workload,
+        log: &DeployLog,
+        rebuild: bool,
+        pull: bool,
+    ) -> anyhow::Result<AppState> {
         let app = &w.spec.name;
         if w.spec.is_static() {
             if !w.spec.enabled {
+                log.begin();
                 return Ok(AppState::Stopped);
             }
             return self.converge_static(w, log).await;
         }
         if !w.spec.enabled {
+            log.begin();
             self.stop(app).await?;
             log.line("stopped");
             return Ok(AppState::Stopped);
         }
 
-        let image = self.ensure_image(w, log).await?;
+        let image = self.ensure_image(w, log, rebuild, pull).await?;
+        log.build_done();
+        log.begin();
         let run_key = run_key(w, &image);
         let name = container(app);
         match self
@@ -174,11 +255,15 @@ impl Runtime {
                     .and_then(|s| s.running)
                     .unwrap_or(false);
                 if same {
+                    self.ensure_aliases(w, &existing).await?;
                     if !running {
                         log.line("starting existing container");
                         self.start(&name).await?;
                     }
                     return Ok(AppState::Running);
+                }
+                if log.is_deployment() {
+                    self.release(w, &image, log).await?;
                 }
                 log.line("configuration changed, replacing container");
                 self.docker()
@@ -191,7 +276,11 @@ impl Runtime {
                     )
                     .await?;
             }
-            Err(e) if is_not_found(&e) => {}
+            Err(e) if is_not_found(&e) => {
+                if log.is_deployment() {
+                    self.release(w, &image, log).await?;
+                }
+            }
             Err(e) => return Err(e.into()),
         }
 
@@ -201,31 +290,39 @@ impl Runtime {
         self.create(w, &image, &run_key).await?;
         self.start(&name).await?;
         log.line(format!("started {name} from {image}"));
+        if log.is_deployment() {
+            self.wait_ready(&name, log).await?;
+        }
         if !matches!(w.spec.source, Source::Image { .. }) {
-            self.prune_images(app, &image).await;
+            self.prune_images(app, &image, KEEP_IMAGES).await;
         }
         Ok(AppState::Running)
     }
 
     /// The image to run: pulled for `Source::Image`, built otherwise. Builds are
-    /// tagged with a hash of the source and revision, so they are reused until either
-    /// changes.
-    async fn ensure_image(&self, w: &Workload, log: &DeployLog) -> anyhow::Result<String> {
+    /// tagged with a hash of the source and commit, so they are reused (on a
+    /// redeploy, a restart, a rollback) until either changes.
+    async fn ensure_image(
+        &self,
+        w: &Workload,
+        log: &DeployLog,
+        rebuild: bool,
+        pull: bool,
+    ) -> anyhow::Result<String> {
         match &w.spec.source {
             Source::Image { image } => {
+                log.begin();
                 let image = &facade_core::image_with_tag(image);
                 let present = self.docker().inspect_image(image).await.is_ok();
                 // An explicit deploy re-pulls, so moving tags like `latest` update.
-                if !present || log.is_deployment() {
+                if !present || (log.is_deployment() && pull) {
                     log.state(AppState::Building);
                     let registry = facade_core::image_registry(image);
-                    let credentials = w.credential(CredentialKind::Registry, &registry).map(|c| {
-                        DockerCredentials {
-                            username: Some(c.username.clone()),
-                            password: Some(c.secret.clone()),
-                            serveraddress: Some(registry.clone()),
-                            ..Default::default()
-                        }
+                    let credentials = w.registry(&registry).map(|r| DockerCredentials {
+                        username: Some(r.username.clone()),
+                        password: Some(r.secret.clone()),
+                        serveraddress: Some(registry.clone()),
+                        ..Default::default()
                     });
                     log.line(match &credentials {
                         Some(c) => format!(
@@ -257,10 +354,11 @@ impl Runtime {
                 sha256,
                 filename,
                 arch,
+                args,
             } => {
-                let tag = planned_image(w).expect("built sources have an image");
+                let tag = planned_image(w).expect("executables have an image");
                 let key = tag.rsplit(':').next().unwrap_or_default().to_string();
-                if self.docker().inspect_image(&tag).await.is_ok() {
+                if !rebuild && self.docker().inspect_image(&tag).await.is_ok() {
                     return Ok(tag);
                 }
                 if arch != std::env::consts::ARCH {
@@ -269,24 +367,27 @@ impl Runtime {
                         std::env::consts::ARCH
                     );
                 }
+                let _slot = log.build_slot(None).await;
                 log.state(AppState::Building);
-                let workdir = self
-                    .0
-                    .dir
-                    .join("builds")
-                    .join(format!("{}-{key}", w.spec.name));
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
-                tokio::fs::create_dir_all(&workdir).await?;
-                let result = async {
+                let workdir = Scratch::new(
+                    self.0
+                        .dir
+                        .join("builds")
+                        .join(format!("{}-{key}", w.spec.name)),
+                );
+                tokio::fs::create_dir_all(&workdir.0).await?;
+                within_build_time(async {
                     log.line(format!("downloading {filename}"));
-                    super::fetch_artifact(&self.0.token, sha256, &workdir.join("app")).await?;
-                    let dockerfile = workdir.join("Dockerfile");
-                    tokio::fs::write(&dockerfile, lang::executable::dockerfile(filename)).await?;
-                    build::docker_build(&w.spec.name, &tag, &dockerfile, &workdir, w, log).await
-                }
-                .await;
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
-                result?;
+                    super::fetch_artifact(&self.0.token, sha256, &workdir.0.join("app")).await?;
+                    let dockerfile = workdir.0.join("Dockerfile");
+                    tokio::fs::write(&dockerfile, lang::executable::dockerfile(filename, args))
+                        .await?;
+                    let options =
+                        build::BuildOptions::new(None, &w.registries, &workdir.0, rebuild)?;
+                    build::docker_build(&w.spec.name, &tag, &dockerfile, &workdir.0, &options, log)
+                        .await
+                })
+                .await?;
                 Ok(tag)
             }
             Source::Git {
@@ -294,42 +395,459 @@ impl Runtime {
                 branch,
                 build,
             } => {
+                // A stack service's image depends on its build context's content,
+                // so it survives commits that do not touch it.
                 let tag = planned_image(w).expect("built sources have an image");
                 let key = tag.rsplit(':').next().unwrap_or_default().to_string();
-                if self.docker().inspect_image(&tag).await.is_ok() {
+                if !rebuild && self.docker().inspect_image(&tag).await.is_ok() {
+                    if log.is_deployment() {
+                        log.line("this code was built before: reusing its image");
+                    }
                     return Ok(tag);
                 }
+                let _slot = log.build_slot(w.commit.clone()).await;
                 log.state(AppState::Building);
-                let workdir = self
-                    .0
-                    .dir
-                    .join("builds")
-                    .join(format!("{}-{key}", w.spec.name));
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
-                let result = async {
-                    build::git_checkout(repo, branch.as_deref(), &workdir, w, log).await?;
+                let builds = self.0.dir.join("builds");
+                let workdir = Scratch::new(builds.join(format!("{}-{key}", w.spec.name)));
+                let private = Scratch::new(builds.join(format!(".{}-{key}", w.spec.name)));
+                within_build_time(async {
+                    let _ = tokio::fs::remove_dir_all(&workdir.0).await;
+                    let access = Access::new(repo, w.git_auth.as_ref(), &self.git_dir())?;
+                    let (sha, title) = build::git_checkout(
+                        &access,
+                        branch.as_deref(),
+                        w.commit.as_deref(),
+                        &workdir.0,
+                        log,
+                    )
+                    .await?;
+                    log.commit(&sha, &title);
                     let (dockerfile, context) = match build {
                         Build::Dockerfile {
                             dockerfile,
                             context,
-                        } => (workdir.join(dockerfile), workdir.join(context)),
+                        } => (workdir.0.join(dockerfile), workdir.0.join(context)),
                         Build::Static { .. } => unreachable!("static sites have no image"),
                         generated => {
-                            let path = workdir.join(".facade.Dockerfile");
+                            let path = workdir.0.join(".facade.Dockerfile");
                             let contents = lang::generated_dockerfile(&w.spec.name, generated)
                                 .expect("every other build kind generates a Dockerfile");
                             tokio::fs::write(&path, contents).await?;
-                            (path, workdir.clone())
+                            (path, workdir.0.clone())
                         }
                     };
-                    build::docker_build(&w.spec.name, &tag, &dockerfile, &context, w, log).await
-                }
-                .await;
-                let _ = tokio::fs::remove_dir_all(&workdir).await;
-                result?;
+                    crate::tls::create_private_dir(&private.0)?;
+                    let options = build::BuildOptions::new(
+                        w.git_auth.as_ref(),
+                        &w.registries,
+                        &private.0,
+                        rebuild,
+                    )?;
+                    build::docker_build(&w.spec.name, &tag, &dockerfile, &context, &options, log)
+                        .await
+                })
+                .await?;
                 Ok(tag)
             }
         }
+    }
+
+    /// Waits until a container just started is ready: healthy when it has a health
+    /// check (its own or its image's), else still up after a few seconds.
+    async fn wait_ready(&self, name: &str, log: &DeployLog) -> anyhow::Result<()> {
+        let inspect = || async {
+            self.docker()
+                .inspect_container(name, None::<InspectContainerOptions>)
+                .await
+                .with_context(|| format!("inspecting {name}"))
+        };
+        let info = inspect().await?;
+        let check = info
+            .config
+            .as_ref()
+            .and_then(|c| c.healthcheck.clone())
+            .filter(|h| {
+                h.test
+                    .as_ref()
+                    .is_some_and(|t| t.first().is_some_and(|f| f != "NONE"))
+            });
+        let has_check = check.is_some()
+            || info
+                .state
+                .as_ref()
+                .and_then(|s| s.health.as_ref())
+                .is_some();
+        let secs = |ns: Option<i64>, default: u64| {
+            ns.filter(|n| *n > 0)
+                .map_or(default, |n| (n / 1_000_000_000) as u64)
+        };
+        let budget = match &check {
+            Some(h) => {
+                secs(h.start_period, 0)
+                    + (secs(h.interval, 30) + secs(h.timeout, 30))
+                        * (h.retries.unwrap_or(3).max(1) as u64 + 1)
+            }
+            // The image's own check, with Docker's defaults.
+            None if has_check => 300,
+            None => 3,
+        };
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(budget.min(900) + 5);
+        if has_check {
+            log.line("waiting for the health check to pass");
+        }
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let state = inspect().await?.state.unwrap_or_default();
+            let restarts = state.restarting == Some(true);
+            if state.running != Some(true) || restarts {
+                bail!(
+                    "the container stopped (exit code {}); its logs (facade logs) usually say why",
+                    state.exit_code.unwrap_or(0)
+                );
+            }
+            match state.health.as_ref().and_then(|h| h.status) {
+                Some(bollard::models::HealthStatusEnum::HEALTHY) => {
+                    log.line("healthy");
+                    return Ok(());
+                }
+                Some(bollard::models::HealthStatusEnum::UNHEALTHY) => {
+                    let last = state
+                        .health
+                        .and_then(|h| h.log)
+                        .and_then(|l| l.last().cloned())
+                        .and_then(|r| r.output)
+                        .unwrap_or_default();
+                    bail!("the health check failed: {}", last.trim());
+                }
+                _ if !has_check && tokio::time::Instant::now() >= deadline => return Ok(()),
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("the health check did not pass within {budget} seconds");
+            }
+        }
+    }
+
+    fn git_dir(&self) -> PathBuf {
+        self.0.dir.join("git")
+    }
+
+    /// Runs the release command in a one-off container of the new image, with the
+    /// app's environment, network and volumes. The deploy stops if it fails, and
+    /// the running version stays.
+    async fn release(&self, w: &Workload, image: &str, log: &DeployLog) -> anyhow::Result<()> {
+        let Some(command) = &w.spec.release_command else {
+            return Ok(());
+        };
+        let app = &w.spec.name;
+        let name = format!("{}-release", container(app));
+        log.line(format!("running release command: {command}"));
+        let _ = self
+            .docker()
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let mut body = self.container_body(w, image, "release").await?;
+        body.cmd = Some(vec!["sh".into(), "-c".into(), command.clone()]);
+        body.entrypoint = Some(vec![]);
+        body.healthcheck = None;
+        body.exposed_ports = None;
+        if let Some(host) = body.host_config.as_mut() {
+            host.port_bindings = None;
+            host.restart_policy = None;
+        }
+        self.docker()
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: Some(name.clone()),
+                    ..Default::default()
+                }),
+                body,
+            )
+            .await
+            .context("creating the release container")?;
+        let result = async {
+            self.connect_networks(w, &name).await?;
+            self.start(&name).await?;
+            let mut logs = self.docker().logs(
+                &name,
+                Some(LogsOptions {
+                    follow: true,
+                    stdout: true,
+                    stderr: true,
+                    ..Default::default()
+                }),
+            );
+            let mut partial = String::new();
+            while let Some(chunk) = logs.next().await {
+                partial.push_str(&String::from_utf8_lossy(&chunk?.into_bytes()));
+                while let Some(i) = partial.find('\n') {
+                    let line: String = partial.drain(..=i).collect();
+                    log.line(line.trim_end().to_string());
+                }
+            }
+            if !partial.is_empty() {
+                log.line(partial);
+            }
+            let mut wait = self
+                .docker()
+                .wait_container(&name, None::<WaitContainerOptions>);
+            let code = match wait.next().await {
+                Some(Ok(r)) => r.status_code,
+                // A non-zero exit comes back as an error carrying the code.
+                Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+                Some(Err(e)) => return Err(e.into()),
+                None => 0,
+            };
+            if code != 0 {
+                bail!(
+                    "the release command failed (exit code {code}); the running version was kept"
+                );
+            }
+            log.line("release command succeeded");
+            Ok(())
+        }
+        .await;
+        let _ = self
+            .docker()
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        result
+    }
+
+    /// The container for `w`: ports, limits, volumes, environment, and its private
+    /// network with the names it answers to.
+    async fn container_body(
+        &self,
+        w: &Workload,
+        image: &str,
+        run_key: &str,
+    ) -> anyhow::Result<ContainerCreateBody> {
+        let spec = &w.spec;
+        let app = &spec.name;
+        let mut exposed = Vec::new();
+        let mut bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+        if !spec.host_network {
+            if let Some(port) = spec.http_port {
+                // Loopback only, on a port Docker picks: the ingress reaches it through
+                // the agent, never directly.
+                let key = format!("{port}/tcp");
+                exposed.push(key.clone());
+                bindings.insert(
+                    key,
+                    Some(vec![PortBinding {
+                        host_ip: Some("127.0.0.1".into()),
+                        host_port: Some(String::new()),
+                    }]),
+                );
+            }
+            for map in &spec.ports {
+                let proto = match map.protocol {
+                    Protocol::Tcp => "tcp",
+                    Protocol::Udp => "udp",
+                };
+                for i in 0..map.count {
+                    let key = format!("{}/{proto}", map.container + i);
+                    exposed.push(key.clone());
+                    bindings.insert(
+                        key,
+                        Some(vec![PortBinding {
+                            host_ip: Some("0.0.0.0".into()),
+                            host_port: Some((map.host + i).to_string()),
+                        }]),
+                    );
+                }
+            }
+        }
+
+        let (network_mode, networking) = if spec.host_network {
+            ("host".to_string(), None)
+        } else {
+            self.ensure_network(app).await?;
+            let endpoint = EndpointSettings {
+                aliases: Some(aliases(w)),
+                ..Default::default()
+            };
+            (
+                network(app),
+                Some(NetworkingConfig {
+                    endpoints_config: Some(HashMap::from([(network(app), endpoint)])),
+                }),
+            )
+        };
+
+        let mut mounts = Vec::new();
+        for volume in &spec.volumes {
+            let name = self.ensure_volume(spec, volume).await?;
+            mounts.push(Mount {
+                target: Some(volume.path.clone()),
+                source: Some(name),
+                typ: Some(MountType::VOLUME),
+                ..Default::default()
+            });
+        }
+
+        let host_config = HostConfig {
+            port_bindings: Some(bindings),
+            network_mode: Some(network_mode),
+            restart_policy: Some(RestartPolicy {
+                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                maximum_retry_count: None,
+            }),
+            memory: spec.limits.memory_mb.map(|mb| (mb * 1024 * 1024) as i64),
+            nano_cpus: spec.limits.cpus.map(|c| (c * 1e9) as i64),
+            pids_limit: Some(4096),
+            security_opt: Some(vec!["no-new-privileges".into()]),
+            init: Some(true),
+            mounts: Some(mounts),
+            log_config: Some(HostConfigLogConfig {
+                typ: Some("json-file".into()),
+                config: Some(HashMap::from([
+                    ("max-size".to_string(), "10m".to_string()),
+                    ("max-file".to_string(), "3".to_string()),
+                ])),
+            }),
+            ..Default::default()
+        };
+
+        let second = 1_000_000_000i64;
+        let healthcheck = spec.healthcheck.as_ref().map(|h| HealthConfig {
+            test: Some(h.test.clone()),
+            interval: Some(i64::from(h.interval_secs) * second),
+            timeout: Some(i64::from(h.timeout_secs) * second),
+            retries: Some(i64::from(h.retries)),
+            start_period: Some(i64::from(h.start_period_secs) * second),
+            ..Default::default()
+        });
+        Ok(ContainerCreateBody {
+            image: Some(image.to_string()),
+            healthcheck,
+            env: Some(w.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
+            cmd: (!spec.command.is_empty()).then(|| spec.command.clone()),
+            exposed_ports: Some(exposed),
+            labels: Some(HashMap::from([
+                (LABEL_APP.to_string(), app.clone()),
+                (LABEL_RUN.to_string(), run_key.to_string()),
+                (LABEL_NODE.to_string(), self.0.token.node.clone()),
+            ])),
+            host_config: Some(host_config),
+            networking_config: networking,
+            ..Default::default()
+        })
+    }
+
+    async fn create(&self, w: &Workload, image: &str, run_key: &str) -> anyhow::Result<()> {
+        let app = &w.spec.name;
+        let body = self.container_body(w, image, run_key).await?;
+        self.docker()
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: Some(container(app)),
+                    ..Default::default()
+                }),
+                body,
+            )
+            .await
+            .with_context(|| format!("creating container for {app}"))?;
+        self.connect_networks(w, &container(app)).await
+    }
+
+    /// Joins its stack's network, where it answers to its service name, and the
+    /// private networks of the apps `w` links to, where they answer to their link
+    /// names.
+    async fn connect_networks(&self, w: &Workload, container_name: &str) -> anyhow::Result<()> {
+        if let Some(stack) = &w.spec.stack
+            && !w.spec.host_network
+        {
+            let net = stack_network(&stack.stack);
+            self.ensure_named_network(&net, &stack.stack).await?;
+            self.docker()
+                .connect_network(
+                    &net,
+                    NetworkConnectRequest {
+                        container: container_name.to_string(),
+                        endpoint_config: Some(EndpointSettings {
+                            aliases: Some(vec![stack.host.clone()]),
+                            ..Default::default()
+                        }),
+                    },
+                )
+                .await
+                .with_context(|| format!("joining stack {}'s network", stack.stack))?;
+        }
+        for link in &w.spec.links {
+            self.ensure_network(&link.app).await?;
+            self.docker()
+                .connect_network(
+                    &network(&link.app),
+                    NetworkConnectRequest {
+                        container: container_name.to_string(),
+                        endpoint_config: Some(EndpointSettings::default()),
+                    },
+                )
+                .await
+                .with_context(|| format!("joining {}'s network", link.app))?;
+        }
+        Ok(())
+    }
+
+    /// Apps linking under a new name change the aliases of a running container
+    /// without restarting it.
+    async fn ensure_aliases(
+        &self,
+        w: &Workload,
+        existing: &bollard::models::ContainerInspectResponse,
+    ) -> anyhow::Result<()> {
+        if w.spec.host_network {
+            return Ok(());
+        }
+        let net = network(&w.spec.name);
+        let current: Vec<String> = existing
+            .network_settings
+            .as_ref()
+            .and_then(|n| n.networks.as_ref())
+            .and_then(|n| n.get(&net))
+            .and_then(|e| e.aliases.clone())
+            .unwrap_or_default();
+        let wanted = aliases(w);
+        if wanted.iter().all(|a| current.contains(a)) {
+            return Ok(());
+        }
+        let name = container(&w.spec.name);
+        self.docker()
+            .disconnect_network(
+                &net,
+                NetworkDisconnectRequest {
+                    container: name.clone(),
+                    force: Some(true),
+                },
+            )
+            .await?;
+        self.docker()
+            .connect_network(
+                &net,
+                NetworkConnectRequest {
+                    container: name,
+                    endpoint_config: Some(EndpointSettings {
+                        aliases: Some(wanted),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     /// Waits until no other program holds the ports the app takes, so a service
@@ -393,45 +911,18 @@ impl Runtime {
         }
     }
 
-    /// Creates the app's volumes that do not exist yet.
-    async fn ensure_volumes(&self, w: &Workload) -> anyhow::Result<Vec<Mount>> {
-        let mut mounts = Vec::new();
-        for volume in &w.spec.volumes {
-            let name = self.ensure_volume(&w.spec.name, &volume.name).await?;
-            mounts.push(Mount {
-                target: Some(volume.path.clone()),
-                source: Some(name),
-                typ: Some(MountType::VOLUME),
-                ..Default::default()
-            });
+    /// The directory holding a facade volume's files on this machine.
+    async fn volume_dir(&self, name: &str) -> anyhow::Result<PathBuf> {
+        let info = match self.docker().inspect_volume(name).await {
+            Ok(info) => info,
+            Err(e) if is_not_found(&e) => {
+                bail!("there is no volume {name} on this node yet: deploy its app once first")
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if info.labels.get(LABEL_NODE) != Some(&self.0.token.node) {
+            bail!("{name} is not a facade volume of this node");
         }
-        Ok(mounts)
-    }
-
-    async fn ensure_volume(&self, app: &str, volume: &str) -> anyhow::Result<String> {
-        let name = volume_name(app, volume);
-        if self.docker().inspect_volume(&name).await.is_ok() {
-            return Ok(name);
-        }
-        self.docker()
-            .create_volume(VolumeCreateRequest {
-                name: Some(name.clone()),
-                labels: Some(HashMap::from([
-                    (LABEL_APP.to_string(), app.to_string()),
-                    (LABEL_VOLUME.to_string(), volume.to_string()),
-                    (LABEL_NODE.to_string(), self.0.token.node.clone()),
-                ])),
-                ..Default::default()
-            })
-            .await
-            .with_context(|| format!("creating volume {name}"))?;
-        Ok(name)
-    }
-
-    /// The directory holding a volume's files on this machine.
-    async fn volume_dir(&self, app: &str, volume: &str) -> anyhow::Result<PathBuf> {
-        let name = self.ensure_volume(app, volume).await?;
-        let info = self.docker().inspect_volume(&name).await?;
         let dir = PathBuf::from(info.mountpoint);
         if !dir.is_dir() {
             bail!(
@@ -440,40 +931,6 @@ impl Runtime {
             );
         }
         Ok(dir)
-    }
-
-    /// Every facade volume of this node, with its size.
-    pub async fn list_volumes(&self) -> anyhow::Result<Vec<VolumeInfo>> {
-        let filters = HashMap::from([(
-            "label".to_string(),
-            vec![format!("{LABEL_NODE}={}", self.0.token.node)],
-        )]);
-        let list = self
-            .docker()
-            .list_volumes(Some(ListVolumesOptions {
-                filters: Some(filters),
-            }))
-            .await?;
-        let mut out = Vec::new();
-        for v in list.volumes.unwrap_or_default() {
-            let (Some(app), Some(name)) = (v.labels.get(LABEL_APP), v.labels.get(LABEL_VOLUME))
-            else {
-                continue;
-            };
-            let dir = PathBuf::from(&v.mountpoint);
-            let size =
-                tokio::task::spawn_blocking(move || dir.is_dir().then(|| volumes::size(&dir)))
-                    .await
-                    .ok()
-                    .flatten();
-            out.push(VolumeInfo {
-                app: app.clone(),
-                name: name.clone(),
-                size,
-            });
-        }
-        out.sort_by(|a, b| (&a.app, &a.name).cmp(&(&b.app, &b.name)));
-        Ok(out)
     }
 
     /// Writes a gzipped tar of the volume to `out`. A running app is paused while
@@ -485,7 +942,7 @@ impl Runtime {
         volume: &str,
         mut out: W,
     ) -> anyhow::Result<()> {
-        let dir = self.volume_dir(app, volume).await?;
+        let dir = self.volume_dir(volume).await?;
         let tmp = self.scratch_file("export");
         let name = container(app);
         let running = self.is_running(&name).await;
@@ -518,10 +975,33 @@ impl Runtime {
         &self,
         app: &str,
         volume: &str,
+        create: Option<&facade_core::proto::NewVolume>,
         mut input: R,
         size: u64,
     ) -> anyhow::Result<()> {
-        let dir = self.volume_dir(app, volume).await?;
+        // An import may come before the app's first deploy: create the volume
+        // with the labels its deploy would give it.
+        if let Some(new) = create
+            && self.docker().inspect_volume(volume).await.is_err()
+        {
+            let mut labels = HashMap::from([
+                (LABEL_APP.to_string(), app.to_string()),
+                (LABEL_NODE.to_string(), self.0.token.node.clone()),
+                (LABEL_VOLUME.to_string(), new.name.clone()),
+            ]);
+            if let Some(stack) = &new.stack {
+                labels.insert(LABEL_STACK.to_string(), stack.clone());
+            }
+            self.docker()
+                .create_volume(VolumeCreateRequest {
+                    name: Some(volume.to_string()),
+                    labels: Some(labels),
+                    ..Default::default()
+                })
+                .await
+                .with_context(|| format!("creating volume {volume}"))?;
+        }
+        let dir = self.volume_dir(volume).await?;
         let tmp = self.scratch_file("import");
         let result = async {
             let mut file = tokio::fs::File::create(&tmp).await?;
@@ -606,116 +1086,88 @@ impl Runtime {
         Ok((by_container, by_port))
     }
 
-    async fn create(&self, w: &Workload, image: &str, run_key: &str) -> anyhow::Result<()> {
-        let spec = &w.spec;
-        let app = &spec.name;
-        let mut exposed = Vec::new();
-        let mut bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-        if !spec.host_network {
-            if let Some(port) = spec.http_port {
-                // Loopback only, on a port Docker picks: the ingress reaches it through
-                // the agent, never directly.
-                let key = format!("{port}/tcp");
-                exposed.push(key.clone());
-                bindings.insert(
-                    key,
-                    Some(vec![PortBinding {
-                        host_ip: Some("127.0.0.1".into()),
-                        host_port: Some(String::new()),
-                    }]),
-                );
-            }
-            for map in &spec.ports {
-                let proto = match map.protocol {
-                    Protocol::Tcp => "tcp",
-                    Protocol::Udp => "udp",
-                };
-                for i in 0..map.count {
-                    let key = format!("{}/{proto}", map.container + i);
-                    exposed.push(key.clone());
-                    bindings.insert(
-                        key,
-                        Some(vec![PortBinding {
-                            host_ip: Some("0.0.0.0".into()),
-                            host_port: Some((map.host + i).to_string()),
-                        }]),
-                    );
-                }
-            }
-        }
-
-        let network_mode = if spec.host_network {
-            "host".to_string()
-        } else {
-            self.ensure_network(app).await?;
-            network(app)
-        };
-        let mounts = self.ensure_volumes(w).await?;
-
-        let host_config = HostConfig {
-            port_bindings: Some(bindings),
-            network_mode: Some(network_mode),
-            mounts: (!mounts.is_empty()).then_some(mounts),
-            restart_policy: Some(RestartPolicy {
-                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-                maximum_retry_count: None,
-            }),
-            memory: spec.limits.memory_mb.map(|mb| (mb * 1024 * 1024) as i64),
-            nano_cpus: spec.limits.cpus.map(|c| (c * 1e9) as i64),
-            pids_limit: Some(4096),
-            security_opt: Some(vec!["no-new-privileges".into()]),
-            init: Some(true),
-            log_config: Some(HostConfigLogConfig {
-                typ: Some("json-file".into()),
-                config: Some(HashMap::from([
-                    ("max-size".to_string(), "10m".to_string()),
-                    ("max-file".to_string(), "3".to_string()),
-                ])),
-            }),
-            ..Default::default()
-        };
-
-        let body = ContainerCreateBody {
-            image: Some(image.to_string()),
-            cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
-            env: Some(w.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
-            exposed_ports: Some(exposed),
-            labels: Some(HashMap::from([
-                (LABEL_APP.to_string(), app.clone()),
-                (LABEL_RUN.to_string(), run_key.to_string()),
+    /// The Docker volume for one of the app's volumes, created if needed.
+    async fn ensure_volume(
+        &self,
+        spec: &facade_core::AppSpec,
+        volume: &facade_core::Volume,
+    ) -> anyhow::Result<String> {
+        let name = spec.volume_name(volume);
+        if self.docker().inspect_volume(&name).await.is_err() {
+            let mut labels = HashMap::from([
+                (LABEL_APP.to_string(), spec.name.clone()),
                 (LABEL_NODE.to_string(), self.0.token.node.clone()),
-            ])),
-            host_config: Some(host_config),
-            ..Default::default()
-        };
-        self.docker()
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: Some(container(app)),
+                (LABEL_VOLUME.to_string(), volume.name.clone()),
+            ]);
+            if let Some(stack) = &spec.stack {
+                labels.insert(LABEL_STACK.to_string(), stack.stack.clone());
+            }
+            self.docker()
+                .create_volume(VolumeCreateRequest {
+                    name: Some(name.clone()),
+                    labels: Some(labels),
                     ..Default::default()
-                }),
-                body,
-            )
-            .await
-            .with_context(|| format!("creating container for {app}"))?;
-        Ok(())
+                })
+                .await
+                .with_context(|| format!("creating volume {name}"))?;
+        }
+        Ok(name)
     }
 
-    /// A bridge network per app, so apps cannot reach each other's containers.
+    /// The network a stack's services share.
+    async fn ensure_named_network(&self, name: &str, stack: &str) -> anyhow::Result<()> {
+        if self.docker().inspect_network(name, None).await.is_ok() {
+            return Ok(());
+        }
+        let created = self
+            .docker()
+            .create_network(NetworkCreateRequest {
+                name: name.to_string(),
+                driver: Some("bridge".into()),
+                labels: Some(HashMap::from([(
+                    LABEL_STACK.to_string(),
+                    stack.to_string(),
+                )])),
+                ..Default::default()
+            })
+            .await;
+        match created {
+            Ok(_) => Ok(()),
+            Err(_) if self.docker().inspect_network(name, None).await.is_ok() => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// A bridge network per app, so apps cannot reach each other's containers
+    /// unless they link to them.
     async fn ensure_network(&self, app: &str) -> anyhow::Result<()> {
         let name = network(app);
         if self.docker().inspect_network(&name, None).await.is_ok() {
             return Ok(());
         }
-        self.docker()
+        let created = self
+            .docker()
             .create_network(NetworkCreateRequest {
                 name,
                 driver: Some("bridge".into()),
                 labels: Some(HashMap::from([(LABEL_APP.to_string(), app.to_string())])),
                 ..Default::default()
             })
-            .await?;
-        Ok(())
+            .await;
+        match created {
+            Ok(_) => Ok(()),
+            // Created meanwhile by a linked app's convergence.
+            Err(_)
+                if self
+                    .docker()
+                    .inspect_network(&network(app), None)
+                    .await
+                    .is_ok() =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn start(&self, name: &str) -> anyhow::Result<()> {
@@ -764,53 +1216,138 @@ impl Runtime {
             .with_context(|| format!("restarting {app}"))
     }
 
-    /// Removes the app's container, network, images and static files. Its volumes
-    /// stay unless `delete_volumes`: data is only ever deleted on purpose.
-    pub async fn remove(&self, app: &str, delete_volumes: bool) -> anyhow::Result<()> {
-        match self
-            .docker()
-            .remove_container(
-                &container(app),
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(e) if is_not_found(&e) => {}
-            Err(e) => return Err(e.into()),
+    /// Removes the app's container, network and images; its volumes too when
+    /// `volumes` is set (otherwise its data stays for a later app of that name).
+    pub async fn remove(&self, app: &str, volumes: bool) -> anyhow::Result<()> {
+        for name in [container(app), format!("{}-release", container(app))] {
+            match self
+                .docker()
+                .remove_container(
+                    &name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
-        match self.docker().remove_network(&network(app)).await {
-            Ok(()) => {}
-            Err(e) if is_not_found(&e) => {}
-            Err(e) => tracing::warn!("removing network for {app}: {e}"),
+        let mut networks = vec![network(app)];
+        // A stack's network goes with its last service.
+        if let Some((stack, _)) = app.split_once('.') {
+            networks.push(stack_network(stack));
         }
-        self.prune_images(app, "").await;
+        for net in networks {
+            match self.docker().remove_network(&net).await {
+                Ok(()) => {}
+                Err(e) if is_not_found(&e) => {}
+                // Containers are still attached; it goes with the last of them.
+                Err(e) => tracing::debug!("removing network {net}: {e}"),
+            }
+        }
+        self.prune_images(app, "", 0).await;
         let dir = self.static_dir(app);
         if dir.exists() {
             tokio::fs::remove_dir_all(dir).await?;
         }
-        if delete_volumes {
-            for volume in self.list_volumes().await? {
+        if volumes {
+            for volume in self.volumes().await? {
                 if volume.app == app {
-                    let name = volume_name(app, &volume.name);
-                    self.docker()
-                        .remove_volume(&name, Some(RemoveVolumeOptions { force: true }))
-                        .await
-                        .with_context(|| format!("deleting volume {name}"))?;
-                    tracing::info!("deleted volume {name}");
+                    self.remove_volume(&volume.name).await?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Removes built images of `app` other than `keep`.
-    async fn prune_images(&self, app: &str, keep: &str) {
+    /// facade volumes of this node, with whether a container uses them.
+    pub async fn volumes(&self) -> anyhow::Result<Vec<VolumeUsage>> {
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![format!("{LABEL_NODE}={}", self.0.token.node)],
+        )]);
+        let list = self
+            .docker()
+            .list_volumes(Some(ListVolumesOptions {
+                filters: Some(filters),
+            }))
+            .await?;
+        let containers = self
+            .docker()
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                ..Default::default()
+            }))
+            .await?;
+        let used: Vec<String> = containers
+            .iter()
+            .flat_map(|c| c.mounts.iter().flatten())
+            .filter_map(|m| m.name.clone())
+            .collect();
+        let volumes: Vec<(VolumeUsage, PathBuf)> = list
+            .volumes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| {
+                let dir = PathBuf::from(&v.mountpoint);
+                Some(VolumeUsage {
+                    app: v
+                        .labels
+                        .get(LABEL_STACK)
+                        .or(v.labels.get(LABEL_APP))?
+                        .clone(),
+                    volume: v.labels.get(LABEL_VOLUME)?.clone(),
+                    in_use: used.contains(&v.name),
+                    name: v.name,
+                    // Measured below, off the async threads.
+                    size: dir.is_dir().then_some(0),
+                })
+                .map(|u| (u, dir))
+            })
+            .collect::<Vec<_>>();
+        let mut volumes: Vec<VolumeUsage> = tokio::task::spawn_blocking(move || {
+            volumes
+                .into_iter()
+                .map(|(mut u, dir)| {
+                    if u.size.is_some() {
+                        u.size = Some(volumes::size(&dir));
+                    }
+                    u
+                })
+                .collect()
+        })
+        .await?;
+        volumes.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(volumes)
+    }
+
+    /// Deletes a facade volume of this node.
+    pub async fn remove_volume(&self, name: &str) -> anyhow::Result<()> {
+        let volume = self
+            .docker()
+            .inspect_volume(name)
+            .await
+            .with_context(|| format!("no volume {name} on this node"))?;
+        if volume.labels.get(LABEL_NODE) != Some(&self.0.token.node) {
+            bail!("{name} is not a facade volume of this node");
+        }
+        self.docker()
+            .remove_volume(name, None::<RemoveVolumeOptions>)
+            .await
+            .with_context(|| format!("deleting {name} (is a container still using it?)"))?;
+        tracing::info!("deleted volume {name}");
+        Ok(())
+    }
+
+    /// Removes built images of `app` other than `keep` and the `spare` most recent
+    /// others, kept for quick rollbacks.
+    pub async fn prune_images(&self, app: &str, keep: &str, spare: usize) {
         let filters = HashMap::from([("reference".to_string(), vec![image_repo(app)])]);
-        let Ok(images) = self
+        let Ok(mut images) = self
             .docker()
             .list_images(Some(ListImagesOptions {
                 filters: Some(filters),
@@ -820,16 +1357,46 @@ impl Runtime {
         else {
             return;
         };
+        images.sort_by_key(|i| std::cmp::Reverse(i.created));
+        let mut spared = 0;
         for image in images {
+            if image.repo_tags.iter().any(|t| t == keep) {
+                continue;
+            }
+            if spared < spare {
+                spared += 1;
+                continue;
+            }
             for tag in image.repo_tags {
-                if tag != keep {
-                    let _ = self
-                        .docker()
-                        .remove_image(&tag, None::<RemoveImageOptions>, None)
-                        .await;
-                }
+                let _ = self
+                    .docker()
+                    .remove_image(&tag, None::<RemoveImageOptions>, None)
+                    .await;
             }
         }
+    }
+
+    /// The image each facade container of this node runs, by app.
+    pub async fn running_images(&self) -> HashMap<String, String> {
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![format!("{LABEL_NODE}={}", self.0.token.node)],
+        )]);
+        let Ok(containers) = self
+            .docker()
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+        else {
+            return HashMap::new();
+        };
+        containers
+            .into_iter()
+            .filter_map(|c| Some((c.labels?.get(LABEL_APP)?.clone(), c.image?)))
+            .collect()
     }
 
     /// Apps with a managed container or static directory on this node.
@@ -897,23 +1464,43 @@ impl Runtime {
             bail!("static sites come from git");
         };
         let dir = self.static_dir(&w.spec.name);
-        let key = short_hash(&(&w.spec.source, w.revision));
+        let key = match &w.commit {
+            Some(commit) => short_hash(&(&w.spec.source, commit)),
+            None => short_hash(&(&w.spec.source, w.revision)),
+        };
         let marker = dir.join(".facade-key");
         if tokio::fs::read_to_string(&marker).await.ok().as_deref() == Some(key.as_str()) {
+            log.begin();
             return Ok(AppState::Running);
         }
+        let _slot = log.build_slot(w.commit.clone()).await;
         log.state(AppState::Building);
-        let staging = self
-            .0
-            .dir
-            .join("static")
-            .join(format!(".{}-{key}", w.spec.name));
-        let _ = tokio::fs::remove_dir_all(&staging).await;
-        build::git_checkout(repo, branch.as_deref(), &staging, w, log).await?;
-        let _ = tokio::fs::remove_dir_all(staging.join(".git")).await;
-        tokio::fs::write(staging.join(".facade-key"), &key).await?;
+        let staging = Scratch::new(
+            self.0
+                .dir
+                .join("static")
+                .join(format!(".{}-{key}", w.spec.name)),
+        );
+        within_build_time(async {
+            let _ = tokio::fs::remove_dir_all(&staging.0).await;
+            let access = Access::new(repo, w.git_auth.as_ref(), &self.git_dir())?;
+            let (sha, title) = build::git_checkout(
+                &access,
+                branch.as_deref(),
+                w.commit.as_deref(),
+                &staging.0,
+                log,
+            )
+            .await?;
+            log.commit(&sha, &title);
+            Ok(())
+        })
+        .await?;
+        log.build_done();
+        let _ = tokio::fs::remove_dir_all(staging.0.join(".git")).await;
+        tokio::fs::write(staging.0.join(".facade-key"), &key).await?;
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::rename(&staging, &dir).await?;
+        tokio::fs::rename(&staging.0, &dir).await?;
         log.line("static site updated");
         Ok(AppState::Running)
     }

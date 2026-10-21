@@ -76,7 +76,7 @@ impl Detector for Cargo {
                         },
                         http_port,
                         env,
-                        args: vec![],
+                        command: vec![],
                         notes: vec![],
                     },
                 ));
@@ -232,7 +232,9 @@ fn read_package(dir: &Path) -> Option<Package> {
 }
 
 /// Multi-stage build of one cargo binary, with the registry and target directory in
-/// BuildKit cache mounts so redeploys only rebuild what changed.
+/// BuildKit cache mounts so redeploys only rebuild what changed. Git dependencies
+/// are fetched with the app's git credential (handed over as build secrets), so
+/// private ones work when the credential covers them.
 pub fn dockerfile(
     app: &str,
     package: Option<&str>,
@@ -253,17 +255,22 @@ pub fn dockerfile(
     }
     format!(
         r#"FROM docker.io/library/rust:1-slim-bookworm AS build
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev git openssh-client && rm -rf /var/lib/apt/lists/*
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=facade-cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=facade-cargo-git \
     --mount=type=cache,target=/src/target,id=facade-{app}-target \
+    --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
+    --mount=type=secret,id=known_hosts,target=/root/.ssh/known_hosts \
+    --mount=type=ssh \
     cargo build --release{args} && cp target/release/{bin} /facade-app
 
 FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 tzdata && rm -rf /var/lib/apt/lists/*
 COPY --from=build /facade-app /usr/local/bin/{bin}
-ENTRYPOINT ["/usr/local/bin/{bin}"]
+CMD ["/usr/local/bin/{bin}"]
 "#
     )
 }

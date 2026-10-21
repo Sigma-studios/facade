@@ -1,5 +1,6 @@
 //! `POST /api/inspect`: clone a repository and say what could be deployed from it.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,63 +19,80 @@ pub async fn inspect(
     user: User,
     Json(req): Json<InspectRequest>,
 ) -> Result<Json<InspectReport>, ApiError> {
-    let repo = req.repo.trim().to_string();
-    if repo.is_empty() || repo.starts_with('-') {
-        return Err(ApiError::bad_request("enter a git repository URL"));
-    }
-    let branch = req.branch.filter(|b| !b.trim().is_empty());
-    if branch.as_deref().is_some_and(|b| b.starts_with('-')) {
-        return Err(ApiError::bad_request("invalid branch"));
-    }
     let dir = server
         .cfg
         .data_dir
         .join("inspect")
         .join(uuid::Uuid::new_v4().to_string());
-    // The caller's own logins: a member never clones with someone else's.
-    let git_env = crate::gitauth::git_env(&repo, &server.credentials(user.login_owner())?);
-    let result = scan(&repo, branch.as_deref(), &dir, git_env).await;
+    let result = async {
+        // The caller's own credentials: a member never clones with someone else's.
+        let checkout = checkout(
+            &server,
+            user.login_owner(),
+            &req.repo,
+            req.branch.as_deref(),
+            &dir,
+        )
+        .await?;
+        let root = dir.clone();
+        let (candidates, compose_files) = tokio::task::spawn_blocking(move || {
+            (lang::detect_all(&root), super::compose::find(&root))
+        })
+        .await?;
+        Ok::<_, anyhow::Error>(InspectReport {
+            commit: checkout.commit,
+            candidates,
+            credential: checkout.credential,
+            compose_files,
+        })
+    }
+    .await;
     let _ = tokio::fs::remove_dir_all(&dir).await;
     result
         .map(Json)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))
 }
 
-async fn scan(
+pub struct Checkout {
+    /// Short hash and subject.
+    pub commit: String,
+    /// Name of the git credential used, if any.
+    pub credential: Option<String>,
+}
+
+/// A shallow clone of `repo` into `dir`, with the credential covering it.
+/// `owner`: whose credentials may fetch it (a user id, or the admins').
+pub async fn checkout(
+    server: &Server,
+    owner: i64,
     repo: &str,
     branch: Option<&str>,
-    dir: &std::path::Path,
-    git_env: Vec<(String, String)>,
-) -> anyhow::Result<InspectReport> {
+    dir: &Path,
+) -> anyhow::Result<Checkout> {
+    let repo = repo.trim().to_string();
+    if repo.is_empty() || repo.starts_with('-') {
+        bail!("enter a git repository URL");
+    }
+    if facade_core::git::has_embedded_credentials(&repo) {
+        bail!(
+            "do not put credentials in the URL: add a git credential instead (Settings → Git access)"
+        );
+    }
+    let branch = branch.map(str::trim).filter(|b| !b.is_empty());
+    if branch.is_some_and(|b| b.starts_with('-')) {
+        bail!("invalid branch");
+    }
     tokio::fs::create_dir_all(dir.parent().expect("has parent")).await?;
-    let mut clone = Command::new("git");
+    let (access, credential) = super::git::access(server, owner, &repo)?;
+    let mut clone = access.git();
     clone.args(["clone", "--depth", "1", "--single-branch"]);
     if let Some(branch) = branch {
         clone.args(["--branch", branch]);
     }
-    clone
-        .arg("--")
-        .arg(repo)
-        .arg(dir)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .envs(git_env)
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(90), clone.output())
+    clone.arg("--").arg(&access.url).arg(dir);
+    crate::gitauth::run(clone, Duration::from_secs(90))
         .await
-        .context("cloning took longer than 90 seconds")?
-        .context("running git (is it installed on the server?)")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let reason = stderr
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("git clone failed");
-        bail!(
-            "cannot clone {repo}: {}",
-            reason.trim_start_matches("fatal: ")
-        );
-    }
+        .with_context(|| format!("cannot clone {repo}"))?;
     let commit = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -83,7 +101,5 @@ async fn scan(
         .await
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    let root = dir.to_path_buf();
-    let candidates = tokio::task::spawn_blocking(move || lang::detect_all(&root)).await?;
-    Ok(InspectReport { commit, candidates })
+    Ok(Checkout { commit, credential })
 }

@@ -5,8 +5,11 @@ use std::path::Path;
 
 use anyhow::Context;
 use facade_core::AppSpec;
-use facade_core::api::{DeploymentStatus, DeploymentView};
-use facade_core::proto::CredentialKind;
+use facade_core::api::{
+    DeploymentStatus, DeploymentView, GitCredentialKind, StackDeploymentService,
+    StackDeploymentView,
+};
+use facade_core::stack::StackSpec;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -77,27 +80,58 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS stacks (
+    name TEXT PRIMARY KEY,
+    spec TEXT NOT NULL,
+    commit_sha TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS stack_vars (
+    stack TEXT NOT NULL REFERENCES stacks(name) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value BLOB NOT NULL,
+    sensitive INTEGER NOT NULL,
+    PRIMARY KEY (stack, key)
+);
+CREATE TABLE IF NOT EXISTS stack_deployments (
+    id TEXT PRIMARY KEY,
+    stack TEXT NOT NULL,
+    status TEXT NOT NULL,
+    commit_sha TEXT,
+    commit_title TEXT,
+    created_at INTEGER NOT NULL,
+    began_at INTEGER,
+    finished_at INTEGER,
+    error TEXT,
+    services TEXT NOT NULL DEFAULT '[]',
+    log TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS stack_deployments_stack ON stack_deployments(stack, created_at);
+CREATE TABLE IF NOT EXISTS git_credentials (
+    name TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    username TEXT,
+    secret BLOB NOT NULL,
+    public_key TEXT,
+    created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS app_access (
     app TEXT NOT NULL REFERENCES apps(name) ON DELETE CASCADE,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     PRIMARY KEY (app, user_id)
 );
-"#;
-
-/// Registry and git logins, each belonging to a user (`owner_id`; 0 for the
-/// admins, who share theirs).
-const CREDENTIALS: &str = r#"
-CREATE TABLE IF NOT EXISTS credentials (
-    kind TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS registry_logins (
     host TEXT NOT NULL,
     owner_id INTEGER NOT NULL DEFAULT 0,
     username TEXT NOT NULL,
     secret BLOB NOT NULL,
-    PRIMARY KEY (kind, host, owner_id)
+    PRIMARY KEY (host, owner_id)
 );
 "#;
 
-/// The owner id of logins shared by every admin.
+/// The owner id of logins and credentials shared by every admin.
 pub const ADMINS: i64 = 0;
 
 /// `ALTER TABLE … ADD COLUMN`, once.
@@ -158,22 +192,53 @@ pub struct NodeRow {
 pub struct AppRow {
     pub spec: AppSpec,
     pub revision: u64,
-    /// The user whose resources and logins the app uses; `None` for the admins.
+    /// Commit of the last deploy, for git sources.
+    pub commit: Option<String>,
+    /// What a stack service's image is built from (see `Workload::build_key`).
+    pub build_key: Option<String>,
+    /// Variables a stack's compose file gives the service, sealed JSON.
+    pub stack_env: Option<Vec<u8>>,
+    /// The member whose resources and logins the app uses; `None` for the admins.
     pub owner: Option<i64>,
+}
+
+pub struct StackRow {
+    pub spec: StackSpec,
+    pub commit: Option<String>,
+}
+
+type RawApp = (
+    String,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<i64>,
+);
+
+pub struct RegistryLoginRow {
+    pub owner_id: i64,
+    pub host: String,
+    pub username: String,
+    pub sealed_secret: Vec<u8>,
+}
+
+pub struct GitCredentialRow {
+    /// A user id, or [`ADMINS`].
+    pub owner_id: i64,
+    pub name: String,
+    pub kind: GitCredentialKind,
+    pub scope: String,
+    pub username: Option<String>,
+    pub sealed_secret: Vec<u8>,
+    pub public_key: Option<String>,
+    pub created_at: u64,
 }
 
 pub struct EnvRow {
     pub key: String,
     pub sealed: Vec<u8>,
     pub sensitive: bool,
-}
-
-pub struct CredentialRow {
-    pub owner_id: i64,
-    pub kind: CredentialKind,
-    pub host: String,
-    pub username: String,
-    pub sealed_secret: Vec<u8>,
 }
 
 pub struct CertRow {
@@ -184,21 +249,18 @@ pub struct CertRow {
     pub not_after: u64,
 }
 
-fn status_str(s: DeploymentStatus) -> &'static str {
-    match s {
-        DeploymentStatus::Running => "running",
-        DeploymentStatus::Succeeded => "succeeded",
-        DeploymentStatus::Failed => "failed",
-    }
-}
-
 fn parse_status(s: &str) -> DeploymentStatus {
     match s {
+        "queued" => DeploymentStatus::Queued,
         "running" => DeploymentStatus::Running,
         "succeeded" => DeploymentStatus::Succeeded,
+        "cancelled" => DeploymentStatus::Cancelled,
         _ => DeploymentStatus::Failed,
     }
 }
+
+const DEPLOYMENT_COLUMNS: &str =
+    "id, app, revision, status, started_at, began_at, finished_at, error, commit_sha, commit_title";
 
 impl Store {
     /// The database of a running server, read only and as it is (no schema
@@ -220,7 +282,14 @@ impl Store {
         )?;
         conn.execute_batch(SCHEMA)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
-        add_column(&conn, "deployments", "git_commit", "TEXT")?;
+        add_column(&conn, "apps", "commit_sha", "TEXT")?;
+        add_column(&conn, "deployments", "commit_sha", "TEXT")?;
+        add_column(&conn, "deployments", "commit_title", "TEXT")?;
+        add_column(&conn, "deployments", "began_at", "INTEGER")?;
+        add_column(&conn, "deployments", "built", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "apps", "build_key", "TEXT")?;
+        add_column(&conn, "apps", "stack_env", "BLOB")?;
+        add_column(&conn, "apps", "owner_id", "INTEGER")?;
         add_column(
             &conn,
             "users",
@@ -229,8 +298,24 @@ impl Store {
         )?;
         add_column(&conn, "users", "memory_cap_mb", "INTEGER")?;
         add_column(&conn, "users", "cpu_cap", "REAL")?;
-        add_column(&conn, "apps", "owner_id", "INTEGER")?;
-        migrate_credentials(&conn)?;
+        add_column(
+            &conn,
+            "git_credentials",
+            "owner_id",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        migrate_from_branch_logins(&conn)?;
+        // A server restart loses track of builds in progress.
+        conn.execute(
+            "UPDATE deployments SET status = 'failed', error = 'the server restarted during the deployment',
+             finished_at = ?1 WHERE status IN ('queued', 'running')",
+            [facade_core::now()],
+        )?;
+        conn.execute(
+            "UPDATE stack_deployments SET status = 'failed', error = 'the server restarted during the deployment',
+             finished_at = ?1 WHERE status IN ('queued', 'running')",
+            [facade_core::now()],
+        )?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -482,23 +567,37 @@ impl Store {
 
     // ---- apps
 
-    fn app_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, u64, Option<i64>)> {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    fn app_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawApp> {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
     }
 
-    fn parse_app((spec, revision, owner): (String, u64, Option<i64>)) -> anyhow::Result<AppRow> {
+    fn parse_app(
+        (spec, revision, commit, build_key, stack_env, owner): RawApp,
+    ) -> anyhow::Result<AppRow> {
         Ok(AppRow {
             spec: serde_json::from_str(&spec)?,
             revision,
+            commit,
+            build_key,
+            stack_env,
             owner,
         })
     }
 
     pub fn list_apps(&self) -> anyhow::Result<Vec<AppRow>> {
-        let raw: Vec<(String, u64, Option<i64>)> = {
+        let raw: Vec<RawApp> = {
             let conn = self.0.lock();
-            let mut stmt =
-                conn.prepare("SELECT spec, revision, owner_id FROM apps ORDER BY name")?;
+            let mut stmt = conn.prepare(
+                "SELECT spec, revision, commit_sha, build_key, stack_env, owner_id
+                 FROM apps ORDER BY name",
+            )?;
             stmt.query_map([], Self::app_from_row)?
                 .collect::<Result<_, _>>()?
         };
@@ -510,7 +609,8 @@ impl Store {
             .0
             .lock()
             .query_row(
-                "SELECT spec, revision, owner_id FROM apps WHERE name = ?1",
+                "SELECT spec, revision, commit_sha, build_key, stack_env, owner_id
+                 FROM apps WHERE name = ?1",
                 [name],
                 Self::app_from_row,
             )
@@ -562,12 +662,66 @@ impl Store {
         )? > 0)
     }
 
-    pub fn bump_revision(&self, name: &str) -> anyhow::Result<u64> {
+    /// Starts a new revision of the app, built from `commit`.
+    pub fn bump_revision(&self, name: &str, commit: Option<&str>) -> anyhow::Result<u64> {
         Ok(self.0.lock().query_row(
-            "UPDATE apps SET revision = revision + 1 WHERE name = ?1 RETURNING revision",
-            [name],
+            "UPDATE apps SET revision = revision + 1, commit_sha = ?2 WHERE name = ?1 RETURNING revision",
+            params![name, commit],
             |r| r.get(0),
         )?)
+    }
+
+    /// A stack service's new release: its spec, what its image is built from and
+    /// the variables its file gives it. Returns the new revision.
+    pub fn release_service(
+        &self,
+        spec: &AppSpec,
+        commit: Option<&str>,
+        build_key: Option<&str>,
+        sealed_env: &[u8],
+    ) -> anyhow::Result<u64> {
+        let now = facade_core::now();
+        let conn = self.0.lock();
+        conn.execute(
+            "INSERT INTO apps (name, spec, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, updated_at = excluded.updated_at",
+            params![spec.name, serde_json::to_string(spec)?, now],
+        )?;
+        Ok(conn.query_row(
+            "UPDATE apps SET revision = revision + 1, commit_sha = ?2, build_key = ?3, stack_env = ?4
+             WHERE name = ?1 RETURNING revision",
+            params![spec.name, commit, build_key, sealed_env],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Puts the app back to an earlier revision (after a cancelled deploy).
+    pub fn set_revision(
+        &self,
+        name: &str,
+        revision: u64,
+        commit: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE apps SET revision = ?2, commit_sha = ?3 WHERE name = ?1",
+            params![name, revision, commit],
+        )?;
+        Ok(())
+    }
+
+    /// Revision and commit of the app's last successful deployment.
+    pub fn last_success(&self, app: &str) -> anyhow::Result<Option<(u64, Option<String>)>> {
+        Ok(self
+            .0
+            .lock()
+            .query_row(
+                "SELECT revision, commit_sha FROM deployments
+                 WHERE app = ?1 AND status = 'succeeded'
+                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                [app],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 
     pub fn delete_app(&self, name: &str) -> anyhow::Result<()> {
@@ -627,17 +781,77 @@ impl Store {
 
     // ---- deployments
 
-    pub fn create_deployment(&self, id: Uuid, app: &str, revision: u64) -> anyhow::Result<()> {
+    pub fn create_deployment(
+        &self,
+        id: Uuid,
+        app: &str,
+        revision: u64,
+        commit: Option<&str>,
+    ) -> anyhow::Result<()> {
         self.0.lock().execute(
-            "INSERT INTO deployments (id, app, revision, status, started_at) VALUES (?1, ?2, ?3, 'running', ?4)",
-            params![id.to_string(), app, revision, facade_core::now()],
+            "INSERT INTO deployments (id, app, revision, status, started_at, commit_sha)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?5)",
+            params![id.to_string(), app, revision, facade_core::now(), commit],
         )?;
         Ok(())
     }
 
+    pub fn start_deployment(&self, id: Uuid) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE deployments SET status = 'running', began_at = ?2 WHERE id = ?1 AND status = 'queued'",
+            params![id.to_string(), facade_core::now()],
+        )?;
+        Ok(())
+    }
+
+    /// The build phase of a stack service's deployment is over.
+    pub fn deployment_built(&self, id: Uuid) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE deployments SET built = 1 WHERE id = ?1",
+            [id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_built(&self, id: Uuid) -> anyhow::Result<bool> {
+        Ok(self
+            .0
+            .lock()
+            .query_row(
+                "SELECT built FROM deployments WHERE id = ?1",
+                [id.to_string()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            == Some(1))
+    }
+
+    pub fn set_deployment_commit(&self, id: Uuid, commit: &str, title: &str) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE deployments SET commit_sha = ?2, commit_title = ?3 WHERE id = ?1",
+            params![id.to_string(), commit, title],
+        )?;
+        Ok(())
+    }
+
+    /// The subject of a commit, from any deployment that checked it out.
+    pub fn commit_title(&self, commit: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .query_row(
+                "SELECT commit_title FROM deployments
+                 WHERE commit_sha = ?1 AND commit_title IS NOT NULL LIMIT 1",
+                [commit],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn append_deploy_log(&self, id: Uuid, line: &str) -> anyhow::Result<()> {
         self.0.lock().execute(
-            "UPDATE deployments SET log = log || ?2 || char(10) WHERE id = ?1 AND status = 'running'",
+            "UPDATE deployments SET log = log || ?2 || char(10)
+             WHERE id = ?1 AND status IN ('queued', 'running')",
             params![id.to_string(), line],
         )?;
         Ok(())
@@ -647,40 +861,19 @@ impl Store {
         &self,
         id: Uuid,
         error: Option<&str>,
-        commit: Option<&str>,
+        cancelled: bool,
     ) -> anyhow::Result<()> {
-        let status = if error.is_some() {
-            DeploymentStatus::Failed
-        } else {
-            DeploymentStatus::Succeeded
+        let status = match (error, cancelled) {
+            (_, true) => "cancelled",
+            (Some(_), false) => "failed",
+            (None, false) => "succeeded",
         };
         self.0.lock().execute(
-            "UPDATE deployments SET status = ?2, error = ?3, finished_at = ?4, git_commit = ?5
-             WHERE id = ?1 AND status = 'running'",
-            params![
-                id.to_string(),
-                status_str(status),
-                error,
-                facade_core::now(),
-                commit
-            ],
+            "UPDATE deployments SET status = ?2, error = ?3, finished_at = ?4
+             WHERE id = ?1 AND status IN ('queued', 'running')",
+            params![id.to_string(), status, error, facade_core::now()],
         )?;
         Ok(())
-    }
-
-    /// Commit built by the app's last successful deployment from git.
-    pub fn deployed_commit(&self, app: &str) -> anyhow::Result<Option<String>> {
-        Ok(self
-            .0
-            .lock()
-            .query_row(
-                "SELECT git_commit FROM deployments
-                 WHERE app = ?1 AND status = 'succeeded' AND git_commit IS NOT NULL
-                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
-                [app],
-                |r| r.get(0),
-            )
-            .optional()?)
     }
 
     /// Deployments that can no longer finish because their node went away.
@@ -689,7 +882,7 @@ impl Store {
         for app in apps {
             conn.execute(
                 "UPDATE deployments SET status = 'failed', error = ?2, finished_at = ?3
-                 WHERE app = ?1 AND status = 'running'",
+                 WHERE app = ?1 AND status IN ('queued', 'running')",
                 params![app, reason, facade_core::now()],
             )?;
         }
@@ -698,12 +891,25 @@ impl Store {
 
     pub fn list_deployments(&self, app: &str, limit: u32) -> anyhow::Result<Vec<DeploymentView>> {
         let conn = self.0.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, app, revision, status, started_at, finished_at, error, '', git_commit FROM deployments
-             WHERE app = ?1 ORDER BY started_at DESC, rowid DESC LIMIT ?2",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DEPLOYMENT_COLUMNS}, '' FROM deployments
+             WHERE app = ?1 ORDER BY started_at DESC, rowid DESC LIMIT ?2"
+        ))?;
         let rows = stmt
             .query_map(params![app, limit], Self::deployment_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// The latest deployments of every app.
+    pub fn recent_deployments(&self, limit: u32) -> anyhow::Result<Vec<DeploymentView>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DEPLOYMENT_COLUMNS}, '' FROM deployments
+             ORDER BY started_at DESC, rowid DESC LIMIT ?1"
+        ))?;
+        let rows = stmt
+            .query_map(params![limit], Self::deployment_row)?
             .collect::<Result<_, _>>()?;
         Ok(rows)
     }
@@ -713,8 +919,7 @@ impl Store {
             .0
             .lock()
             .query_row(
-                "SELECT id, app, revision, status, started_at, finished_at, error, log, git_commit
-                 FROM deployments WHERE id = ?1",
+                &format!("SELECT {DEPLOYMENT_COLUMNS}, log FROM deployments WHERE id = ?1"),
                 [id.to_string()],
                 Self::deployment_row,
             )
@@ -729,12 +934,345 @@ impl Store {
             app: r.get(1)?,
             revision: r.get(2)?,
             status: parse_status(&status),
-            started_at: r.get(4)?,
-            finished_at: r.get(5)?,
-            error: r.get(6)?,
-            log: r.get(7)?,
+            created_at: r.get(4)?,
+            started_at: r.get(5)?,
+            finished_at: r.get(6)?,
+            error: r.get(7)?,
             commit: r.get(8)?,
+            commit_title: r.get(9)?,
+            log: r.get(10)?,
         })
+    }
+
+    // ---- stacks
+
+    pub fn list_stacks(&self) -> anyhow::Result<Vec<StackRow>> {
+        let raw: Vec<(String, Option<String>)> = {
+            let conn = self.0.lock();
+            let mut stmt = conn.prepare("SELECT spec, commit_sha FROM stacks ORDER BY name")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        raw.into_iter()
+            .map(|(spec, commit)| {
+                Ok(StackRow {
+                    spec: serde_json::from_str(&spec)?,
+                    commit,
+                })
+            })
+            .collect()
+    }
+
+    pub fn get_stack(&self, name: &str) -> anyhow::Result<Option<StackRow>> {
+        Ok(self
+            .list_stacks()?
+            .into_iter()
+            .find(|s| s.spec.name == name))
+    }
+
+    pub fn put_stack(&self, spec: &StackSpec) -> anyhow::Result<()> {
+        let now = facade_core::now();
+        self.0.lock().execute(
+            "INSERT INTO stacks (name, spec, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, updated_at = excluded.updated_at",
+            params![spec.name, serde_json::to_string(spec)?, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_stack_commit(&self, name: &str, commit: Option<&str>) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE stacks SET commit_sha = ?2 WHERE name = ?1",
+            params![name, commit],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_stack(&self, name: &str) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .execute("DELETE FROM stacks WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    pub fn list_stack_vars(&self, stack: &str) -> anyhow::Result<Vec<EnvRow>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key, value, sensitive FROM stack_vars WHERE stack = ?1 ORDER BY key",
+        )?;
+        let rows = stmt
+            .query_map([stack], |r| {
+                Ok(EnvRow {
+                    key: r.get(0)?,
+                    sealed: r.get(1)?,
+                    sensitive: r.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_stack_var(
+        &self,
+        stack: &str,
+        key: &str,
+        sealed: &[u8],
+        sensitive: bool,
+    ) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "INSERT INTO stack_vars (stack, key, value, sensitive) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(stack, key) DO UPDATE SET value = excluded.value, sensitive = excluded.sensitive",
+            params![stack, key, sealed, sensitive],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_stack_var(&self, stack: &str, key: &str) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "DELETE FROM stack_vars WHERE stack = ?1 AND key = ?2",
+            [stack, key],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_stack_deployment(
+        &self,
+        id: Uuid,
+        stack: &str,
+        commit: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "INSERT INTO stack_deployments (id, stack, status, commit_sha, created_at)
+             VALUES (?1, ?2, 'queued', ?3, ?4)",
+            params![id.to_string(), stack, commit, facade_core::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn start_stack_deployment(&self, id: Uuid, title: Option<&str>) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE stack_deployments SET status = 'running', began_at = ?2, commit_title = ?3
+             WHERE id = ?1 AND status = 'queued'",
+            params![id.to_string(), facade_core::now(), title],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_stack_deployment_commit(
+        &self,
+        id: Uuid,
+        commit: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE stack_deployments SET commit_sha = ?2 WHERE id = ?1",
+            params![id.to_string(), commit],
+        )?;
+        Ok(())
+    }
+
+    pub fn stack_deploy_log(&self, id: Uuid, line: &str) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE stack_deployments SET log = log || ?2 || char(10) WHERE id = ?1",
+            params![id.to_string(), line],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_stack_deployment_services(
+        &self,
+        id: Uuid,
+        services: &[StackDeploymentService],
+    ) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE stack_deployments SET services = ?2 WHERE id = ?1",
+            params![id.to_string(), serde_json::to_string(services)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_stack_deployment(
+        &self,
+        id: Uuid,
+        error: Option<&str>,
+        cancelled: bool,
+    ) -> anyhow::Result<()> {
+        let status = match (error, cancelled) {
+            (_, true) => "cancelled",
+            (Some(_), false) => "failed",
+            (None, false) => "succeeded",
+        };
+        self.0.lock().execute(
+            "UPDATE stack_deployments SET status = ?2, error = ?3, finished_at = ?4
+             WHERE id = ?1 AND status IN ('queued', 'running')",
+            params![id.to_string(), status, error, facade_core::now()],
+        )?;
+        Ok(())
+    }
+
+    const STACK_DEPLOYMENT_COLUMNS: &str = "id, stack, status, commit_sha, commit_title, created_at, began_at, finished_at, error, services";
+
+    fn stack_deployment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StackDeploymentView> {
+        let id: String = r.get(0)?;
+        let status: String = r.get(2)?;
+        let services: String = r.get(9)?;
+        Ok(StackDeploymentView {
+            id: id.parse().unwrap_or_default(),
+            stack: r.get(1)?,
+            status: parse_status(&status),
+            commit: r.get(3)?,
+            commit_title: r.get(4)?,
+            created_at: r.get(5)?,
+            started_at: r.get(6)?,
+            finished_at: r.get(7)?,
+            error: r.get(8)?,
+            services: serde_json::from_str(&services).unwrap_or_default(),
+            log: r.get(10)?,
+        })
+    }
+
+    pub fn list_stack_deployments(
+        &self,
+        stack: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<StackDeploymentView>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {}, '' FROM stack_deployments WHERE stack = ?1
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+            Self::STACK_DEPLOYMENT_COLUMNS
+        ))?;
+        let rows = stmt
+            .query_map(params![stack, limit], Self::stack_deployment_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_stack_deployment(&self, id: Uuid) -> anyhow::Result<Option<StackDeploymentView>> {
+        Ok(self
+            .0
+            .lock()
+            .query_row(
+                &format!(
+                    "SELECT {}, log FROM stack_deployments WHERE id = ?1",
+                    Self::STACK_DEPLOYMENT_COLUMNS
+                ),
+                [id.to_string()],
+                Self::stack_deployment_row,
+            )
+            .optional()?)
+    }
+
+    // ---- git credentials
+
+    pub fn put_git_credential(&self, row: &GitCredentialRow) -> anyhow::Result<()> {
+        let kind = match row.kind {
+            GitCredentialKind::SshKey => "ssh_key",
+            GitCredentialKind::Token => "token",
+        };
+        self.0.lock().execute(
+            "INSERT INTO git_credentials
+                 (name, kind, scope, username, secret, public_key, created_at, owner_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                row.name,
+                kind,
+                row.scope,
+                row.username,
+                row.sealed_secret,
+                row.public_key,
+                row.created_at,
+                row.owner_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Credentials of `owner` (a user id, or [`ADMINS`]), or everyone's.
+    pub fn list_git_credentials(
+        &self,
+        owner: Option<i64>,
+    ) -> anyhow::Result<Vec<GitCredentialRow>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare(
+            "SELECT name, kind, scope, username, secret, public_key, created_at, owner_id
+             FROM git_credentials WHERE ?1 IS NULL OR owner_id = ?1 ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([owner], |r| {
+                let kind: String = r.get(1)?;
+                Ok(GitCredentialRow {
+                    name: r.get(0)?,
+                    kind: if kind == "token" {
+                        GitCredentialKind::Token
+                    } else {
+                        GitCredentialKind::SshKey
+                    },
+                    scope: r.get(2)?,
+                    username: r.get(3)?,
+                    sealed_secret: r.get(4)?,
+                    public_key: r.get(5)?,
+                    created_at: r.get(6)?,
+                    owner_id: r.get(7)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Deletes `owner`'s credential (anyone's with `None`).
+    pub fn delete_git_credential(&self, name: &str, owner: Option<i64>) -> anyhow::Result<bool> {
+        Ok(self.0.lock().execute(
+            "DELETE FROM git_credentials WHERE name = ?1 AND (?2 IS NULL OR owner_id = ?2)",
+            params![name, owner],
+        )? > 0)
+    }
+
+    // ---- registry logins
+
+    /// Logins of `owner` (a user id, or [`ADMINS`]), or everyone's.
+    pub fn list_registry_logins(
+        &self,
+        owner: Option<i64>,
+    ) -> anyhow::Result<Vec<RegistryLoginRow>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare(
+            "SELECT owner_id, host, username, secret FROM registry_logins
+             WHERE ?1 IS NULL OR owner_id = ?1 ORDER BY owner_id, host",
+        )?;
+        let rows = stmt
+            .query_map([owner], |r| {
+                Ok(RegistryLoginRow {
+                    owner_id: r.get(0)?,
+                    host: r.get(1)?,
+                    username: r.get(2)?,
+                    sealed_secret: r.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn put_registry_login(
+        &self,
+        owner: i64,
+        host: &str,
+        username: &str,
+        sealed_secret: &[u8],
+    ) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "INSERT OR REPLACE INTO registry_logins (owner_id, host, username, secret)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![owner, host, username, sealed_secret],
+        )?;
+        Ok(())
+    }
+
+    /// Whether there was one to delete.
+    pub fn delete_registry_login(&self, owner: i64, host: &str) -> anyhow::Result<bool> {
+        Ok(self.0.lock().execute(
+            "DELETE FROM registry_logins WHERE owner_id = ?1 AND host = ?2",
+            params![owner, host],
+        )? > 0)
     }
 
     // ---- certificates
@@ -824,69 +1362,6 @@ impl Store {
         Ok(())
     }
 
-    // ---- registry and git logins
-
-    /// Logins of `owner` (a user id, or [`ADMINS`]), or everyone's.
-    pub fn list_credentials(&self, owner: Option<i64>) -> anyhow::Result<Vec<CredentialRow>> {
-        let conn = self.0.lock();
-        let mut stmt = conn.prepare(
-            "SELECT owner_id, kind, host, username, secret FROM credentials
-             WHERE ?1 IS NULL OR owner_id = ?1 ORDER BY owner_id, kind, host",
-        )?;
-        let rows = stmt
-            .query_map([owner], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Vec<u8>>(4)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(owner_id, kind, host, username, sealed_secret)| {
-                Some(CredentialRow {
-                    owner_id,
-                    kind: parse_kind(&kind)?,
-                    host,
-                    username,
-                    sealed_secret,
-                })
-            })
-            .collect())
-    }
-
-    pub fn put_credential(
-        &self,
-        owner: i64,
-        kind: CredentialKind,
-        host: &str,
-        username: &str,
-        sealed_secret: &[u8],
-    ) -> anyhow::Result<()> {
-        self.0.lock().execute(
-            "INSERT OR REPLACE INTO credentials (owner_id, kind, host, username, secret)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![owner, kind.to_string(), host, username, sealed_secret],
-        )?;
-        Ok(())
-    }
-
-    /// Whether there was one to delete.
-    pub fn delete_credential(
-        &self,
-        owner: i64,
-        kind: CredentialKind,
-        host: &str,
-    ) -> anyhow::Result<bool> {
-        Ok(self.0.lock().execute(
-            "DELETE FROM credentials WHERE owner_id = ?1 AND kind = ?2 AND host = ?3",
-            params![owner, kind.to_string(), host],
-        )? > 0)
-    }
-
     /// A consistent copy of the whole database, safe while the server runs.
     pub fn snapshot(&self, dest: &Path) -> anyhow::Result<()> {
         let dest = dest.to_str().context("backup path is not UTF-8")?;
@@ -895,32 +1370,38 @@ impl Store {
     }
 }
 
-/// Logins used to belong to everyone: they become the admins'.
-fn migrate_credentials(conn: &Connection) -> anyhow::Result<()> {
-    let columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(credentials)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<Result<_, _>>()?;
-    if columns.is_empty() {
-        conn.execute_batch(CREDENTIALS)?;
-    } else if !columns.iter().any(|c| c == "owner_id") {
-        conn.execute_batch(&format!(
-            "BEGIN;
-             ALTER TABLE credentials RENAME TO credentials_old;
-             {CREDENTIALS}
-             INSERT INTO credentials (kind, host, owner_id, username, secret)
-                 SELECT kind, host, 0, username, secret FROM credentials_old;
-             DROP TABLE credentials_old;
-             COMMIT;"
-        ))?;
+/// Data written by the user-accounts branch before it was merged: commits in
+/// `deployments.git_commit`, and logins in a `credentials` table.
+fn migrate_from_branch_logins(conn: &Connection) -> anyhow::Result<()> {
+    let columns = |table: &str| -> anyhow::Result<Vec<String>> {
+        Ok(conn
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?)
+    };
+    if columns("deployments")?.iter().any(|c| c == "git_commit") {
+        conn.execute_batch(
+            "UPDATE deployments SET commit_sha = git_commit
+                 WHERE commit_sha IS NULL AND git_commit IS NOT NULL;
+             UPDATE apps SET commit_sha = (
+                 SELECT d.commit_sha FROM deployments d
+                 WHERE d.app = apps.name AND d.status = 'succeeded' AND d.commit_sha IS NOT NULL
+                 ORDER BY d.started_at DESC LIMIT 1)
+                 WHERE commit_sha IS NULL;
+             ALTER TABLE deployments DROP COLUMN git_commit;",
+        )?;
+    }
+    let old = columns("credentials")?;
+    if old.iter().any(|c| c == "owner_id") {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO registry_logins (host, owner_id, username, secret)
+                 SELECT host, owner_id, username, secret FROM credentials WHERE kind = 'registry';
+             INSERT OR IGNORE INTO git_credentials
+                 (name, kind, scope, username, secret, created_at, owner_id)
+                 SELECT host || '-' || owner_id, 'token', host, username, secret, 0, owner_id
+                 FROM credentials WHERE kind = 'git';
+             DROP TABLE credentials;",
+        )?;
     }
     Ok(())
-}
-
-fn parse_kind(s: &str) -> Option<CredentialKind> {
-    match s {
-        "registry" => Some(CredentialKind::Registry),
-        "git" => Some(CredentialKind::Git),
-        _ => None,
-    }
 }

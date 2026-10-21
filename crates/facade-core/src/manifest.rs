@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::spec::AppSpec;
+use crate::stack::StackSpec;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
@@ -28,6 +29,20 @@ pub struct Manifest {
     pub nodes: Vec<NodeDecl>,
     #[serde(default, rename = "app", skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<AppManifest>,
+    #[serde(default, rename = "stack", skip_serializing_if = "Vec::is_empty")]
+    pub stacks: Vec<StackManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackManifest {
+    #[serde(flatten)]
+    pub spec: StackSpec,
+    /// The stack's variables, used by its compose file (`${DB_PASSWORD}`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variables: BTreeMap<String, EnvEntry>,
+    /// Variables set in facade for each service, by service.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, BTreeMap<String, EnvEntry>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +92,18 @@ impl Manifest {
             app.spec
                 .validate()
                 .map_err(|e| format!("app `{}`: {e}", app.spec.name))?;
+            if app.spec.stack.is_some() {
+                return Err(format!(
+                    "app `{}`: services of a stack are declared in its [[stack]]",
+                    app.spec.name
+                ));
+            }
+        }
+        for stack in &manifest.stacks {
+            stack
+                .spec
+                .validate()
+                .map_err(|e| format!("stack `{}`: {e}", stack.spec.name))?;
         }
         Ok(manifest)
     }
@@ -113,16 +140,34 @@ name = "landing"
 node = "main"
 domains = ["example.com"]
 source = { type = "git", repo = "https://github.com/me/site", build = { kind = "static", dir = "public" } }
+
+[[app]]
+name = "api"
+node = "main"
+http_port = 8080
+command = ["./api", "--workers", "4"]
+release_command = "./api migrate"
+volumes = ["uploads:/srv/uploads"]
+links = ["db", "cache:redis"]
+source = { type = "git", repo = "git@github.com:me/shop.git", build = { kind = "dockerfile", dockerfile = "api/Dockerfile", context = "." } }
+
+[app.env]
+DATABASE_URL = "${{db.DATABASE_URL}}"
 "#;
         let manifest = Manifest::parse(src).unwrap();
-        assert_eq!(manifest.apps.len(), 2);
+        assert_eq!(manifest.apps.len(), 3);
+        let api = &manifest.apps[2].spec;
+        assert_eq!(api.links[1].host(), "redis");
+        assert_eq!(api.volumes[0].path, "/srv/uploads");
         assert!(manifest.apps[1].spec.is_static());
         assert_eq!(
             manifest.apps[0].env["TURN_PASSWORD"].resolve(),
             (None, true)
         );
         let again = Manifest::parse(&manifest.to_toml()).unwrap();
-        assert_eq!(again.apps[0].spec, manifest.apps[0].spec);
-        assert_eq!(again.apps[0].env, manifest.apps[0].env);
+        for (a, b) in again.apps.iter().zip(&manifest.apps) {
+            assert_eq!(a.spec, b.spec);
+            assert_eq!(a.env, b.env);
+        }
     }
 }

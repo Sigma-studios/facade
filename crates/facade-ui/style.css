@@ -129,6 +129,7 @@ p { margin: 0 0 12px; }
   padding: 0 7px;
   line-height: 18px;
 }
+.nav-count-busy { background: var(--accent); }
 .nav-logout {
   margin-top: auto;
   background: none;
@@ -172,7 +173,8 @@ p { margin: 0 0 12px; }
   .sidebar { width: auto; height: auto; position: static; flex-direction: row; align-items: center; padding: 10px; }
   .brand { padding: 4px 10px; }
   .nav { flex-direction: row; overflow-x: auto; }
-  .nav-logout { margin: 0 0 0 auto; }
+  .nav-count-busy { background: var(--accent); }
+.nav-logout { margin: 0 0 0 auto; }
   .page { padding: 20px 16px 48px; }
   .shell-banner { padding: 16px 16px 0; }
   .page-head { flex-direction: column; align-items: flex-start; }
@@ -401,7 +403,7 @@ input[type="text"], input[type="password"], input[type="url"], input[type="numbe
 textarea { resize: vertical; min-height: 38px; }
 input:disabled, textarea:disabled { background: var(--surface-2); color: var(--text-muted); }
 .check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; cursor: pointer; padding-top: 26px; }
-.toolbar .check, .modal .check { padding-top: 0; }
+.toolbar .check, .modal .check, .checks .check { padding-top: 0; }
 .inline-field { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
 .inline-field select { width: auto; padding: 4px 8px; }
 
@@ -577,6 +579,14 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
   cursor: pointer;
 }
 .deploy-item .muted { grid-column: 2; }
+.deploy-title {
+  grid-column: 1 / -1;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.deploy-commit-title { margin: -4px 0 10px; color: var(--text-secondary); }
 .deploy-item.active { border-color: var(--accent); background: var(--accent-soft); }
 .deploy-rev { font-weight: 600; }
 .deploy-detail { min-width: 0; }
@@ -761,3 +771,37 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .slider-none { padding-top: 0; }
 .limits-row > .field { flex: 1 1 260px; }
 .field small.slider-label.over { color: var(--critical-text); }
+
+/* ---------------------------------------------------------------- builds, data, git access */
+
+.checks { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 4px 0 2px; }
+.private-repo { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.private-repo p { margin: 0; }
+.private-repo .copy-field { align-self: stretch; }
+.storage-line {
+  padding: 8px 20px;
+  border: 1px solid var(--border);
+  border-top: 0;
+  background: var(--surface-1);
+  line-height: 1.5;
+}
+.notes { margin: 12px 0 0; padding-left: 18px; color: var(--text-secondary); }
+.notes li + li { margin-top: 3px; }
+.after-cards { margin-top: 12px; }
+.error-cell { color: var(--critical-text); max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------------------------------------------------------------- stacks */
+
+.stacks-title { margin-top: 32px; }
+.stack-block + .stack-block { margin-top: 22px; }
+.stack-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+.stack-name { font-size: 15px; }
+.service-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; }
+.service-row { display: flex; align-items: center; gap: 10px; padding: 9px 14px; }
+.service-row + .service-row { border-top: 1px solid var(--border); }
+.modal .service-form { max-height: 70vh; overflow: auto; padding-right: 4px; }
+.plan { margin-top: 16px; }
+.deploy-log.stack-log { height: auto; min-height: 0; max-height: 260px; margin-bottom: 12px; }
+.service-log { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; }
+.service-log summary { display: flex; align-items: center; gap: 10px; padding: 8px 12px; cursor: pointer; }
+.service-log .deploy-log { border-radius: 0 0 8px 8px; height: 320px; min-height: 0; }

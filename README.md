@@ -1,9 +1,12 @@
 # facade
 
 Self-hosted app platform for your own VPSes, in Rust. One server, any number of
-nodes; apps from Docker images, git repositories (Dockerfile, cargo binary, or static
-files); domains with automatic HTTPS; encrypted env vars; logs, metrics and Discord
-alerts; everything scriptable from a CLI with `--json` output.
+nodes; apps from Docker images or git repositories, private ones included (Dockerfile,
+cargo binary or static files); stacks of services deployed together from a monorepo
+(its docker-compose file, or services defined in facade); databases with volumes;
+domains with automatic HTTPS; encrypted env vars; builds pinned to commits, with a
+build queue, health checks and rollbacks; logs, metrics and Discord alerts;
+everything scriptable from a CLI with `--json` output.
 
 ```
  facade CLI / web UI ── :7701 ──▶ facaded server: API, SQLite + encrypted secrets,
@@ -29,7 +32,7 @@ alerts; everything scriptable from a CLI with `--json` output.
 * **Agents dial the server**, over TLS pinned to the server's certificate.
 * Containers get their own bridge network, `no-new-privileges`, optional CPU/memory
   limits, log rotation, and are only reachable through their node's entry point
-  unless you publish ports.
+  unless you publish ports or link another app to them.
 
 ## Crates
 
@@ -135,16 +138,19 @@ builds embed `crates/facade-ui/dist` (built by `deploy/build-linux.sh`).
 
 An app comes from one of three sources:
 
-* **A git repository.** facade clones it and scans it for what can be deployed
-  (`facade scan <url>` shows the list): its own Dockerfile, Rust binaries (with the
-  features they need, the port they listen on and the environment variables they
-  read), Python programs (a script with a `__main__` block, a package with
+* **A git repository**, public or [private](#private-repositories). facade clones it
+  and scans it for what can be deployed (`facade scan <url>` shows the list): its
+  Dockerfiles (also deeper in a monorepo, like `apps/api/Dockerfile`), Rust binaries
+  (with the features they need, the port they listen on and the environment variables
+  they read), Python programs (a script with a `__main__` block, a package with
   `__main__.py` or a `pyproject.toml` command; dependencies from `requirements.txt`
   and/or `pyproject.toml`; the version from `.python-version` or `requires-python`)
   or a static site. The best match is used unless you pick a build yourself
-  (`--dockerfile`, `--rust-bin`, `--python`, `--static`). The scan also suggests
-  arguments: a Python server whose `--host` defaults to `127.0.0.1` gets
-  `--host 0.0.0.0`, since loopback is unreachable from outside its container.
+  (`--dockerfile`, `--rust-bin`, `--python`, `--static`). The scan also suggests a
+  command when needed: a Python server whose `--host` defaults to `127.0.0.1` gets
+  `--host 0.0.0.0`, since loopback is unreachable from outside its container. A
+  repository holding several services (a monorepo with a docker-compose file, say) is
+  better deployed as a [stack](#stacks-monorepos).
 * **A Linux executable** you upload (`--executable`, or drag and drop in the web
   UI). It runs in a small Debian image; it must be built for the node's CPU
   (`x86_64` or `aarch64`), and a static build (`--target x86_64-unknown-linux-musl`)
@@ -179,13 +185,14 @@ facade app create poker --git https://github.com/me/poker --domain poker.example
   --redirect www.poker.example.com
 
 # a site keeping a SQLite database across deploys, from a private registry
-facade auth registry ghcr.io --user me            # token with read:packages
+facade registry login ghcr.io --user me           # token with read:packages
 facade app create blog --image ghcr.io/me/blog --port 3000 --domain example.com \
   --redirect www.example.com --volume data:/data
 ```
 
-`--arg` (repeatable) passes arguments to the program: after the executable, Rust
-binary or Python entry, or in place of the `CMD` of a Dockerfile or image.
+`--command` replaces the image's command (`CMD`), for any build: with a scanned
+Python server it is what the scan suggests (`python server.py --host 0.0.0.0`);
+`--arg` (repeatable) gives an uploaded executable its arguments.
 
 ### Teaching the scan a new language
 
@@ -205,16 +212,174 @@ template in `lang::generated_dockerfile`.
 | `facade env ls <app> [--reveal]` / `env set` / `env unset` | variables; sensitive unless `--public` |
 | `facade domain add <app> <domain>` | route a host name to an app |
 | `facade app update <app> --memory 512 --cpus 1 --node eu-2 …` | change settings (moving nodes works) |
-| `facade stop` / `start` / `restart` / `app rm [--delete-data]` | lifecycle |
-| `facade volume ls` / `export` / `import` | volumes, as `.tar.gz` |
+| `facade app update <app> --command "./worker" --release "./migrate up"` | command, and what runs before each deploy |
+| `facade app update <app> -v data:/data --link db` | volumes, and apps it reaches by name |
+| `facade app update <app> --redirect www.example.com` | domains redirecting to the main one |
+| `facade deploy <app> [--commit REF] [--rebuild]` / `rollback` / `cancel` | deploys |
+| `facade updates <app>` | commits on the app's branch since its deployed one |
+| `facade builds` | what each node builds, what waits, recent deployments |
+| `facade db create <name> --kind postgres --link <app>` | a database for an app |
+| `facade stack create shop --git <url>` / `stack show` / `stack plan` | a stack of services |
+| `facade stack service update shop api --domain … --port 8080` | a stack service's settings |
+| `facade git key` / `git token` / `git ls` | access to private repositories |
+| `facade registry login ghcr.io --user …` / `registry ls` / `registry rm` | private container registries |
+| `facade volume ls` / `export` / `import` / `rm` / `node prune` | volumes and disk space |
 | `facade backup ls` / `run` / `get` / `restore` / `server` | backups |
-| `facade auth registry\|git <host> --user …` / `auth ls` / `auth rm` | private registries and repositories |
 | `facade node ports <node>` | what listens on a node, and who holds each port |
+| `facade user add/ls/set/rm` / `app owner` / `app grant` / `whoami` | accounts and who manages what |
+| `facade server` / `server set` | the web UI's domain, ACME contact, direct API port |
+| `facade stop` / `start` / `restart` / `app rm [--volumes]` | lifecycle |
 | `facade export -o facade.toml` / `facade apply -f facade.toml` | config as code |
 
 Apps run from their first `facade deploy`; until then they are only configuration.
-`deploy` always rebuilds from the latest commit (or re-pulls the image); config and env
-changes restart the container without rebuilding.
+Config and env changes restart the container without rebuilding.
+
+### Deploys, commits and rollbacks
+
+`facade deploy` resolves the branch's latest commit on the server, records it, and has
+the node build exactly that commit (submodules included). Images are tagged by commit,
+so a node that rebuilds later (after a cleanup, or when the app moves) builds the same
+code, and deploying a commit that was built before reuses its image:
+
+```sh
+facade deploy api                      # latest commit of the app's branch
+facade deploy api --commit v1.4.2      # a tag, a branch, or a full commit hash
+facade rollback api                    # the previous successfully deployed commit
+facade deploy api --rebuild            # build again, without Docker's layer cache
+```
+
+Each node builds one app at a time; other deployments wait in its queue (`facade
+builds`, or the Builds page). `facade cancel <app>` stops a queued or building
+deployment: the running version stays, and the app does not move to the cancelled
+commit later. Builds are stopped after an hour.
+
+A **release command** (`--release "./migrate up"`) runs with `sh -c` in a one-off
+container of the new build, with the app's variables, volumes and links, before the
+new version replaces the running one; if it fails, the deploy stops and the running
+version stays. It is the place for database migrations.
+
+A **health check** (`--health "curl -fs localhost:8080/health"`, or the image's own
+`HEALTHCHECK`) tells when the app is ready: a deploy waits for it to pass, and fails if
+it does not. Without one, a deploy waits for the container to stay up a few seconds.
+
+### Private repositories
+
+facade needs read access to private repositories, for scans and builds alike:
+
+```sh
+# a deploy key for one repository: facade generates it, you add the public half
+# on GitHub (Settings → Deploy keys; read-only is enough)
+facade git key shop --repo https://github.com/me/shop
+
+# or one access token for every repository of an account or organisation
+# (GitHub: a fine-grained token with read access to Contents)
+facade git token sigma --scope github.com/Sigma-studios      # prompts for the token
+```
+
+The most specific credential covering a repository is used, for HTTPS or SSH URLs
+alike (a deploy key fetches over SSH, a token over HTTPS). Credentials are encrypted
+on the server, sent to the node building the app over the pinned connection, never
+written into URLs, logs or exports, and handed to `docker build` as build secrets so
+Dockerfiles can fetch private dependencies without baking them into the image:
+`RUN --mount=type=secret,id=gitconfig,target=/root/.gitconfig …` (tokens) or
+`RUN --mount=type=ssh …` (keys); facade's generated Rust builds do this for git
+dependencies. Host keys of GitHub, GitLab and Bitbucket are built in; other hosts are
+remembered on first use. In the web UI, a scan that is refused offers to create the
+deploy key on the spot. URLs with a password or token in them are refused.
+
+### Databases, volumes and links
+
+A **volume** (`-v data:/var/lib/data`) keeps what an app writes there across restarts
+and deploys. Volumes live on the app's node; an app with volumes moves to another node with
+`--move-data`, which copies them over (see [Volumes and backups](#volumes-and-backups)).
+`facade app rm <app> --volumes` deletes them with the app; otherwise they stay, listed
+as orphaned in `facade volume ls` until `facade volume rm`.
+
+A **link** (`--link db`, or `--link shop-db:db` to use another name) lets an app reach
+another app of the same node by name, over a network private to the two of them:
+`postgres://…@db:5432`. Apps that are not linked cannot reach each other.
+
+A variable can **refer to another app's variable**: `${{db.DATABASE_URL}}` is replaced
+by the `DATABASE_URL` of app `db` when the app starts, and apps referring to a variable
+restart when it changes, so a password lives in one place.
+
+`facade db create` puts the three together: an official image (PostgreSQL, MySQL,
+MariaDB or Redis), a volume for its data, a generated password, and a connection URL
+for the apps it is linked to.
+
+```sh
+facade app create api --git https://github.com/me/shop --dockerfile api/Dockerfile \
+  --port 8080 --domain api.example.com --release "./api migrate"
+facade db create shop-db --kind postgres --link api   # api gets DATABASE_URL=${{shop-db.DATABASE_URL}}
+facade deploy api
+```
+
+### Stacks (monorepos)
+
+A **stack** deploys several services together: from one repository, at one commit, on
+one node, where they reach each other by service name over a network of their own.
+Its services come from the repository's docker-compose file, read again at every
+deploy so the repository stays the source of truth, or are defined in facade when
+there is no file.
+
+```sh
+facade stack create shop --git https://github.com/me/shop   # finds docker-compose.yml, shows the plan
+facade stack service update shop web --domain shop.example.com --port 3000
+facade deploy shop
+facade logs shop.api -f                                    # services are apps named <stack>.<service>
+```
+
+A deploy resolves one commit and reads the file at that commit. Services whose build
+context, settings and variables did not change are left running (their image is
+keyed by their build context's content, not the commit). The others are **built
+first, all of them**: if one fails, nothing is replaced. Then they are replaced in
+`depends_on` order, each after the ones it depends on are healthy: Compose
+`healthcheck:`s are used, and the usual database images (PostgreSQL, MySQL, MariaDB,
+Redis, MongoDB) get a readiness check of their own. `facade stack plan shop` shows what
+a deploy would do; rollbacks, cancels and the build queue work on the whole stack.
+
+From the compose file: `image:` and `build:` (with its context and Dockerfile),
+`command`, `environment` (interpolated like Compose does, from the stack's variables
+and a committed `.env`), `ports` (the first one is where HTTP for the service's domains
+goes; nothing is published on the node's public address unless asked), named volumes
+(shared by the services naming them, as in Compose), `depends_on`, `healthcheck` and
+resource limits. Passwords the file expects from the environment (`${DB_PASSWORD}`)
+are generated once and kept as stack variables (`facade env ls shop`). Bind mounts,
+`env_file`, build arguments and profiles are left out, and the plan says so. What
+Compose has no words for goes in an `x-facade:` section of the service:
+
+```yaml
+services:
+  api:
+    build: ./api
+    depends_on: [db]
+    x-facade:
+      domains: [api.example.com]
+      http_port: 8080
+      release: ./api migrate        # runs before each deploy replaces it
+      memory: 512                   # MB
+      publish: ["3478:3478/udp"]    # on the node's public address
+```
+
+The same settings can be set from facade instead (`facade stack service update`, or a
+service's Settings tab), over the file's. Without a file, services are defined the same
+way: `facade stack service add shop db --database postgres` (image, volume, password and
+`DATABASE_URL`), `facade stack service add shop api --dockerfile api/Dockerfile --port
+8080 --depends-on db`. A service's own variables are set on it (`facade env set
+shop.api KEY=…`) and can refer to the others' (`${{shop.db.DATABASE_URL}}`).
+
+Several standalone apps can also come from one repository, each with its own
+Dockerfile and build context: the scan finds Dockerfiles deeper in a monorepo, and uses
+the repository root as the context when the Dockerfile copies files from there.
+
+### Disk space
+
+Builds leave cache behind and every deploy leaves an image. Each node cleans up on its
+own: every 6 hours it removes dangling images and build cache unused for a week, and
+when its disk is 85 % full it also drops build cache unused for a day and the images
+kept for rollbacks (the two previous builds of each app), and at 90 % the whole build
+cache. `facade node prune <node> [--aggressive]` (or the Nodes page) does it now; the
+Nodes page shows images, build cache and volumes per node.
 
 ### Domains and HTTPS
 
@@ -252,8 +417,8 @@ live on the app's node, as Docker volumes named `facade-<app>_<volume>`.
   instant. `facade volume import <app> <volume> <file>` replaces its contents with
   a `.tar` or `.tar.gz` (owners and permissions kept) while the app is stopped:
   that is how existing data comes into facade.
-* `facade app rm` keeps an app's volumes unless `--delete-data`; leftovers are
-  listed by `facade volume ls` and deleted with `facade volume rm <app> --node <node>`.
+* `facade app rm` keeps an app's volumes unless `--volumes`; leftovers are listed by
+  `facade volume ls` and deleted with `facade volume rm <node> <name>`.
 * Moving an app with volumes to another node needs `--move-data`: the app stops,
   its volumes are copied to the new node, then deleted from the old one. If the copy
   fails, the app starts again where it was.
@@ -266,16 +431,16 @@ the key to its secrets, in one file). `facade backup run [app]` backs up now and
 `facade backup restore <app> <volume> <id>` puts a backup back. A failed backup is
 an alert.
 
-### Private registries and repositories
+### Private registries
 
 ```sh
-facade auth registry ghcr.io --user me     # prompts for a token (read:packages)
-facade auth git github.com --user me       # a token that can read the repositories
+facade registry login ghcr.io --user me     # prompts for a token (read:packages)
 ```
 
-Logins are stored encrypted on the server and sent to nodes for pulls, clones
-(`https://` URLs) and builds (a Dockerfile's `FROM` can use a private registry).
-Changing one restarts nothing.
+Logins are stored encrypted on the server and sent to nodes for image pulls and
+builds (a Dockerfile's `FROM` can name a private image). Changing one restarts
+nothing. Like git credentials, a login belongs to someone: an app's pulls and builds
+use its owner's (the admins' for the admins' apps).
 
 ### Ports
 
@@ -319,14 +484,21 @@ Every command accepts `--json`. Instead of `facade login`, set `FACADE_SERVER`,
 
 ### Export / restore
 
-`facade export` writes every node and app as TOML. Variables marked sensitive appear
+`facade export` writes every node, app and stack as TOML. Variables marked sensitive appear
 as `{ sensitive = true }` without their value. `facade apply` on a fresh server
 recreates everything, prints join tokens for the nodes it had to create and lists the
 secrets still to set. Applying is idempotent and never deletes anything.
 
+### Upgrading
+
+Servers and agents speak a versioned protocol; when it changes (it did with commit
+pinning and the build queue), upgrade `facaded` on the server and on every node.
+
 ## Not there yet
 
 * Users other than admins, and per-app permissions.
+* Links across nodes: a database and the apps using it share a node.
 * Backups to somewhere other than the server's disk (S3 and the like).
-* Redeploying on `git push` (webhooks).
-* Zero-downtime deploys: a changed app is stopped, then started again.
+* Zero-downtime deploys (the new container starting next to the old one) and deploys
+  on push (webhooks).
+* Stacks and databases owned by members (admins create them for now).
