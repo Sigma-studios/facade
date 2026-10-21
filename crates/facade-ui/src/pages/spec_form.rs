@@ -34,8 +34,8 @@ pub struct SpecForm {
     python_entry: RwSignal<String>,
     static_dir: RwSignal<String>,
     http_port: RwSignal<String>,
-    domains: RwSignal<String>,
-    redirects: RwSignal<String>,
+    domains: RwSignal<Vec<DomainRow>>,
+    redirects: RwSignal<Vec<DomainRow>>,
     ports: RwSignal<Vec<PortRow>>,
     host_network: RwSignal<bool>,
     volumes: RwSignal<String>,
@@ -89,8 +89,8 @@ impl SpecForm {
             python_entry: s(""),
             static_dir: s("."),
             http_port: s(""),
-            domains: s(""),
-            redirects: s(""),
+            domains: RwSignal::new(vec![]),
+            redirects: RwSignal::new(vec![]),
             ports: RwSignal::new(vec![]),
             host_network: RwSignal::new(false),
             volumes: s(""),
@@ -178,8 +178,10 @@ impl SpecForm {
             }
         }
         form.http_port.set(opt_text(spec.http_port));
-        form.domains.set(spec.domains.join("\n"));
-        form.redirects.set(spec.redirects.join("\n"));
+        form.domains
+            .set(spec.domains.iter().map(|d| DomainRow::full(d)).collect());
+        form.redirects
+            .set(spec.redirects.iter().map(|d| DomainRow::full(d)).collect());
         form.ports
             .set(spec.ports.iter().map(PortRow::from_map).collect());
         form.host_network.set(spec.host_network);
@@ -458,14 +460,8 @@ impl SpecForm {
             node: text(self.node),
             source,
             http_port,
-            domains: list(self.domains)
-                .into_iter()
-                .map(|d| d.to_lowercase())
-                .collect(),
-            redirects: list(self.redirects)
-                .into_iter()
-                .map(|d| d.to_lowercase())
-                .collect(),
+            domains: domain_list(self.domains),
+            redirects: domain_list(self.redirects),
             ports,
             host_network,
             limits: Limits { memory_mb, cpus },
@@ -482,6 +478,139 @@ impl SpecForm {
         };
         spec.validate().map_err(|e| e.to_string())?;
         Ok(spec)
+    }
+}
+
+/// One line of a domains editor: a name under one of the domains the DNS
+/// provider manages (empty for that domain itself), or any full domain when
+/// `zone` is empty.
+#[derive(Clone, Copy)]
+pub struct DomainRow {
+    id: usize,
+    name: RwSignal<String>,
+    zone: RwSignal<String>,
+}
+
+impl DomainRow {
+    fn new(zone: String) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            name: RwSignal::new(String::new()),
+            zone: RwSignal::new(zone),
+        }
+    }
+
+    fn full(domain: &str) -> Self {
+        let row = Self::new(String::new());
+        row.name.set(domain.to_string());
+        row
+    }
+
+    fn domain(&self) -> String {
+        let name = self
+            .name
+            .get_untracked()
+            .trim()
+            .trim_matches('.')
+            .to_lowercase();
+        let zone = self.zone.get_untracked();
+        match (name.is_empty(), zone.is_empty()) {
+            (_, true) => name,
+            (true, false) => zone,
+            (false, false) => format!("{name}.{zone}"),
+        }
+    }
+
+    /// Shows a full domain as a name under the longest managed domain it
+    /// belongs to, if any.
+    fn split(&self, zones: &[String]) {
+        if !self.zone.get_untracked().is_empty() {
+            return;
+        }
+        let domain = self.domain();
+        let zone = zones
+            .iter()
+            .filter(|z| domain == **z || domain.ends_with(&format!(".{z}")))
+            .max_by_key(|z| z.len());
+        if let Some(zone) = zone {
+            let name = domain[..domain.len() - zone.len()].trim_end_matches('.');
+            self.name.set(name.to_string());
+            self.zone.set(zone.clone());
+        }
+    }
+}
+
+fn domain_list(rows: RwSignal<Vec<DomainRow>>) -> Vec<String> {
+    rows.get_untracked()
+        .iter()
+        .map(DomainRow::domain)
+        .filter(|d| !d.is_empty())
+        .collect()
+}
+
+/// Domains as a name plus one of the domains the DNS provider manages, or any
+/// other domain (whose DNS is then set up by hand).
+#[component]
+fn DomainsEditor(
+    rows: RwSignal<Vec<DomainRow>>,
+    #[prop(into)] zones: Signal<Vec<String>>,
+    placeholder: &'static str,
+    add_label: &'static str,
+) -> impl IntoView {
+    // Saved domains arrive whole; split them once the managed domains are known.
+    Effect::new(move |_| {
+        zones.with(|z| rows.with_untracked(|r| r.iter().for_each(|row| row.split(z))))
+    });
+    let choose = move |row: DomainRow, zone: String| {
+        if zone.is_empty() {
+            // Other: start from the whole domain.
+            row.name.set(row.domain());
+        } else if row.zone.get_untracked().is_empty() {
+            let typed = row.domain();
+            let name = if typed == zone {
+                ""
+            } else {
+                typed.strip_suffix(&format!(".{zone}")).unwrap_or(&typed)
+            };
+            row.name.set(name.to_string());
+        }
+        row.zone.set(zone);
+    };
+    view! {
+        <div class="domains-editor">
+            <For each=move || rows.get() key=|row| row.id let:row>
+                <div class="domain-row">
+                    <input type="text" bind:value=row.name
+                        placeholder=move || if row.zone.with(String::is_empty) { placeholder } else { "name (empty: the domain itself)" }
+                        aria-label=move || if row.zone.with(String::is_empty) { "Domain" } else { "Name under the chosen domain" }/>
+                    <Show when=move || !zones.with(Vec::is_empty)>
+                        <select aria-label="Domain" on:change=move |ev| choose(row, event_target_value(&ev))
+                            prop:value=move || row.zone.get()>
+                            <For each=move || zones.get() key=|z| z.clone() let:zone>
+                                <option value=zone.clone()
+                                    selected={
+                                        let z = zone.clone();
+                                        move || row.zone.with(|r| *r == z)
+                                    }>
+                                    {format!(".{zone}")}
+                                </option>
+                            </For>
+                            <option value="" selected=move || row.zone.with(String::is_empty)>"Other domain…"</option>
+                        </select>
+                    </Show>
+                    <button type="button" class="icon-button" aria-label="Remove this domain"
+                        on:click=move |_| rows.update(|r| r.retain(|x| x.id != row.id))>"×"</button>
+                </div>
+            </For>
+            <button type="button" class="button"
+                on:click=move |_| rows.update(|r| r.push(DomainRow::new(
+                    zones.with_untracked(|z| z.first().cloned().unwrap_or_default()),
+                )))>
+                {add_label}
+            </button>
+        </div>
     }
 }
 
@@ -656,6 +785,13 @@ pub fn SpecFields(
 ) -> impl IntoView {
     let f = form;
     let me = me();
+    // Domains the DNS provider manages, offered in the domain pickers.
+    let zones = RwSignal::new(Vec::<String>::new());
+    spawn_local(async move {
+        if let Ok(z) = api::get::<Vec<String>>("/api/dns/zones").await {
+            zones.try_set(z);
+        }
+    });
     // Capacity of the chosen node, which bounds the limit sliders.
     let node_stat = move |pick: fn(&facade_core::proto::NodeStats) -> f64| {
         let node = f.node.get();
@@ -835,17 +971,21 @@ pub fn SpecFields(
                         <small>"The port your app listens on. Needed for domains."</small>
                     </label>
                 </Show>
-                <label class="field grow">
+                <div class="field grow">
                     <span>"Domains"</span>
-                    <textarea rows="2" bind:value=f.domains placeholder="app.example.com"></textarea>
-                    <small>"One per line; the first is the main domain. Each must point at the app's node; the Domains page shows how, and HTTPS follows on its own."</small>
-                </label>
+                    <DomainsEditor rows=f.domains zones=zones placeholder="app.example.com" add_label="Add a domain"/>
+                    <small>{move || if zones.with(Vec::is_empty) {
+                        "The first is the main domain. Each must point at the app's node; the Domains page shows how, and HTTPS follows on its own."
+                    } else {
+                        "The first is the main domain. Records under the listed domains are created for you; an other domain must point at the app's node (the Domains page shows how). HTTPS follows on its own."
+                    }}</small>
+                </div>
             </div>
-            <label class="field">
+            <div class="field">
                 <span>"Redirects"</span>
-                <textarea rows="2" bind:value=f.redirects placeholder="www.example.com"></textarea>
-                <small>"One per line. Visitors are sent to the main domain, keeping the path."</small>
-            </label>
+                <DomainsEditor rows=f.redirects zones=zones placeholder="www.example.com" add_label="Add a redirect"/>
+                <small>"Visitors are sent to the main domain, keeping the path."</small>
+            </div>
             <Show when=move || !f.is_static()>
                 <div class="form-row">
                     <div class="field grow">

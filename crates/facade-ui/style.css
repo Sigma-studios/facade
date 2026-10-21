@@ -752,6 +752,11 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .port-row .segmented { flex-shrink: 0; }
 .port-count { min-width: 5em; }
 
+.domains-editor { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.domain-row { display: flex; gap: 8px; align-items: center; width: 100%; }
+.domain-row input[type="text"] { flex: 1; min-width: 0; }
+.domain-row select { flex: 0 1 auto; min-width: 0; }
+
 /* ---------------------------------------------------------------- amount sliders */
 
 .slider-row { display: flex; align-items: center; gap: 10px; }
