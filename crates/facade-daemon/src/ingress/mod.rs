@@ -178,6 +178,11 @@ pub struct Ingress {
     tcp: Mutex<HashMap<u16, watch::Sender<bool>>>,
     /// Set once a newer entry point took over: no TLS port starts any more.
     retired: AtomicBool,
+    /// Turns true then too: open connections finish what they are doing and
+    /// close, so clients reconnect to the new process. Kept alive (a page
+    /// polling every few seconds keeps it so), a connection would otherwise
+    /// stay here, with routes that no longer change, until the drain ends.
+    retiring: watch::Sender<bool>,
 }
 
 impl Ingress {
@@ -204,6 +209,7 @@ impl Ingress {
             status: watch::channel(()).0,
             tcp: Default::default(),
             retired: AtomicBool::new(false),
+            retiring: watch::channel(false).0,
         }))
     }
 
@@ -343,13 +349,22 @@ impl Ingress {
     where
         I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     {
+        let mut retiring = self.retiring.subscribe();
         let service = hyper::service::service_fn(move |req| {
             let ingress = self.clone();
             async move { Ok::<_, Infallible>(ingress.handle(req, peer, tls).await) }
         });
-        let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-            .serve_connection_with_upgrades(io, service)
-            .await;
+        let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+        let conn = builder.serve_connection_with_upgrades(io, service);
+        tokio::pin!(conn);
+        tokio::select! {
+            _ = conn.as_mut() => return,
+            _ = retiring.wait_for(|r| *r) => {}
+        }
+        // HTTP/2: GOAWAY; HTTP/1.1: no keep-alive after the current response.
+        // Upgraded connections (WebSockets) carry on until they end.
+        conn.as_mut().graceful_shutdown();
+        let _ = conn.await;
     }
 
     async fn handle(&self, req: Request<Incoming>, peer: SocketAddr, tls: bool) -> Response<Body> {
@@ -584,6 +599,36 @@ mod tests {
 
     fn host_of(h: &str) -> Option<String> {
         request_host(&Request::builder().header("host", h).body(()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_retiring_entry_point_closes_kept_alive_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("facade-retire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ingress = Ingress::new(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop_tx, stop) = watch::channel(false);
+        tokio::spawn(ingress.clone().serve(listener, false, stop));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ask = b"GET / HTTP/1.1\r\nHost: nowhere.example\r\n\r\n";
+        client.write_all(ask).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 404"));
+        assert_eq!(ingress.active_connections(), 1, "kept alive");
+
+        ingress.retire();
+        let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "the connection closes: {closed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ingress.active_connections(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -88,6 +88,7 @@ impl Ingress {
     /// Stops accepting on every TLS port, for good (a newer entry point took over).
     pub fn retire(&self) {
         self.retired.store(true, Ordering::Relaxed);
+        self.retiring.send_replace(true);
         for (_, stop) in self.tcp.lock().drain() {
             stop.send_replace(true);
         }
