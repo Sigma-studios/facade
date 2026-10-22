@@ -272,6 +272,12 @@ p { margin: 0 0 12px; }
 .spark-base { stroke: var(--border-strong); stroke-width: 1; }
 .spark-area { fill: var(--series-1-area); }
 .spark-line { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.spark-peak { fill: none; stroke: var(--series-1); stroke-opacity: 0.45; stroke-width: 1; stroke-dasharray: 4 3; stroke-linejoin: round; stroke-linecap: round; }
+.spark-key { display: inline-flex; align-items: center; gap: 5px; margin-left: 10px; color: var(--text-muted); font-weight: 400; font-size: 11.5px; }
+.spark-key-avg, .spark-key-peak { display: inline-block; width: 14px; height: 0; border-top: 2px solid var(--series-1); margin-left: 4px; }
+.spark-key-peak { border-top: 1px dashed var(--series-1); opacity: 0.6; }
+.spark-axis { display: flex; justify-content: space-between; margin-top: 4px; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.charts-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
 .spark-cross { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .spark-dot { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
 .spark-tip {

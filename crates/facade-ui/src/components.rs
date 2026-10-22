@@ -70,49 +70,88 @@ pub fn Meter(
 const SPARK_W: f64 = 600.0;
 const SPARK_H: f64 = 120.0;
 
-/// One series over time, with a hover crosshair and tooltip. `max` fixes the top of
-/// the scale (a memory limit, 100 % CPU); otherwise the data's maximum is used.
+/// One point of a [`Sparkline`]: the average over its span and the peak.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Sample {
+    pub at: u64,
+    pub value: f64,
+    pub peak: f64,
+}
+
+/// One series over `span` (start, end), with a hover crosshair and tooltip. Points
+/// further apart than `gap` seconds are not joined (the app was not running). A
+/// faint line shows the peaks when they differ from the averages. `max` fixes the
+/// top of the scale (a memory limit, a CPU limit); the data can raise it.
 #[component]
 pub fn Sparkline(
     title: &'static str,
-    #[prop(into)] points: Signal<Vec<(u64, f64)>>,
+    #[prop(into)] points: Signal<Vec<Sample>>,
+    #[prop(into)] span: Signal<(u64, u64)>,
+    #[prop(into)] gap: Signal<u64>,
     #[prop(into)] max: Signal<Option<f64>>,
     format: fn(f64) -> String,
 ) -> impl IntoView {
     let hover = RwSignal::new(None::<usize>);
     let scale = move || {
-        let data_max = points.with(|p| p.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max));
+        let data_max = points.with(|p| {
+            p.iter()
+                .map(|s| s.peak.max(s.value))
+                .fold(0.0_f64, f64::max)
+        });
         max.get().unwrap_or(0.0).max(data_max).max(1e-9)
     };
-    let xy = move |i: usize, v: f64, n: usize| {
-        let x = if n <= 1 {
-            SPARK_W
-        } else {
-            i as f64 * SPARK_W / (n - 1) as f64
-        };
-        let y = SPARK_H - (v / scale()) * (SPARK_H - 8.0) - 2.0;
-        (x, y)
+    let x_of = move |at: u64| {
+        let (start, end) = span.get();
+        let width = end.saturating_sub(start).max(1) as f64;
+        (at.saturating_sub(start) as f64 / width * SPARK_W).min(SPARK_W)
     };
-    let line = move || {
+    let y_of = move |v: f64| SPARK_H - (v / scale()) * (SPARK_H - 8.0) - 2.0;
+    let has_peaks = move || points.with(|p| p.iter().any(|s| s.peak > s.value * 1.05 + 1e-9));
+    // Runs of points close enough in time to be joined.
+    let runs = move || {
+        let gap = gap.get();
         points.with(|p| {
-            let n = p.len();
-            p.iter()
-                .enumerate()
-                .map(|(i, (_, v))| {
-                    let (x, y) = xy(i, *v, n);
-                    format!("{}{x:.1},{y:.1}", if i == 0 { "M" } else { "L" })
-                })
-                .collect::<String>()
+            let mut runs: Vec<Vec<Sample>> = Vec::new();
+            for s in p {
+                match runs.last_mut() {
+                    Some(run) if run.last().is_some_and(|l| s.at.saturating_sub(l.at) <= gap) => {
+                        run.push(*s)
+                    }
+                    _ => runs.push(vec![*s]),
+                }
+            }
+            runs
         })
     };
-    let area = move || {
-        let l = line();
-        if l.is_empty() {
-            return String::new();
+    let path = move |pick: fn(&Sample) -> f64, close: bool| {
+        let mut d = String::new();
+        for run in runs() {
+            for (i, s) in run.iter().enumerate() {
+                let (x, y) = (x_of(s.at), y_of(pick(s)));
+                d.push_str(&format!("{}{x:.1},{y:.1} ", if i == 0 { "M" } else { "L" }));
+            }
+            let (first, last) = (x_of(run[0].at), x_of(run[run.len() - 1].at));
+            if close {
+                d.push_str(&format!("L{last:.1},{SPARK_H} L{first:.1},{SPARK_H} Z "));
+            } else if run.len() == 1 {
+                // A lone point: a zero-length segment, drawn as a dot by the round cap.
+                d.push_str("l0.01,0 ");
+            }
         }
-        format!("{l} L{SPARK_W},{SPARK_H} L0,{SPARK_H} Z")
+        d
     };
-    let current = move || points.with(|p| p.last().map(|(_, v)| format(*v)));
+    let current = move || points.with(|p| p.last().map(|s| format(s.value)));
+    let long = move || {
+        let (start, end) = span.get();
+        end.saturating_sub(start) > 86400
+    };
+    let stamp = move |at: u64| {
+        if long() {
+            format!("{} {}", crate::util::day(at), crate::util::clock(at))
+        } else {
+            crate::util::clock(at)
+        }
+    };
     let on_move = move |ev: leptos::ev::MouseEvent| {
         use wasm_bindgen::JsCast;
         let Some(target) = ev.current_target() else {
@@ -120,58 +159,79 @@ pub fn Sparkline(
         };
         let el: web_sys::Element = target.unchecked_into();
         let width = el.get_bounding_client_rect().width();
-        let n = points.with(Vec::len);
-        if n == 0 || width <= 0.0 {
+        if width <= 0.0 {
             return;
         }
-        let fraction = (ev.offset_x() as f64 / width).clamp(0.0, 1.0);
-        hover.set(Some(((fraction * (n - 1) as f64).round()) as usize));
+        let x = (ev.offset_x() as f64 / width).clamp(0.0, 1.0) * SPARK_W;
+        let nearest = points.with(|p| {
+            p.iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| (x_of(a.at) - x).abs().total_cmp(&(x_of(b.at) - x).abs()))
+                .map(|(i, _)| i)
+        });
+        hover.set(nearest);
     };
     let hovered = move || {
         let i = hover.get()?;
-        points.with(|p| {
-            let n = p.len();
-            p.get(i).map(|(at, v)| {
-                let (x, y) = xy(i, *v, n);
-                (x, y, *at, *v)
-            })
-        })
+        points.with(|p| p.get(i).copied())
     };
 
     view! {
         <figure class="spark">
             <figcaption class="spark-head">
-                <span class="spark-title">{title}</span>
+                <span class="spark-title">
+                    {title}
+                    <Show when=has_peaks>
+                        <span class="spark-key">
+                            <span class="spark-key-avg"></span>"average"
+                            <span class="spark-key-peak"></span>"peak"
+                        </span>
+                    </Show>
+                </span>
                 <span class="spark-now">{move || current().unwrap_or_else(|| "—".into())}</span>
             </figcaption>
             <Show
-                when=move || points.with(|p| p.len() > 1)
-                fallback=|| view! { <div class="spark-empty">"Collecting samples…"</div> }
+                when=move || points.with(|p| !p.is_empty())
+                fallback=|| view! { <div class="spark-empty">"No samples over this period yet"</div> }
             >
                 <div class="spark-plot" on:mousemove=on_move on:mouseleave=move |_| hover.set(None)>
                     <svg viewBox=format!("0 0 {SPARK_W} {SPARK_H}") preserveAspectRatio="none"
                         role="img" aria-label=title>
                         <line class="spark-base" x1="0" x2=SPARK_W y1=SPARK_H y2=SPARK_H
                             vector-effect="non-scaling-stroke"/>
-                        <path class="spark-area" d=area/>
-                        <path class="spark-line" d=line vector-effect="non-scaling-stroke"/>
-                        {move || hovered().map(|(x, y, _, _)| view! {
-                            <line class="spark-cross" x1=x x2=x y1="0" y2=SPARK_H
+                        <path class="spark-area" d=move || path(|s| s.value, true)/>
+                        <Show when=has_peaks>
+                            <path class="spark-peak" d=move || path(|s| s.peak, false)
                                 vector-effect="non-scaling-stroke"/>
-                            <circle class="spark-dot" cx=x cy=y r="4"
-                                vector-effect="non-scaling-stroke"/>
+                        </Show>
+                        <path class="spark-line" d=move || path(|s| s.value, false)
+                            vector-effect="non-scaling-stroke"/>
+                        {move || hovered().map(|s| {
+                            let (x, y) = (x_of(s.at), y_of(s.value));
+                            view! {
+                                <line class="spark-cross" x1=x x2=x y1="0" y2=SPARK_H
+                                    vector-effect="non-scaling-stroke"/>
+                                <circle class="spark-dot" cx=x cy=y r="4"
+                                    vector-effect="non-scaling-stroke"/>
+                            }
                         })}
                     </svg>
-                    {move || hovered().map(|(x, _, at, v)| {
-                        let left = (x / SPARK_W * 100.0).clamp(8.0, 92.0);
+                    {move || hovered().map(|s| {
+                        let left = (x_of(s.at) / SPARK_W * 100.0).clamp(12.0, 88.0);
+                        let peak = (s.peak > s.value * 1.05 + 1e-9).then(|| format!("peak {}", format(s.peak)));
                         view! {
                             <div class="spark-tip" style=format!("left: {left:.1}%")>
-                                <strong>{format(v)}</strong>
-                                <span>{crate::util::clock(at)}</span>
+                                <strong>{format(s.value)}</strong>
+                                {peak.map(|p| view! { <span>{p}</span> })}
+                                <span>{stamp(s.at)}</span>
                             </div>
                         }
                     })}
                     <div class="spark-scale">{move || format(scale())}</div>
+                </div>
+                <div class="spark-axis">
+                    <span>{move || stamp(span.get().0)}</span>
+                    <span>"now"</span>
                 </div>
             </Show>
         </figure>

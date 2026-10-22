@@ -499,6 +499,17 @@ pub struct AppMetric {
     pub stats: AppStats,
 }
 
+/// An app's resource use over a span of time starting at `at`: averages and peaks.
+/// CPU is in percent of one core, memory in bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsagePoint {
+    pub at: u64,
+    pub cpu: f32,
+    pub cpu_peak: f32,
+    pub mem: u64,
+    pub mem_peak: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertView {
     pub key: String,
