@@ -44,7 +44,9 @@ pub enum Link {
     },
     External {
         control: PathBuf,
-        table: watch::Sender<Table>,
+        /// `None` until the first table: an agent just started knows no app
+        /// yet, and must not empty the entry point's routes.
+        table: watch::Sender<Option<Table>>,
         connected: AtomicBool,
         /// From the entry point's last status.
         bind_errors: Mutex<Vec<String>>,
@@ -62,7 +64,7 @@ impl Link {
             },
             IngressMode::External { control } => Link::External {
                 control,
-                table: watch::channel(Table::default()).0,
+                table: watch::channel(None).0,
                 connected: AtomicBool::new(false),
                 bind_errors: Default::default(),
                 upgrade: Notify::new(),
@@ -75,8 +77,8 @@ impl Link {
             Link::Embedded { ingress, .. } => ingress.set_table(new),
             Link::External { table, .. } => {
                 table.send_if_modified(|current| {
-                    let changed = *current != new;
-                    *current = new;
+                    let changed = current.as_ref() != Some(&new);
+                    *current = Some(new);
                     changed
                 });
             }
@@ -146,6 +148,11 @@ impl Agent {
 
     /// Rebuilds the routing table from the current state and publishes it.
     pub(super) async fn refresh_routes(&self) {
+        // Until the server has said which apps run here, an empty table would
+        // take every route down (right after the agent restarts).
+        if !self.synced.load(Ordering::Relaxed) {
+            return;
+        }
         let workloads: Vec<_> = self.workloads.lock().values().cloned().collect();
         let mut routes = BTreeMap::new();
         let mut tcp = BTreeMap::new();
@@ -242,13 +249,17 @@ impl Agent {
             let mut tables = table.subscribe();
             let result: anyhow::Result<()> = async {
                 let current = tables.borrow_and_update().clone();
-                write_json(&mut write, &ToIngress::Table { table: current }).await?;
+                if let Some(table) = current {
+                    write_json(&mut write, &ToIngress::Table { table }).await?;
+                }
                 loop {
                     tokio::select! {
                         changed = tables.changed() => {
                             changed?;
                             let current = tables.borrow_and_update().clone();
-                            write_json(&mut write, &ToIngress::Table { table: current }).await?;
+                            if let Some(table) = current {
+                                write_json(&mut write, &ToIngress::Table { table }).await?;
+                            }
                         }
                         _ = upgrade.notified() => {
                             write_json(&mut write, &ToIngress::Upgrade).await?;

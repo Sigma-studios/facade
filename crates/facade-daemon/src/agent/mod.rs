@@ -75,6 +75,8 @@ pub struct Agent {
     runtime: Runtime,
     /// Last desired state received from the server.
     workloads: Mutex<HashMap<String, Workload>>,
+    /// Set by the server's first `Sync`: until then `workloads` is not known.
+    synced: AtomicBool,
     /// Serialises operations on the same app (a deploy and a sync must not interleave).
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Sender of the current control connection, if any.
@@ -115,6 +117,7 @@ impl Agent {
             token,
             runtime,
             workloads: Default::default(),
+            synced: AtomicBool::new(false),
             locks: Default::default(),
             outbox: Default::default(),
             failed: Default::default(),
@@ -259,6 +262,9 @@ impl Agent {
                     .map(|w| (w.spec.name.clone(), w))
                     .collect();
                 *self.workloads.lock() = map;
+                self.synced.store(true, Ordering::Relaxed);
+                let agent = self.clone();
+                tokio::spawn(async move { agent.refresh_routes().await });
                 tokio::spawn(self.clone().reconcile_all());
             }
             AgentRequest::Apply {
