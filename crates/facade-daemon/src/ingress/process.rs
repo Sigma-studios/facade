@@ -423,9 +423,16 @@ mod tests {
         let mut table = Table::default();
         table.tcp.insert(
             465,
-            super::super::tcp::TcpRoute { app: "valet".into(), port: Some(32780), names: vec!["mail.example.com".into()] },
+            super::super::tcp::TcpRoute {
+                app: "valet".into(),
+                port: Some(32780),
+                names: vec!["mail.example.com".into()],
+            },
         );
-        let line = serde_json::to_string(&ToIngress::Table { table: table.clone() }).unwrap();
+        let line = serde_json::to_string(&ToIngress::Table {
+            table: table.clone(),
+        })
+        .unwrap();
         match serde_json::from_str::<ToIngress>(&line).unwrap() {
             ToIngress::Table { table: back } => assert_eq!(back, table),
             other => panic!("{other:?}"),
