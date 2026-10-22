@@ -2,7 +2,8 @@
 //! apps running on the node; WebSocket (and any HTTP/1.1 upgrade) is spliced
 //! through.
 //!
-//! It also takes TLS off raw TCP ports for apps that ask (see [`tcp`]).
+//! It also takes TLS off raw TCP ports for apps that ask (see [`tcp`]), and
+//! opens those ports in ufw while it serves them (see [`firewall`]).
 //!
 //! What to serve comes as a [`Table`] from the node's agent: routes, TLS ports,
 //! certificates and ACME HTTP-01 answers. The table is kept on disk, so apps stay reachable
@@ -14,6 +15,7 @@
 //! entry point updates itself by handing its listening sockets to the new
 //! binary while the old one finishes its open connections.
 
+mod firewall;
 pub mod process;
 pub mod tcp;
 

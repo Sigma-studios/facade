@@ -480,6 +480,11 @@ TCP keepalives. The app sees them come from 127.0.0.1. A TLS port conflicts with
 other apps' ports like a published one, and one that cannot be bound is reported
 like 80 and 443.
 
+When ufw is active, the entry point opens a TLS port in it (`ufw allow
+<port>/tcp`, commented *facade tls port*) as it starts serving it, and closes it
+again once no app asks for it. Published ports need nothing: Docker lets them in
+past ufw by itself.
+
 ### Alerts on Discord
 
 Create a webhook in a channel (Edit channel → Integrations → Webhooks → New Webhook),
