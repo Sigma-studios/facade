@@ -18,6 +18,11 @@ impl RepoLocation {
         format!("{}/{}", self.host, self.path.to_lowercase())
     }
 
+    /// The repository's page in a browser (the hosts' usual layout).
+    pub fn web_url(&self) -> String {
+        format!("https://{}/{}", self.host, self.path)
+    }
+
     pub fn https_url(&self) -> String {
         format!("https://{}/{}.git", self.host, self.path)
     }
@@ -188,6 +193,11 @@ mod tests {
             let l = parse(url).unwrap_or_else(|| panic!("{url}"));
             assert_eq!(l.key(), "github.com/sigma-studios/facade", "{url}");
             assert_eq!(l.path, "Sigma-studios/facade");
+            assert_eq!(
+                l.web_url(),
+                "https://github.com/Sigma-studios/facade",
+                "{url}"
+            );
         }
         let l = parse("ssh://git@git.example.com:2222/team/app.git").unwrap();
         assert_eq!(l.ssh_url(), "ssh://git@git.example.com:2222/team/app.git");
