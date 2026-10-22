@@ -51,10 +51,32 @@ pub struct Table {
     pub routes: BTreeMap<String, Route>,
     pub certs: Vec<CertBundle>,
     /// Public TCP port → the app TLS-wrapped connections on it go to.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "port_keys")]
     pub tcp: BTreeMap<u16, tcp::TcpRoute>,
     /// ACME HTTP-01 token → key authorization.
     pub challenges: BTreeMap<String, String>,
+}
+
+/// Port-keyed maps as JSON objects with string keys, read back by hand: the
+/// table travels inside an internally tagged enum, whose buffering cannot turn
+/// `"465"` back into a number.
+mod port_keys {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<V: Serialize, S: Serializer>(map: &BTreeMap<u16, V>, s: S) -> Result<S::Ok, S::Error> {
+        let by_name: BTreeMap<String, &V> = map.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        by_name.serialize(s)
+    }
+
+    pub fn deserialize<'de, V: Deserialize<'de>, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<u16, V>, D::Error> {
+        let by_name = BTreeMap::<String, V>::deserialize(d)?;
+        by_name
+            .into_iter()
+            .map(|(k, v)| k.parse().map(|k| (k, v)).map_err(|_| serde::de::Error::custom(format!("bad port {k}"))))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
