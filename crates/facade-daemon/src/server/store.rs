@@ -140,12 +140,49 @@ CREATE TABLE IF NOT EXISTS app_usage (
     mem_peak INTEGER NOT NULL,
     PRIMARY KEY (app, at)
 ) WITHOUT ROWID;
+-- The same for nodes, with their disk use.
+CREATE TABLE IF NOT EXISTS node_usage (
+    node TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    samples INTEGER NOT NULL,
+    cpu REAL NOT NULL,
+    cpu_peak REAL NOT NULL,
+    mem REAL NOT NULL,
+    mem_peak INTEGER NOT NULL,
+    disk REAL NOT NULL,
+    PRIMARY KEY (node, at)
+) WITHOUT ROWID;
 "#;
 
 /// Seconds of app usage stored as one row.
 pub const USAGE_BUCKET: u64 = 300;
-/// How long app usage is kept, in seconds.
+/// How long usage is kept, in seconds.
 pub const USAGE_KEEP: u64 = 30 * 86400;
+
+/// Whose usage: an app's or a node's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageOf {
+    App,
+    Node,
+}
+
+impl UsageOf {
+    /// Its table, the column naming the app or node, and what it reads as disk.
+    fn sql(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            UsageOf::App => ("app_usage", "app", "0"),
+            UsageOf::Node => ("node_usage", "node", "disk"),
+        }
+    }
+}
+
+/// One report's figures for an app or a node: CPU in percent, bytes otherwise.
+pub struct UsageSample {
+    pub name: String,
+    pub cpu: f32,
+    pub mem: u64,
+    pub disk: u64,
+}
 
 /// The owner id of logins and credentials shared by every admin.
 pub const ADMINS: i64 = 0;
@@ -749,48 +786,81 @@ impl Store {
 
     // ---- usage
 
-    /// Folds one sample per app, `(app, cpu %, memory bytes)`, into its bucket.
-    pub fn record_usage(&self, at: u64, samples: &[(String, f32, u64)]) -> anyhow::Result<()> {
+    /// Folds one report's samples into their buckets.
+    pub fn record_usage(
+        &self,
+        of: UsageOf,
+        at: u64,
+        samples: &[UsageSample],
+    ) -> anyhow::Result<()> {
+        let (table, key, _) = of.sql();
         let bucket = at - at % USAGE_BUCKET;
         let mut conn = self.0.lock();
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO app_usage (app, at, samples, cpu, cpu_peak, mem, mem_peak)
-                 VALUES (?1, ?2, 1, ?3, ?3, ?4, ?4)
-                 ON CONFLICT (app, at) DO UPDATE SET
+            // The app table has no disk column: its value is bound and unused.
+            let (disk_col, disk_val, disk_set) = match of {
+                UsageOf::App => ("", "", ""),
+                UsageOf::Node => (
+                    ", disk",
+                    ", ?5",
+                    ", disk = (disk * samples + excluded.disk) / (samples + 1)",
+                ),
+            };
+            let mut stmt = tx.prepare_cached(&format!(
+                "INSERT INTO {table} ({key}, at, samples, cpu, cpu_peak, mem, mem_peak{disk_col})
+                 VALUES (?1, ?2, 1, ?3, ?3, ?4, ?4{disk_val})
+                 ON CONFLICT ({key}, at) DO UPDATE SET
                     cpu = (cpu * samples + excluded.cpu) / (samples + 1),
                     cpu_peak = max(cpu_peak, excluded.cpu),
                     mem = (mem * samples + excluded.mem) / (samples + 1),
-                    mem_peak = max(mem_peak, excluded.mem_peak),
-                    samples = samples + 1",
-            )?;
-            for (app, cpu, mem) in samples {
-                stmt.execute(params![app, bucket as i64, f64::from(*cpu), *mem as i64])?;
+                    mem_peak = max(mem_peak, excluded.mem_peak){disk_set},
+                    samples = samples + 1"
+            ))?;
+            for s in samples {
+                let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                    Box::new(s.name.clone()),
+                    Box::new(bucket as i64),
+                    Box::new(f64::from(s.cpu)),
+                    Box::new(s.mem as i64),
+                ];
+                if of == UsageOf::Node {
+                    values.push(Box::new(s.disk as f64));
+                }
+                stmt.execute(rusqlite::params_from_iter(values.iter()))?;
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// An app's usage since `since`, in buckets of `step` seconds (a multiple of
+    /// Usage since `since`, in buckets of `step` seconds (a multiple of
     /// `USAGE_BUCKET`), oldest first.
-    pub fn usage(&self, app: &str, since: u64, step: u64) -> anyhow::Result<Vec<UsagePoint>> {
+    pub fn usage(
+        &self,
+        of: UsageOf,
+        name: &str,
+        since: u64,
+        step: u64,
+    ) -> anyhow::Result<Vec<UsagePoint>> {
+        let (table, key, disk) = of.sql();
         let step = step.max(USAGE_BUCKET) as i64;
         let conn = self.0.lock();
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT at / ?3 * ?3 AS b, SUM(cpu * samples) / SUM(samples), MAX(cpu_peak),
-                    SUM(mem * samples) / SUM(samples), MAX(mem_peak)
-             FROM app_usage WHERE app = ?1 AND at >= ?2 GROUP BY b ORDER BY b",
-        )?;
+                    SUM(mem * samples) / SUM(samples), MAX(mem_peak),
+                    SUM({disk} * samples) / SUM(samples)
+             FROM {table} WHERE {key} = ?1 AND at >= ?2 GROUP BY b ORDER BY b"
+        ))?;
         let rows = stmt
-            .query_map(params![app, since as i64, step], |r| {
+            .query_map(params![name, since as i64, step], |r| {
                 Ok(UsagePoint {
                     at: r.get::<_, i64>(0)? as u64,
                     cpu: r.get::<_, f64>(1)? as f32,
                     cpu_peak: r.get::<_, f64>(2)? as f32,
                     mem: r.get::<_, f64>(3)? as u64,
                     mem_peak: r.get::<_, i64>(4)? as u64,
+                    disk: (of == UsageOf::Node).then(|| r.get::<_, f64>(5).unwrap_or(0.0) as u64),
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -799,9 +869,13 @@ impl Store {
 
     /// Drops usage older than `before`.
     pub fn prune_usage(&self, before: u64) -> anyhow::Result<()> {
-        self.0
-            .lock()
-            .execute("DELETE FROM app_usage WHERE at < ?1", [before as i64])?;
+        let conn = self.0.lock();
+        for (table, _, _) in [UsageOf::App.sql(), UsageOf::Node.sql()] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE at < ?1"),
+                [before as i64],
+            )?;
+        }
         Ok(())
     }
 
@@ -1487,30 +1561,61 @@ mod tests {
     #[test]
     fn usage_is_bucketed_and_merged() {
         let store = Store::open(Path::new(":memory:")).unwrap();
+        let sample = |name: &str, cpu: f32, mem: u64| UsageSample {
+            name: name.into(),
+            cpu,
+            mem,
+            disk: mem * 10,
+        };
+        let app = UsageOf::App;
         // Two samples in one 5-minute bucket, one in the next.
-        store.record_usage(600, &[("a".into(), 10.0, 100)]).unwrap();
         store
-            .record_usage(615, &[("a".into(), 30.0, 300), ("b".into(), 1.0, 1)])
+            .record_usage(app, 600, &[sample("a", 10.0, 100)])
             .unwrap();
         store
-            .record_usage(900, &[("a".into(), 50.0, 200), ("b".into(), 1.0, 1)])
+            .record_usage(app, 615, &[sample("a", 30.0, 300), sample("b", 1.0, 1)])
             .unwrap();
-        let points = store.usage("a", 0, USAGE_BUCKET).unwrap();
+        store
+            .record_usage(app, 900, &[sample("a", 50.0, 200), sample("b", 1.0, 1)])
+            .unwrap();
+        let points = store.usage(app, "a", 0, USAGE_BUCKET).unwrap();
         assert_eq!(points.len(), 2);
         assert_eq!(
             (points[0].at, points[0].cpu, points[0].cpu_peak),
             (600, 20.0, 30.0)
         );
-        assert_eq!((points[0].mem, points[0].mem_peak), (200, 300));
+        assert_eq!(
+            (points[0].mem, points[0].mem_peak, points[0].disk),
+            (200, 300, None)
+        );
         // Merged into one 30-minute bucket, weighted by samples.
-        let merged = store.usage("a", 0, 1800).unwrap();
+        let merged = store.usage(app, "a", 0, 1800).unwrap();
         assert_eq!(merged.len(), 1);
         assert!((merged[0].cpu - 30.0).abs() < 1e-4);
         assert_eq!(merged[0].cpu_peak, 50.0);
+        // Nodes keep their disk too, apart from apps of the same name.
+        store
+            .record_usage(
+                UsageOf::Node,
+                600,
+                &[sample("a", 5.0, 100), sample("a", 7.0, 300)],
+            )
+            .unwrap();
+        let node = store.usage(UsageOf::Node, "a", 0, USAGE_BUCKET).unwrap();
+        assert_eq!(
+            (node.len(), node[0].cpu, node[0].disk),
+            (1, 6.0, Some(2000))
+        );
         store.prune_usage(900).unwrap();
-        assert_eq!(store.usage("a", 0, USAGE_BUCKET).unwrap().len(), 1);
+        assert_eq!(store.usage(app, "a", 0, USAGE_BUCKET).unwrap().len(), 1);
+        assert!(
+            store
+                .usage(UsageOf::Node, "a", 0, USAGE_BUCKET)
+                .unwrap()
+                .is_empty()
+        );
         store.delete_app("a").unwrap();
-        assert!(store.usage("a", 0, USAGE_BUCKET).unwrap().is_empty());
-        assert_eq!(store.usage("b", 0, USAGE_BUCKET).unwrap().len(), 1);
+        assert!(store.usage(app, "a", 0, USAGE_BUCKET).unwrap().is_empty());
+        assert_eq!(store.usage(app, "b", 0, USAGE_BUCKET).unwrap().len(), 1);
     }
 }

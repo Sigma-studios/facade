@@ -277,6 +277,8 @@ p { margin: 0 0 12px; }
 .spark-key-avg, .spark-key-peak { display: inline-block; width: 14px; height: 0; border-top: 2px solid var(--series-1); margin-left: 4px; }
 .spark-key-peak { border-top: 1px dashed var(--series-1); opacity: 0.6; }
 .spark-axis { display: flex; justify-content: space-between; margin-top: 4px; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.node-usage { margin-top: 28px; }
+.node-usage > .segmented { margin-bottom: 12px; }
 .charts-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
 .spark-cross { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .spark-dot { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }

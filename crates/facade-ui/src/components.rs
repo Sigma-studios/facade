@@ -1,3 +1,4 @@
+use facade_core::api::UsagePoint;
 use facade_core::proto::AppState;
 use leptos::prelude::*;
 
@@ -235,6 +236,129 @@ pub fn Sparkline(
                 </div>
             </Show>
         </figure>
+    }
+}
+
+/// The periods the usage charts cover.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Range {
+    Hour,
+    Day,
+    Week,
+    Month,
+}
+
+impl Range {
+    const ALL: [Range; 4] = [Range::Hour, Range::Day, Range::Week, Range::Month];
+
+    fn key(self) -> &'static str {
+        match self {
+            Range::Hour => "1h",
+            Range::Day => "1d",
+            Range::Week => "7d",
+            Range::Month => "30d",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Range::Hour => "1 h",
+            Range::Day => "24 h",
+            Range::Week => "7 d",
+            Range::Month => "30 d",
+        }
+    }
+
+    fn secs(self) -> u64 {
+        match self {
+            Range::Hour => 3600,
+            Range::Day => 86400,
+            Range::Week => 7 * 86400,
+            Range::Month => 30 * 86400,
+        }
+    }
+
+    /// Seconds between points: the agents' reports, then the server's buckets.
+    fn step(self) -> u64 {
+        match self {
+            Range::Hour => 15,
+            Range::Day => 300,
+            Range::Week => 1800,
+            Range::Month => 7200,
+        }
+    }
+}
+
+/// CPU and memory (and disk, for a node) charts over a chosen period, from a
+/// `…/usage` endpoint. The maxima fix the top of each scale (limits, totals).
+#[component]
+pub fn UsageCharts(
+    #[prop(into)] url: Signal<String>,
+    #[prop(into)] cpu_max: Signal<Option<f64>>,
+    #[prop(into)] mem_max: Signal<Option<f64>>,
+    #[prop(optional, into)] disk_max: Option<Signal<Option<f64>>>,
+) -> impl IntoView {
+    let range = RwSignal::new(Range::Hour);
+    let usage = crate::util::polled(Some(std::time::Duration::from_secs(15)), move || {
+        let url = url.get();
+        let range = range.get();
+        async move {
+            crate::api::get::<Vec<UsagePoint>>(&format!("{url}?range={}", range.key()))
+                .await
+                .map(|points| (url, range, points))
+        }
+    });
+    // Only the data of what is on screen: a slow answer for the previous range
+    // (or app) must not draw over it.
+    let series = move |f: fn(&UsagePoint) -> (f64, f64)| {
+        Signal::derive(move || {
+            usage.data.with(|u| match u {
+                Some((u, r, points)) if *r == range.get() && *u == url.get() => points
+                    .iter()
+                    .map(|p| {
+                        let (value, peak) = f(p);
+                        Sample {
+                            at: p.at,
+                            value,
+                            peak,
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+        })
+    };
+    let cpu = series(|p| (f64::from(p.cpu), f64::from(p.cpu_peak)));
+    let mem = series(|p| (p.mem as f64, p.mem_peak as f64));
+    let disk = series(|p| {
+        let d = p.disk.unwrap_or(0) as f64;
+        (d, d)
+    });
+    let span = Signal::derive(move || {
+        let now = crate::util::now();
+        (now.saturating_sub(range.get().secs()), now)
+    });
+    let gap = Signal::derive(move || range.get().step() * 5 / 2);
+
+    view! {
+        <div class="charts-head">
+            <h2 class="section-title">"Usage"</h2>
+            <div class="segmented" role="radiogroup" aria-label="Period">
+                {Range::ALL.into_iter().map(|r| view! {
+                    <button type="button" role="radio"
+                        class=move || if range.get() == r { "segment active" } else { "segment" }
+                        aria-checked=move || (range.get() == r).to_string()
+                        on:click=move |_| range.set(r)>{r.label()}</button>
+                }).collect_view()}
+            </div>
+        </div>
+        <div class="charts">
+            <Sparkline title="CPU" points=cpu span=span gap=gap max=cpu_max format=|v| format!("{v:.1} %")/>
+            <Sparkline title="Memory" points=mem span=span gap=gap max=mem_max format=|v| bytes(v as u64)/>
+            {disk_max.map(|disk_max| view! {
+                <Sparkline title="Disk" points=disk span=span gap=gap max=disk_max format=|v| bytes(v as u64)/>
+            })}
+        </div>
     }
 }
 
