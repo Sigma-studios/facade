@@ -719,7 +719,7 @@ struct SpecArgs {
     /// Upload and run a Linux executable (built for the node's CPU).
     #[arg(long, conflicts_with = "git")]
     executable: Option<PathBuf>,
-    /// Argument passed to the executable (repeatable).
+    /// Argument passed to the executable (repeatable). Other apps take --command.
     #[arg(long = "arg", allow_hyphen_values = true)]
     args: Vec<String>,
     /// Build from a git repository. Without --dockerfile, --rust-bin or --static, the
@@ -809,6 +809,16 @@ impl SpecArgs {
         current: Option<&Source>,
         uploaded: Option<&ArtifactView>,
     ) -> anyhow::Result<Option<Source>> {
+        let executable = uploaded.is_some()
+            || (self.image.is_none()
+                && self.git.is_none()
+                && matches!(current, Some(Source::Executable { .. })));
+        if !self.args.is_empty() && !executable {
+            bail!(
+                "--arg is for executables; give this app its whole command line instead, \
+                 e.g. --command \"python server.py --port 8000\""
+            );
+        }
         if let Some(image) = &self.image {
             return Ok(Some(Source::Image {
                 image: image.clone(),
