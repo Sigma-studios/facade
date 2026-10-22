@@ -1,14 +1,15 @@
 //! `facaded ingress`: the entry point as its own long-lived process.
 //!
-//! * It listens on the node's HTTP and HTTPS ports and on a unix control socket,
-//!   where the node's agent sends it the routing [`Table`] and reads back its
-//!   status (addresses it cannot bind).
+//! * It listens on the node's HTTP and HTTPS ports (and the apps' TLS ports) and
+//!   on a unix control socket, where the node's agent sends it the routing
+//!   [`Table`] and reads back its status (addresses it cannot bind).
 //! * On `SIGUSR2` (`systemctl reload facaded-ingress`), or when the agent asks
 //!   after updating itself, it starts the binary now installed at its own path
 //!   and hands it the listening sockets. Once the new process says it is ready,
 //!   this one stops accepting, lets its open connections (WebSockets included)
 //!   finish, and exits. Nothing is refused meanwhile, and if the new binary does
-//!   not come up, this one simply carries on.
+//!   not come up, this one simply carries on. TLS ports are not handed over:
+//!   the new process binds them alongside (`SO_REUSEPORT`).
 //! * Sockets are passed as `FACADE_INGRESS_FDS=http=3,https=4,control=5`; systemd
 //!   socket activation (`LISTEN_FDS` with `FileDescriptorName=http|https|control`)
 //!   works the same way.
@@ -85,6 +86,8 @@ impl Sockets {
 
 pub async fn run(opts: Options) -> anyhow::Result<()> {
     let ingress = Ingress::new(&opts.data_dir)?;
+    // The TLS ports of the table last saved, until the agent sends a new one.
+    ingress.sync_tcp();
     let mut inherited = take_inherited();
     let sockets = Arc::new(Sockets::default());
     let (stop_tx, stop) = watch::channel(false);
@@ -140,6 +143,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             Ok(pid) => {
                 info!("process {pid} took over; finishing open connections");
                 stop_tx.send_replace(true);
+                ingress.retire();
                 break;
             }
             Err(e) => warn!("handover failed, still serving: {e:#}"),

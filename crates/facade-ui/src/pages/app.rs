@@ -547,6 +547,10 @@ fn OverviewTab(
                     <dd>{if s.host_network { "node network".to_string() } else if s.ports.is_empty() { "—".into() } else {
                         s.ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
                     }}</dd>
+                    {(!s.tls_ports.is_empty()).then(|| view! {
+                        <dt>"TLS ports"</dt>
+                        <dd>{s.tls_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")}</dd>
+                    })}
                     {(!s.command.is_empty()).then(|| view! {
                         <dt>"Command"</dt><dd><code>{facade_core::join_command(&s.command)}</code></dd>
                     })}

@@ -36,6 +36,11 @@ pub struct AppSpec {
     /// itself, so conflicts are caught before it starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortMap>,
+    /// TCP ports the node's entry point takes TLS off before passing the
+    /// connection to the app (IMAPS, SMTPS…), with the certificate of the app's
+    /// domains.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls_ports: Vec<TlsPort>,
     /// Share the node's network stack. Needed by things like TURN relays that
     /// advertise their own ports.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -235,6 +240,20 @@ impl AppSpec {
         out
     }
 
+    /// Ports the node's entry point listens on for the app (its TLS ports), as
+    /// TCP mappings of the public port to itself.
+    pub fn ingress_ports(&self) -> Vec<PortMap> {
+        self.tls_ports
+            .iter()
+            .map(|t| PortMap {
+                host: t.public,
+                container: t.public,
+                count: 1,
+                protocol: Protocol::Tcp,
+            })
+            .collect()
+    }
+
     /// Name of one of the app's volumes on its node. A stack's services share
     /// their stack's volumes, as Compose services share a project's.
     pub fn volume_name(&self, volume: &Volume) -> String {
@@ -276,7 +295,11 @@ impl AppSpec {
             check.validate()?;
         }
         if self.is_static() {
-            if !self.ports.is_empty() || self.host_network || self.http_port.is_some() {
+            if !self.ports.is_empty()
+                || !self.tls_ports.is_empty()
+                || self.host_network
+                || self.http_port.is_some()
+            {
                 return err("static sites cannot have ports, http_port or host_network");
             }
             if !self.command.is_empty()
@@ -305,6 +328,27 @@ impl AppSpec {
                 if a.protocol == b.protocol && a.overlaps(b) {
                     return err(format!("{a} and {b} overlap"));
                 }
+            }
+        }
+        for (i, t) in self.tls_ports.iter().enumerate() {
+            t.validate()?;
+            if self.domains.is_empty() {
+                return err("TLS ports need a domain (its certificate is used)");
+            }
+            if self.tls_ports[..i].iter().any(|o| o.public == t.public) {
+                return err(format!("TLS port {} is listed twice", t.public));
+            }
+            if let Some(p) = self
+                .host_ports()
+                .iter()
+                .find(|p| p.protocol == Protocol::Tcp && p.contains(t.public))
+            {
+                return err(format!("TLS port {} overlaps {p}", t.public));
+            }
+            if self.host_network && t.container == t.public {
+                return err(format!(
+                    "TLS port {t}: on the host network the app cannot listen on the public port itself"
+                ));
             }
         }
         if let Some(cpus) = self.limits.cpus
@@ -772,6 +816,54 @@ impl fmt::Display for PortMap {
     }
 }
 
+/// `public[:container]`, e.g. `993:1143`: TLS-wrapped TCP on the node's public
+/// `public` port, passed on in the clear to the app's `container` port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsPort {
+    pub public: u16,
+    pub container: u16,
+}
+
+impl TlsPort {
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if self.public == 0 || self.container == 0 {
+            return err("ports must be non-zero");
+        }
+        if matches!(self.public, 80 | 443) {
+            return err(format!(
+                "TLS port {}: the entry point serves HTTP(S) there",
+                self.public
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for TlsPort {
+    type Err = SpecError;
+
+    fn from_str(s: &str) -> Result<Self, SpecError> {
+        let (public, container) = s.split_once(':').unwrap_or((s, s));
+        let parse = |p: &str| {
+            p.trim()
+                .parse::<u16>()
+                .map_err(|_| SpecError(format!("`{p}` is not a port")))
+        };
+        let port = TlsPort {
+            public: parse(public)?,
+            container: parse(container)?,
+        };
+        port.validate()?;
+        Ok(port)
+    }
+}
+
+impl fmt::Display for TlsPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.public, self.container)
+    }
+}
+
 /// A named Docker volume mounted into the container: `data:/var/lib/postgresql`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -1098,6 +1190,23 @@ mod tests {
         assert_eq!(s.host_ports().len(), 2, "declared ports and the HTTP port");
         s.ports = vec!["3479:3478/udp".parse().unwrap()];
         assert!(s.validate().is_err(), "no remapping on the host network");
+        let mut s = spec();
+        s.tls_ports = vec!["993:1143".parse().unwrap(), "465:1587".parse().unwrap()];
+        assert!(s.validate().is_ok());
+        assert_eq!(s.ingress_ports()[0].host, 993);
+        assert_eq!(s.tls_ports[1].to_string(), "465:1587");
+        s.tls_ports.push("993:2000".parse().unwrap());
+        assert!(s.validate().is_err(), "a public port twice");
+        let mut s = spec();
+        s.tls_ports = vec!["993:1143".parse().unwrap()];
+        s.ports = vec!["990-999:990-999".parse().unwrap()];
+        assert!(s.validate().is_err(), "overlaps a published port");
+        s.ports.clear();
+        s.domains.clear();
+        s.http_port = None;
+        assert!(s.validate().is_err(), "needs a domain for its certificate");
+        assert!("443:8443".parse::<TlsPort>().is_err());
+        assert_eq!("993".parse::<TlsPort>().unwrap().container, 993);
     }
 
     #[test]

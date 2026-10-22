@@ -653,10 +653,14 @@ impl Runtime {
         let mut exposed = Vec::new();
         let mut bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         if !spec.host_network {
-            if let Some(port) = spec.http_port {
-                // Loopback only, on a port Docker picks: the ingress reaches it through
-                // the agent, never directly.
+            // Loopback only, on ports Docker picks: the ingress reaches them through
+            // the agent, never directly.
+            let tls = spec.tls_ports.iter().map(|t| t.container);
+            for port in spec.http_port.into_iter().chain(tls) {
                 let key = format!("{port}/tcp");
+                if bindings.contains_key(&key) {
+                    continue;
+                }
                 exposed.push(key.clone());
                 bindings.insert(
                     key,
@@ -1453,6 +1457,11 @@ impl Runtime {
             .spec
             .http_port
             .ok_or_else(|| anyhow!("{} has no http_port", w.spec.name))?;
+        self.loopback_target(w, port).await
+    }
+
+    /// Where TCP port `port` of the app's container is reachable from this machine.
+    pub async fn loopback_target(&self, w: &Workload, port: u16) -> anyhow::Result<SocketAddr> {
         if w.spec.host_network {
             return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
         }

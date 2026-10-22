@@ -169,6 +169,7 @@ impl ServiceSpec {
             domains: self.domains.clone().unwrap_or_default(),
             redirects: vec![],
             ports: self.ports.clone().unwrap_or_default(),
+            tls_ports: vec![],
             host_network: false,
             limits: self.limits.clone(),
             enabled,

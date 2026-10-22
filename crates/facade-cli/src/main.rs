@@ -14,7 +14,7 @@ use clap::{Args, Parser, Subcommand};
 use facade_core::api::*;
 use facade_core::proto::Listener;
 use facade_core::stack::{ServiceSpec, StackSpec};
-use facade_core::{AppSpec, Build, Limits, Link, PortMap, Source, Volume};
+use facade_core::{AppSpec, Build, Limits, Link, PortMap, Source, TlsPort, Volume};
 use futures_util::StreamExt;
 use reqwest::Method;
 
@@ -768,6 +768,12 @@ struct SpecArgs {
     /// Publish raw ports: `3478:3478/udp`, `49160-49260:49160-49260/udp` (repeatable).
     #[arg(long = "publish", short = 'p')]
     ports: Vec<PortMap>,
+    /// Take TLS off a public TCP port with the app's certificate and pass the
+    /// connection on to a port of the app: `993:1143` (repeatable; replaces the list).
+    #[arg(long = "tls-port")]
+    tls_ports: Vec<TlsPort>,
+    #[arg(long, conflicts_with = "tls_ports")]
+    no_tls_ports: bool,
     /// Share the node's network (e.g. for TURN relays).
     #[arg(long)]
     host_network: Option<bool>,
@@ -936,6 +942,9 @@ impl SpecArgs {
         }
         if !self.ports.is_empty() {
             spec.ports = self.ports.clone();
+        }
+        if !self.tls_ports.is_empty() || self.no_tls_ports {
+            spec.tls_ports = self.tls_ports.clone();
         }
         if let Some(host) = self.host_network {
             spec.host_network = host;
@@ -2829,6 +2838,7 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 domains: vec![],
                 redirects: vec![],
                 ports: vec![],
+                tls_ports: vec![],
                 host_network: false,
                 limits: Limits::default(),
                 enabled: true,
@@ -3542,6 +3552,9 @@ fn print_app_detail(view: &AppView) {
     }
     for port in &spec.ports {
         println!("publish:   {port}");
+    }
+    for port in &spec.tls_ports {
+        println!("tls port:  {port}");
     }
     if spec.host_network {
         println!("network:   host");

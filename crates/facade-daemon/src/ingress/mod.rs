@@ -2,8 +2,10 @@
 //! apps running on the node; WebSocket (and any HTTP/1.1 upgrade) is spliced
 //! through.
 //!
-//! What to serve comes as a [`Table`] from the node's agent: routes, certificates
-//! and ACME HTTP-01 answers. The table is kept on disk, so apps stay reachable
+//! It also takes TLS off raw TCP ports for apps that ask (see [`tcp`]).
+//!
+//! What to serve comes as a [`Table`] from the node's agent: routes, TLS ports,
+//! certificates and ACME HTTP-01 answers. The table is kept on disk, so apps stay reachable
 //! while the agent (or the server) is away or restarting.
 //!
 //! The entry point runs either inside the agent (`embedded`, handy in
@@ -13,13 +15,14 @@
 //! binary while the old one finishes its open connections.
 
 pub mod process;
+pub mod tcp;
 
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -47,6 +50,9 @@ pub struct Table {
     /// Host name → where it goes.
     pub routes: BTreeMap<String, Route>,
     pub certs: Vec<CertBundle>,
+    /// Public TCP port → the app TLS-wrapped connections on it go to.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tcp: BTreeMap<u16, tcp::TcpRoute>,
     /// ACME HTTP-01 token → key authorization.
     pub challenges: BTreeMap<String, String>,
 }
@@ -131,6 +137,10 @@ pub struct Ingress {
     active: Arc<AtomicUsize>,
     /// Told whenever `bind_errors` changes.
     pub status: watch::Sender<()>,
+    /// The listener of each TLS port, by the sender that stops it.
+    tcp: Mutex<HashMap<u16, watch::Sender<bool>>>,
+    /// Set once a newer entry point took over: no TLS port starts any more.
+    retired: AtomicBool,
 }
 
 impl Ingress {
@@ -155,11 +165,13 @@ impl Ingress {
             bind_errors: Default::default(),
             active: Default::default(),
             status: watch::channel(()).0,
+            tcp: Default::default(),
+            retired: AtomicBool::new(false),
         }))
     }
 
     /// Replaces the table (and saves it) if it changed.
-    pub fn set_table(&self, table: Table) {
+    pub fn set_table(self: &Arc<Self>, table: Table) {
         {
             let current = self.table.read();
             if *current == table {
@@ -178,6 +190,7 @@ impl Ingress {
             Err(e) => warn!("saving the routing table: {e}"),
         }
         *self.table.write() = table;
+        self.sync_tcp();
     }
 
     pub fn bind_errors(&self) -> Vec<String> {

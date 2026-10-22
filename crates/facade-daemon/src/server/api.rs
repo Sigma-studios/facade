@@ -19,7 +19,7 @@ use axum::routing::{get, post, put};
 use facade_core::api::*;
 use facade_core::manifest::{AppManifest, EnvEntry, Manifest, NodeDecl};
 use facade_core::proto::{AgentRequest, AppState, Listener};
-use facade_core::{AppSpec, validate_name};
+use facade_core::{AppSpec, PortMap, validate_name};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -931,7 +931,9 @@ fn port_conflict(
     listening: bool,
 ) -> anyhow::Result<Option<String>> {
     let wanted = spec.host_ports();
-    if wanted.is_empty() {
+    // The entry point listens on TLS ports itself.
+    let tls = spec.ingress_ports();
+    if wanted.is_empty() && tls.is_empty() {
         return Ok(None);
     }
     for other in server.store.list_apps()? {
@@ -939,9 +941,13 @@ fn port_conflict(
         if other.name == spec.name || other.node != spec.node {
             continue;
         }
-        for a in &wanted {
-            if let Some(b) = other
-                .host_ports()
+        let theirs: Vec<PortMap> = other
+            .host_ports()
+            .into_iter()
+            .chain(other.ingress_ports())
+            .collect();
+        for a in wanted.iter().chain(&tls) {
+            if let Some(b) = theirs
                 .iter()
                 .find(|b| a.protocol == b.protocol && a.overlaps(b))
             {
@@ -963,8 +969,11 @@ fn port_conflict(
         if l.app.as_deref() == Some(spec.name.as_str()) {
             continue;
         }
+        let entry_point =
+            l.app.as_deref() == Some("facade") || l.process.as_deref() == Some("facaded");
         if wanted
             .iter()
+            .chain(tls.iter().filter(|_| !entry_point))
             .any(|w| w.protocol == l.protocol && w.contains(l.port))
         {
             return Ok(Some(format!(
@@ -994,7 +1003,7 @@ fn holder(l: &Listener) -> String {
 /// Before (re)starting an app by hand: its ports must be free, as the node sees
 /// them now (an old program stopped a second ago no longer counts).
 async fn check_ports_free(server: &Server, spec: &AppSpec) -> ApiResult<()> {
-    if !spec.host_ports().is_empty()
+    if !(spec.host_ports().is_empty() && spec.tls_ports.is_empty())
         && let Ok(listeners) = server
             .hub
             .query::<Vec<Listener>>(&spec.node, AgentRequest::Ports)
