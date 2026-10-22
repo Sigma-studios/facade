@@ -144,7 +144,7 @@ pub fn Sparkline(
     let current = move || points.with(|p| p.last().map(|s| format(s.value)));
     let long = move || {
         let (start, end) = span.get();
-        end.saturating_sub(start) > 86400
+        end.saturating_sub(start) >= 86400
     };
     let stamp = move |at: u64| {
         if long() {
