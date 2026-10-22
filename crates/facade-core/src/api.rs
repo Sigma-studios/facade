@@ -499,8 +499,9 @@ pub struct AppMetric {
     pub stats: AppStats,
 }
 
-/// An app's resource use over a span of time starting at `at`: averages and peaks.
-/// CPU is in percent of one core, memory in bytes.
+/// Resource use over a span of time starting at `at`: averages and peaks. CPU is
+/// in percent (of one core for an app, of the whole machine for a node), memory
+/// and disk in bytes; only nodes report their disk.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsagePoint {
     pub at: u64,
@@ -508,6 +509,8 @@ pub struct UsagePoint {
     pub cpu_peak: f32,
     pub mem: u64,
     pub mem_peak: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

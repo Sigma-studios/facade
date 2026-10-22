@@ -37,7 +37,7 @@ use crate::config::ServerConfig;
 use crate::tls::{self, Identity};
 use hub::Hub;
 use secrets::SecretBox;
-use store::Store;
+use store::{Store, UsageOf, UsageSample};
 
 /// One hour of samples at the agents' 15 s reporting interval.
 const HISTORY: usize = 240;
@@ -404,6 +404,12 @@ impl Server {
         }
         entry.listeners = report.listeners;
         entry.ingress_errors = report.ingress_errors;
+        let node_usage = UsageSample {
+            name: node.to_string(),
+            cpu: report.node.cpu_percent,
+            mem: report.node.mem_used,
+            disk: report.node.disk_used,
+        };
         push_capped(
             &mut entry.history,
             NodeMetric {
@@ -414,7 +420,12 @@ impl Server {
         let mut usage = Vec::new();
         for stats in report.apps {
             if stats.state == AppState::Running {
-                usage.push((stats.app.clone(), stats.cpu_percent, stats.mem_used));
+                usage.push(UsageSample {
+                    name: stats.app.clone(),
+                    cpu: stats.cpu_percent,
+                    mem: stats.mem_used,
+                    disk: 0,
+                });
             }
             let app = live.apps.entry(stats.app.clone()).or_default();
             // A build in progress is more informative than "the old container runs".
@@ -425,8 +436,12 @@ impl Server {
             push_capped(&mut app.history, AppMetric { at, stats });
         }
         drop(live);
-        if let Err(e) = self.store.record_usage(at, &usage) {
-            warn!("recording app usage: {e:#}");
+        if let Err(e) = self
+            .store
+            .record_usage(UsageOf::App, at, &usage)
+            .and_then(|()| self.store.record_usage(UsageOf::Node, at, &[node_usage]))
+        {
+            warn!("recording usage: {e:#}");
         }
     }
 

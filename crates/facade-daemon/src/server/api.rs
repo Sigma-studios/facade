@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::store::UsageOf;
 use super::users::{can_see_app, check_caps, check_member_spec, load_app_for, visible_apps};
 use super::{Server, hash_secret, random_token};
 use crate::tls;
@@ -54,6 +55,7 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/nodes/{name}", axum::routing::delete(delete_node))
         .route("/api/nodes/{name}/token", post(rotate_node_token))
         .route("/api/nodes/{name}/metrics", get(node_metrics))
+        .route("/api/nodes/{name}/usage", get(node_usage))
         .route("/api/nodes/{name}/ip", put(set_node_ip))
         .route("/api/nodes/{name}/prune", post(prune_node))
         .route("/api/nodes/{name}/ports", get(node_ports))
@@ -1793,35 +1795,15 @@ fn one_hour() -> String {
 
 /// `?range=1h` is every sample the agents sent (kept in memory); `1d`, `7d` and
 /// `30d` come from the stored 5-minute buckets, merged to keep about 300 points.
-async fn app_usage(
-    State(server): S,
-    user: User,
-    Path(name): Path<String>,
-    Query(q): Query<UsageQuery>,
+fn usage(
+    server: &Server,
+    of: UsageOf,
+    name: &str,
+    range: &str,
+    recent: impl FnOnce(&super::Live) -> Vec<UsagePoint>,
 ) -> ApiResult<Json<Vec<UsagePoint>>> {
-    load_app_for(&server, &user, &name)?;
-    let (span, step) = match q.range.as_str() {
-        "1h" => {
-            let live = server.live.read();
-            let points = live
-                .apps
-                .get(&name)
-                .map(|a| {
-                    a.history
-                        .iter()
-                        .filter(|m| m.stats.state == AppState::Running)
-                        .map(|m| UsagePoint {
-                            at: m.at,
-                            cpu: m.stats.cpu_percent,
-                            cpu_peak: m.stats.cpu_percent,
-                            mem: m.stats.mem_used,
-                            mem_peak: m.stats.mem_used,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            return Ok(Json(points));
-        }
+    let (span, step) = match range {
+        "1h" => return Ok(Json(recent(&server.live.read()))),
         "1d" => (86400, 300),
         "7d" => (7 * 86400, 1800),
         "30d" => (30 * 86400, 7200),
@@ -1833,10 +1815,65 @@ async fn app_usage(
     };
     let since = facade_core::now().saturating_sub(span);
     Ok(Json(server.store.usage(
-        &name,
+        of,
+        name,
         since - since % step,
         step,
     )?))
+}
+
+async fn app_usage(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+    Query(q): Query<UsageQuery>,
+) -> ApiResult<Json<Vec<UsagePoint>>> {
+    load_app_for(&server, &user, &name)?;
+    usage(&server, UsageOf::App, &name, &q.range, |live| {
+        live.apps
+            .get(&name)
+            .map(|a| {
+                a.history
+                    .iter()
+                    .filter(|m| m.stats.state == AppState::Running)
+                    .map(|m| UsagePoint {
+                        at: m.at,
+                        cpu: m.stats.cpu_percent,
+                        cpu_peak: m.stats.cpu_percent,
+                        mem: m.stats.mem_used,
+                        mem_peak: m.stats.mem_used,
+                        disk: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+async fn node_usage(
+    State(server): S,
+    _: User,
+    Path(name): Path<String>,
+    Query(q): Query<UsageQuery>,
+) -> ApiResult<Json<Vec<UsagePoint>>> {
+    usage(&server, UsageOf::Node, &name, &q.range, |live| {
+        live.nodes
+            .get(&name)
+            .map(|n| {
+                n.history
+                    .iter()
+                    .map(|m| UsagePoint {
+                        at: m.at,
+                        cpu: m.stats.cpu_percent,
+                        cpu_peak: m.stats.cpu_percent,
+                        mem: m.stats.mem_used,
+                        mem_peak: m.stats.mem_used,
+                        disk: Some(m.stats.disk_used),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
 }
 
 async fn list_deployments(

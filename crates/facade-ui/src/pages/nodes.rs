@@ -8,8 +8,65 @@ use leptos_router::components::A;
 
 use super::overview::NodeCard;
 use crate::api;
-use crate::components::{CopyField, ErrorNote, Loading, Modal};
+use crate::components::{CopyField, ErrorNote, Loading, Modal, UsageCharts};
 use crate::util::{ago, bytes, me, polled, run, toasts};
+
+/// The usage charts of one node, picked among them when there are several.
+#[component]
+fn NodeUsage(#[prop(into)] nodes: Signal<Vec<NodeView>>) -> impl IntoView {
+    let picked = RwSignal::new(None::<String>);
+    let current = Memo::new(move |_| {
+        nodes.with(|all| {
+            let picked = picked.get();
+            all.iter()
+                .find(|n| Some(&n.name) == picked.as_ref())
+                .or_else(|| all.iter().find(|n| n.local))
+                .or_else(|| all.first())
+                .map(|n| n.name.clone())
+        })
+    });
+    let stats = move || {
+        let name = current.get()?;
+        nodes.with(|all| {
+            all.iter()
+                .find(|n| n.name == name)
+                .and_then(|n| n.stats.clone())
+        })
+    };
+    let url =
+        Signal::derive(move || format!("/api/nodes/{}/usage", current.get().unwrap_or_default()));
+    let mem_max = Signal::derive(move || stats().map(|s| s.mem_total as f64));
+    let disk_max = Signal::derive(move || stats().map(|s| s.disk_total as f64));
+
+    view! {
+        <Show when=move || current.with(Option::is_some)>
+            <section class="node-usage">
+                <Show when=move || nodes.with(|n| n.len() > 1)>
+                    <div class="segmented" role="radiogroup" aria-label="Node">
+                        <For each=move || nodes.get() key=|n| n.name.clone() let:node>
+                            {
+                                let name = node.name.clone();
+                                let is = {
+                                    let name = name.clone();
+                                    move || current.get().as_ref() == Some(&name)
+                                };
+                                let is2 = is.clone();
+                                view! {
+                                    <button type="button" role="radio"
+                                        class=move || if is() { "segment active" } else { "segment" }
+                                        aria-checked=move || is2().to_string()
+                                        on:click=move |_| picked.set(Some(name.clone()))>{node.name.clone()}</button>
+                                }
+                            }
+                        </For>
+                    </div>
+                </Show>
+                <UsageCharts url=url cpu_max=Signal::derive(|| Some(100.0))
+                    mem_max=mem_max disk_max=disk_max/>
+            </section>
+        </Show>
+    }
+}
 
 #[component]
 pub fn Nodes() -> impl IntoView {
@@ -219,6 +276,7 @@ pub fn Nodes() -> impl IntoView {
                 <p class="muted small after-cards">
                     "Nodes clean up after builds on their own: every 6 hours, and harder when the disk is 85 % full."
                 </p>
+                <NodeUsage nodes=Signal::derive(move || nodes.data.get().unwrap_or_default())/>
                 <Show when=move || ports_of.with(Option::is_some)>
                     <Ports
                         node=Signal::derive(move || ports_of.get().unwrap_or_default())
