@@ -19,6 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use super::firewall;
 use super::{BIND_RETRY, Certs, Counted, Ingress, stopped};
 
 /// Where a TLS port goes.
@@ -71,6 +72,7 @@ impl Ingress {
             let keep = wanted.contains(port);
             if !keep {
                 stop.send_replace(true);
+                tokio::spawn(firewall::close(*port));
             }
             keep
         });
@@ -118,6 +120,7 @@ impl Ingress {
             }
         };
         info!("serving tls on tcp port {port}");
+        firewall::open(port).await;
         loop {
             let accepted = tokio::select! {
                 accepted = listener.accept() => accepted,
