@@ -5,7 +5,7 @@ use facade_core::api::{
     InspectRequest, NewGitSecret, NodeView,
 };
 use facade_core::{
-    AppSpec, Build, DEFAULT_PYTHON, Limits, Link, PortMap, Protocol, Source, Volume,
+    AppSpec, Build, DEFAULT_PYTHON, Limits, Link, PortMap, Protocol, Source, TlsPort, Volume,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -37,6 +37,8 @@ pub struct SpecForm {
     domains: RwSignal<Vec<DomainRow>>,
     redirects: RwSignal<Vec<DomainRow>>,
     ports: RwSignal<Vec<PortRow>>,
+    /// `993:1143, 465:1587`.
+    tls_ports: RwSignal<String>,
     host_network: RwSignal<bool>,
     volumes: RwSignal<String>,
     memory: RwSignal<String>,
@@ -92,6 +94,7 @@ impl SpecForm {
             domains: RwSignal::new(vec![]),
             redirects: RwSignal::new(vec![]),
             ports: RwSignal::new(vec![]),
+            tls_ports: s(""),
             host_network: RwSignal::new(false),
             volumes: s(""),
             memory: s(""),
@@ -184,6 +187,13 @@ impl SpecForm {
             .set(spec.redirects.iter().map(|d| DomainRow::full(d)).collect());
         form.ports
             .set(spec.ports.iter().map(PortRow::from_map).collect());
+        form.tls_ports.set(
+            spec.tls_ports
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         form.host_network.set(spec.host_network);
         form.volumes.set(
             spec.volumes
@@ -418,6 +428,16 @@ impl SpecForm {
                 .map(|row| row.port_map(host_network))
                 .collect::<Result<_, _>>()?
         };
+        let tls_ports = if is_static {
+            vec![]
+        } else {
+            self.tls_ports
+                .get_untracked()
+                .split([',', ' ', '\n'])
+                .filter(|p| !p.is_empty())
+                .map(|p| p.parse::<TlsPort>().map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let memory_mb = optional(self.memory)
             .map(|m| {
                 m.parse::<u64>()
@@ -463,6 +483,7 @@ impl SpecForm {
             domains: domain_list(self.domains),
             redirects: domain_list(self.redirects),
             ports,
+            tls_ports,
             host_network,
             limits: Limits { memory_mb, cpus },
             enabled: self.enabled.get_untracked(),
@@ -1008,6 +1029,12 @@ pub fn SpecFields(
                         </Show>
                     </div>
                 </div>
+                <label class="field">
+                    <span>"TLS ports"</span>
+                    <input placeholder="993:1143, 465:1587" bind:value=f.tls_ports/>
+                    <small>"Public TCP ports the entry point takes TLS off, with the certificate of the app's domains, \
+                            before passing the connection to a port of the app (IMAPS, SMTPS…): public:app."</small>
+                </label>
             </Show>
         </fieldset>
 

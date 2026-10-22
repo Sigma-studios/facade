@@ -72,6 +72,7 @@ pub fn database(
         domains: vec![],
         redirects: vec![],
         ports: vec![],
+        tls_ports: vec![],
         host_network: false,
         limits: Limits {
             memory_mb: req.memory_mb,

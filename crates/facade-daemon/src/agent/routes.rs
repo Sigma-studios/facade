@@ -17,6 +17,7 @@ use tracing::{debug, info};
 use super::Agent;
 use crate::framing::{JsonLines, write_json};
 use crate::ingress::process::{FromIngress, ToIngress};
+use crate::ingress::tcp::TcpRoute;
 use crate::ingress::{Ingress, Route, Table};
 
 /// The table is rebuilt this often anyway, so a container restarted by Docker
@@ -127,6 +128,7 @@ impl Agent {
                         tokio::spawn(ingress.clone().listen(addr, tls));
                     }
                 }
+                ingress.sync_tcp();
             }
             Link::External { .. } => {
                 tokio::spawn(self.clone().ingress_connection_loop());
@@ -146,6 +148,7 @@ impl Agent {
     pub(super) async fn refresh_routes(&self) {
         let workloads: Vec<_> = self.workloads.lock().values().cloned().collect();
         let mut routes = BTreeMap::new();
+        let mut tcp = BTreeMap::new();
         for proxy in self.proxies.lock().iter() {
             routes.insert(
                 proxy.domain.clone(),
@@ -177,6 +180,22 @@ impl Agent {
             for domain in &w.spec.domains {
                 routes.insert(domain.clone(), target.clone());
             }
+            for t in &w.spec.tls_ports {
+                let port = self
+                    .runtime
+                    .loopback_target(w, t.container)
+                    .await
+                    .ok()
+                    .map(|a| a.port());
+                tcp.insert(
+                    t.public,
+                    TcpRoute {
+                        app: app.clone(),
+                        port,
+                        names: w.spec.domains.clone(),
+                    },
+                );
+            }
             if let Some(main) = w.spec.domains.first() {
                 for domain in &w.spec.redirects {
                     routes.insert(domain.clone(), Route::Redirect { to: main.clone() });
@@ -185,6 +204,7 @@ impl Agent {
         }
         self.link.publish(Table {
             routes,
+            tcp,
             certs: self.certs.lock().clone(),
             challenges: self.challenges.lock().clone(),
         });

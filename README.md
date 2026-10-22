@@ -461,6 +461,25 @@ If a node's HTTP(S) entry point cannot bind 80 or 443 (another web server holds
 them), it says so in `facade status` and as an alert, and retries every 5 seconds:
 stopping the other server is enough for facade to take over.
 
+**TLS ports.** For protocols that are not HTTP but run over TLS (IMAPS, SMTPS…),
+`--tls-port public:app` (repeatable, or *TLS ports* in the settings form) has the
+entry point listen on the node's public TCP port `public`, take TLS off with the
+certificate of the app's domains (the one the client names if it is among them,
+else the main domain's), and pass the connection on in the clear to the app's
+port `app`. The app needs a domain, so it needs no certificate code of its own,
+and renewals apply to the next connection.
+
+```sh
+# a mail server listening on 1143 (IMAP) and 1587 (submission) in its container
+facade app update valet --tls-port 993:1143 --tls-port 465:1587
+facade app update valet --no-tls-ports
+```
+
+Connections have no idle timeout (IMAP IDLE stays quiet for half an hour) and get
+TCP keepalives. The app sees them come from 127.0.0.1. A TLS port conflicts with
+other apps' ports like a published one, and one that cannot be bound is reported
+like 80 and 443.
+
 ### Alerts on Discord
 
 Create a webhook in a channel (Edit channel → Integrations → Webhooks → New Webhook),
