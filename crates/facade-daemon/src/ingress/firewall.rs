@@ -10,6 +10,9 @@ use tracing::{info, warn};
 
 const COMMENT: &str = "facade tls port";
 
+/// ufw rewrites its rule files on each call: two at once lose one's rule.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn active() -> bool {
     match Command::new("ufw").arg("status").output().await {
         Ok(out) => {
@@ -38,6 +41,7 @@ async fn ufw(args: &[&str]) {
 
 /// Lets `port/tcp` in (does nothing if it already is).
 pub async fn open(port: u16) {
+    let _turn = ONE_AT_A_TIME.lock().await;
     if active().await {
         ufw(&["allow", &format!("{port}/tcp"), "comment", COMMENT]).await;
     }
@@ -45,6 +49,7 @@ pub async fn open(port: u16) {
 
 /// Closes `port/tcp` again, once no app serves on it.
 pub async fn close(port: u16) {
+    let _turn = ONE_AT_A_TIME.lock().await;
     if active().await {
         ufw(&["delete", "allow", &format!("{port}/tcp")]).await;
     }
