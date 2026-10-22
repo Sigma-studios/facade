@@ -32,7 +32,7 @@ use crate::tls;
 use queue::BuildQueue;
 pub use routes::IngressMode;
 use runtime::Runtime;
-pub use runtime::{planned_image, run_key};
+pub use runtime::{planned_image, run_key_matches};
 
 const REPORT_EVERY: Duration = Duration::from_secs(15);
 /// Re-check every app this often, so a removed or dead container comes back

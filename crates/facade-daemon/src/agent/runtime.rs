@@ -76,9 +76,22 @@ fn short_hash(value: &impl Serialize) -> String {
 }
 
 /// Identifies the container a workload needs. Credentials and aliases are left
-/// out: they change without the container having to.
+/// out: they change without the container having to. So are domains and
+/// redirects, which only the ingress uses.
 pub fn run_key(w: &Workload, image: &str) -> String {
-    short_hash(&(&w.spec, &w.env, w.revision, &w.commit, image))
+    let spec = facade_core::AppSpec {
+        domains: vec![],
+        redirects: vec![],
+        ..w.spec.clone()
+    };
+    short_hash(&(&spec, &w.env, w.revision, &w.commit, image))
+}
+
+/// Whether a container labelled `key` is the one the workload needs. Containers
+/// created before domains and redirects left the key carry the whole spec's
+/// hash; that one still counts, so an upgrade restarts nothing.
+pub fn run_key_matches(w: &Workload, image: &str, key: &str) -> bool {
+    key == run_key(w, image) || key == short_hash(&(&w.spec, &w.env, w.revision, &w.commit, image))
 }
 
 /// The image an app runs: its registry reference, or the tag its build gets
@@ -248,7 +261,7 @@ impl Runtime {
                     .as_ref()
                     .and_then(|c| c.labels.as_ref())
                     .and_then(|l| l.get(LABEL_RUN))
-                    .is_some_and(|k| *k == run_key);
+                    .is_some_and(|k| run_key_matches(w, &image, k));
                 let running = existing
                     .state
                     .as_ref()
@@ -1682,5 +1695,47 @@ impl Runtime {
             }
         }
         stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workload(domains: &[&str], redirects: &[&str]) -> Workload {
+        serde_json::from_value(serde_json::json!({
+            "spec": {
+                "name": "web",
+                "node": "main",
+                "source": { "type": "image", "image": "nginx" },
+                "http_port": 80,
+                "domains": domains,
+                "redirects": redirects,
+            },
+            "env": [],
+            "revision": 1,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn routing_changes_keep_the_container() {
+        let before = workload(&["example.com"], &[]);
+        let after = workload(&["example.com", "example.org"], &["www.example.com"]);
+        assert_eq!(run_key(&before, "nginx:1"), run_key(&after, "nginx:1"));
+
+        // A container labelled by an older version (whole spec hashed) is kept
+        // until something it depends on changes.
+        let legacy = short_hash(&(&before.spec, &before.env, 1u64, &before.commit, "nginx:1"));
+        assert!(run_key_matches(&before, "nginx:1", &legacy));
+        assert!(!run_key_matches(&before, "nginx:2", &legacy));
+
+        let mut env = before.clone();
+        env.env.push(("A".into(), "1".into()));
+        assert!(!run_key_matches(
+            &env,
+            "nginx:1",
+            &run_key(&before, "nginx:1")
+        ));
     }
 }
