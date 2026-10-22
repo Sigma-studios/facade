@@ -413,3 +413,22 @@ fn notify_systemd(message: &str) {
         warn!("notifying systemd: {e}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_table_with_tls_ports_survives_the_control_connection() {
+        let mut table = Table::default();
+        table.tcp.insert(
+            465,
+            super::super::tcp::TcpRoute { app: "valet".into(), port: Some(32780), names: vec!["mail.example.com".into()] },
+        );
+        let line = serde_json::to_string(&ToIngress::Table { table: table.clone() }).unwrap();
+        match serde_json::from_str::<ToIngress>(&line).unwrap() {
+            ToIngress::Table { table: back } => assert_eq!(back, table),
+            other => panic!("{other:?}"),
+        }
+    }
+}
