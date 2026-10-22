@@ -68,6 +68,92 @@ pub fn Meter(
     }
 }
 
+const TREND_W: f64 = 120.0;
+const TREND_H: f64 = 28.0;
+
+/// A small last-hour line beside a meter, on the meter's 0–100 % scale: points
+/// are `(time, percent)`, drawn over `span`, unjoined across gaps over `gap`
+/// seconds. Hovering shows `format(percent)` and the time.
+#[component]
+pub fn Trend(
+    label: &'static str,
+    #[prop(into)] points: Signal<Vec<(u64, f64)>>,
+    #[prop(into)] span: Signal<(u64, u64)>,
+    gap: u64,
+    format: Callback<f64, String>,
+) -> impl IntoView {
+    let hover = RwSignal::new(None::<(u64, f64)>);
+    let x_of = move |at: u64| {
+        let (start, end) = span.get();
+        let width = end.saturating_sub(start).max(1) as f64;
+        (at.saturating_sub(start) as f64 / width * TREND_W).clamp(0.0, TREND_W)
+    };
+    let y_of = |v: f64| TREND_H - 1.5 - v.clamp(0.0, 100.0) / 100.0 * (TREND_H - 3.0);
+    let line = move || {
+        points.with(|p| {
+            let mut d = String::new();
+            let mut last: Option<u64> = None;
+            for &(at, v) in p {
+                let join = last.is_some_and(|l| at.saturating_sub(l) <= gap);
+                d.push_str(&format!(
+                    "{}{:.1},{:.1} ",
+                    if join { "L" } else { "M" },
+                    x_of(at),
+                    y_of(v)
+                ));
+                last = Some(at);
+            }
+            d
+        })
+    };
+    let on_move = move |ev: leptos::ev::MouseEvent| {
+        use wasm_bindgen::JsCast;
+        let Some(target) = ev.current_target() else {
+            return;
+        };
+        let el: web_sys::Element = target.unchecked_into();
+        let width = el.get_bounding_client_rect().width();
+        if width <= 0.0 {
+            return;
+        }
+        let x = (ev.offset_x() as f64 / width).clamp(0.0, 1.0) * TREND_W;
+        hover.set(points.with(|p| {
+            p.iter()
+                .copied()
+                .min_by(|a, b| (x_of(a.0) - x).abs().total_cmp(&(x_of(b.0) - x).abs()))
+        }));
+    };
+
+    view! {
+        <div class="trend" on:mousemove=on_move on:mouseleave=move |_| hover.set(None)>
+            <svg viewBox=format!("0 0 {TREND_W} {TREND_H}") preserveAspectRatio="none"
+                role="img" aria-label=format!("{label}, last hour")>
+                <line class="trend-base" x1="0" x2=TREND_W y1=TREND_H y2=TREND_H
+                    vector-effect="non-scaling-stroke"/>
+                <path class="trend-line" d=line vector-effect="non-scaling-stroke"/>
+                {move || hover.get().map(|(at, v)| {
+                    let x = x_of(at);
+                    view! {
+                        <line class="spark-cross" x1=x x2=x y1="0" y2=TREND_H
+                            vector-effect="non-scaling-stroke"/>
+                        <circle class="spark-dot" cx=x cy=y_of(v) r="3"
+                            vector-effect="non-scaling-stroke"/>
+                    }
+                })}
+            </svg>
+            {move || hover.get().map(|(at, v)| {
+                let left = (x_of(at) / TREND_W * 100.0).clamp(20.0, 80.0);
+                view! {
+                    <div class="spark-tip" style=format!("left: {left:.1}%")>
+                        <strong>{format.run(v)}</strong>
+                        <span>{crate::util::clock(at)}</span>
+                    </div>
+                }
+            })}
+        </div>
+    }
+}
+
 const SPARK_W: f64 = 600.0;
 const SPARK_H: f64 = 120.0;
 

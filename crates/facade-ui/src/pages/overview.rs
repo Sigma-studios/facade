@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use facade_core::api::{AlertView, AppView, NodeView, StatusView};
+use facade_core::api::{AlertView, AppView, NodeView, StatusView, UsagePoint};
 use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::api;
-use crate::components::{ErrorNote, Loading, Meter, OnlineBadge, StateBadge};
+use crate::components::{ErrorNote, Loading, Meter, OnlineBadge, StateBadge, Trend};
 use crate::util::{ago, bytes, cpus, me, percent, polled};
 
 #[component]
@@ -69,7 +69,7 @@ pub fn Overview() -> impl IntoView {
                         <For
                             each=move || status.data.get().map(|s| s.nodes).unwrap_or_default()
                             key=|n| (n.name.clone(), n.ingress_errors.clone())
-                            children=move |node| view! { <NodeCard node/> }
+                            children=move |node| view! { <NodeCard node trends=true/> }
                         />
                     </div>
                 </section>
@@ -85,7 +85,8 @@ pub fn Overview() -> impl IntoView {
 }
 
 #[component]
-pub fn NodeCard(node: NodeView) -> impl IntoView {
+/// `trends` adds each meter's last hour beside it.
+pub fn NodeCard(node: NodeView, #[prop(optional)] trends: bool) -> impl IntoView {
     let stats = node.stats.clone();
     let online = node.connected;
     view! {
@@ -111,6 +112,55 @@ pub fn NodeCard(node: NodeView) -> impl IntoView {
                 </div>
             })}
             {match stats.filter(|_| online) {
+                Some(s) if trends => {
+                    let name = node.name.clone();
+                    let usage = polled(Some(Duration::from_secs(15)), move || {
+                        let name = name.clone();
+                        async move {
+                            api::get::<Vec<UsagePoint>>(&format!("/api/nodes/{name}/usage?range=1h")).await
+                        }
+                    });
+                    let (mem_total, disk_total, cores) = (s.mem_total, s.disk_total, s.cpus);
+                    // The card is not redrawn as the status refreshes: the meters
+                    // follow the usage feed instead.
+                    let latest = move || usage.data.with(|u| u.as_ref().and_then(|u| u.last().cloned()));
+                    let mem_now = move || latest().map_or(s.mem_used, |p| p.mem);
+                    let disk_now = move || latest().and_then(|p| p.disk).unwrap_or(s.disk_used);
+                    let series = move |f: Box<dyn Fn(&UsagePoint) -> f64 + Send + Sync>| {
+                        Signal::derive(move || {
+                            usage.data.with(|u| u.iter().flatten().map(|p| (p.at, f(p))).collect::<Vec<_>>())
+                        })
+                    };
+                    let cpu = series(Box::new(|p| f64::from(p.cpu)));
+                    let mem = series(Box::new(move |p| percent(p.mem, mem_total)));
+                    let disk = series(Box::new(move |p| percent(p.disk.unwrap_or(0), disk_total)));
+                    let span = Signal::derive(|| {
+                        let now = crate::util::now();
+                        (now.saturating_sub(3600), now)
+                    });
+                    view! {
+                        <div class="meters">
+                            <div class="meter-row">
+                                <Meter label="CPU" percent=Signal::derive(move || latest().map_or(s.cpu_percent, |p| p.cpu) as f64)
+                                    detail=Signal::derive(move || format!("{:.0} % of {cores} cores", latest().map_or(s.cpu_percent, |p| p.cpu)))/>
+                                <Trend label="CPU" points=cpu span=span gap=40
+                                    format=Callback::new(|v: f64| format!("{v:.0} %"))/>
+                            </div>
+                            <div class="meter-row">
+                                <Meter label="Memory" percent=Signal::derive(move || percent(mem_now(), mem_total))
+                                    detail=Signal::derive(move || format!("{} / {}", bytes(mem_now()), bytes(mem_total)))/>
+                                <Trend label="Memory" points=mem span=span gap=40
+                                    format=Callback::new(move |v: f64| bytes((v / 100.0 * mem_total as f64) as u64))/>
+                            </div>
+                            <div class="meter-row">
+                                <Meter label="Disk" percent=Signal::derive(move || percent(disk_now(), disk_total))
+                                    detail=Signal::derive(move || format!("{} / {}", bytes(disk_now()), bytes(disk_total)))/>
+                                <Trend label="Disk" points=disk span=span gap=40
+                                    format=Callback::new(move |v: f64| bytes((v / 100.0 * disk_total as f64) as u64))/>
+                            </div>
+                        </div>
+                    }.into_any()
+                }
                 Some(s) => view! {
                     <div class="meters">
                         <Meter label="CPU" percent=s.cpu_percent as f64
