@@ -89,6 +89,7 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/apps/{name}/env", get(get_env).patch(patch_env))
         .route("/api/apps/{name}/logs", get(logs))
         .route("/api/apps/{name}/metrics", get(app_metrics))
+        .route("/api/apps/{name}/usage", get(app_usage))
         .route("/api/apps/{name}/deployments", get(list_deployments))
         .route("/api/deployments/{id}", get(get_deployment))
         .route("/api/deployments/{id}/cancel", post(cancel_deployment))
@@ -1769,6 +1770,64 @@ async fn app_metrics(
             .map(|a| a.history.iter().cloned().collect())
             .unwrap_or_default(),
     ))
+}
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    #[serde(default = "one_hour")]
+    range: String,
+}
+
+fn one_hour() -> String {
+    "1h".into()
+}
+
+/// `?range=1h` is every sample the agents sent (kept in memory); `1d`, `7d` and
+/// `30d` come from the stored 5-minute buckets, merged to keep about 300 points.
+async fn app_usage(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+    Query(q): Query<UsageQuery>,
+) -> ApiResult<Json<Vec<UsagePoint>>> {
+    load_app_for(&server, &user, &name)?;
+    let (span, step) = match q.range.as_str() {
+        "1h" => {
+            let live = server.live.read();
+            let points = live
+                .apps
+                .get(&name)
+                .map(|a| {
+                    a.history
+                        .iter()
+                        .filter(|m| m.stats.state == AppState::Running)
+                        .map(|m| UsagePoint {
+                            at: m.at,
+                            cpu: m.stats.cpu_percent,
+                            cpu_peak: m.stats.cpu_percent,
+                            mem: m.stats.mem_used,
+                            mem_peak: m.stats.mem_used,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Ok(Json(points));
+        }
+        "1d" => (86400, 300),
+        "7d" => (7 * 86400, 1800),
+        "30d" => (30 * 86400, 7200),
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown range {other:?}: 1h, 1d, 7d or 30d"
+            )));
+        }
+    };
+    let since = facade_core::now().saturating_sub(span);
+    Ok(Json(server.store.usage(
+        &name,
+        since - since % step,
+        step,
+    )?))
 }
 
 async fn list_deployments(

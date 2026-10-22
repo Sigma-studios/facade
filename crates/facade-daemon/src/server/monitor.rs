@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use facade_core::api::{AlertView, Mention, NotifySettings, NotifyUpdate};
+use facade_core::api::{AlertView, AppMetric, Mention, NotifySettings, NotifyUpdate};
 use facade_core::proto::AppState;
 use parking_lot::RwLock;
 use serde_json::json;
@@ -16,10 +16,16 @@ use tracing::{info, warn};
 
 use super::Server;
 use super::secrets::SecretBox;
-use super::store::Store;
+use super::store::{Store, USAGE_KEEP};
 
 const CHECK_EVERY: Duration = Duration::from_secs(30);
 const NODE_OFFLINE_AFTER: u64 = 120;
+/// An app is at its CPU limit when it averaged it over this long. Each sample
+/// covers a second, so one alone is mostly noise: a health check starting an
+/// interpreter fills a half-CPU limit for that second.
+const CPU_PINNED_FOR: u64 = 180;
+/// Stored usage is pruned once an hour.
+const PRUNE_EVERY: u32 = 120;
 
 #[derive(Default)]
 pub struct Alerts {
@@ -44,8 +50,16 @@ pub async fn run(server: Arc<Server>) -> anyhow::Result<()> {
     }
     let mut tick = tokio::time::interval(CHECK_EVERY);
     tick.tick().await;
+    let mut ticks = 0u32;
     loop {
         tick.tick().await;
+        if ticks.is_multiple_of(PRUNE_EVERY) {
+            let before = facade_core::now().saturating_sub(USAGE_KEEP);
+            if let Err(e) = server.store.prune_usage(before) {
+                warn!("pruning app usage: {e:#}");
+            }
+        }
+        ticks = ticks.wrapping_add(1);
         let current = conditions(&server);
         let (fired, cleared) = {
             let mut alerts = server.alerts.lock();
@@ -107,6 +121,28 @@ fn transition(
     }
     alerts.pending = pending;
     (fired, cleared)
+}
+
+/// Whether the running samples of the last `CPU_PINNED_FOR` seconds, covering
+/// most of it, average at least `threshold` percent.
+fn cpu_pinned(history: &VecDeque<AppMetric>, threshold: f64, now: u64) -> bool {
+    let since = now.saturating_sub(CPU_PINNED_FOR);
+    let recent: Vec<&AppMetric> = history
+        .iter()
+        .filter(|m| m.at >= since && m.stats.state == AppState::Running)
+        .collect();
+    let (Some(first), Some(last)) = (recent.first(), recent.last()) else {
+        return false;
+    };
+    if last.at - first.at < CPU_PINNED_FOR * 3 / 4 {
+        return false;
+    }
+    let mean = recent
+        .iter()
+        .map(|m| f64::from(m.stats.cpu_percent))
+        .sum::<f64>()
+        / recent.len() as f64;
+    mean >= threshold
 }
 
 /// Everything wrong right now, keyed so the same problem keeps the same key.
@@ -211,12 +247,16 @@ fn conditions(server: &Server) -> HashMap<String, String> {
                 ),
             );
         }
-        if let (Some(stats), Some(cpus)) = (&state.stats, spec.limits.cpus)
-            && f64::from(stats.cpu_percent) >= cpus * 100.0 * 0.95
+        if let Some(cpus) = spec.limits.cpus
+            && cpu_pinned(&state.history, cpus * 100.0 * 0.95, now)
         {
             out.insert(
                 format!("app:{}:cpu", spec.name),
-                format!("app {} is pinned at its CPU limit", spec.name),
+                format!(
+                    "app {} has been at its CPU limit for {} minutes",
+                    spec.name,
+                    CPU_PINNED_FOR / 60
+                ),
             );
         }
     }
@@ -464,5 +504,44 @@ mod tests {
         let (_, cleared) = transition(&mut alerts, HashMap::new());
         assert_eq!(cleared.len(), 1);
         assert_eq!(alerts.views().len(), 1);
+    }
+
+    fn samples(cpu: &[f32], every: u64, now: u64) -> VecDeque<AppMetric> {
+        let n = cpu.len() as u64;
+        cpu.iter()
+            .enumerate()
+            .map(|(i, &cpu_percent)| AppMetric {
+                at: now - (n - 1 - i as u64) * every,
+                stats: facade_core::proto::AppStats {
+                    app: "a".into(),
+                    state: AppState::Running,
+                    cpu_percent,
+                    mem_used: 0,
+                    mem_limit: 0,
+                    net_rx: 0,
+                    net_tx: 0,
+                    restarts: 0,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cpu_alerts_need_a_sustained_average() {
+        let now = 10_000;
+        // A health check's spikes: a few samples at the limit, the rest idle.
+        let spiky = samples(
+            &[
+                50.0, 49.0, 0.1, 0.1, 50.0, 0.1, 48.0, 0.1, 0.1, 50.0, 0.1, 0.1, 50.0,
+            ],
+            15,
+            now,
+        );
+        assert!(!cpu_pinned(&spiky, 47.5, now));
+        let pinned = samples(&[50.0; 13], 15, now);
+        assert!(cpu_pinned(&pinned, 47.5, now));
+        // Too little history (just started) is not enough to say.
+        let short = samples(&[50.0; 4], 15, now);
+        assert!(!cpu_pinned(&short, 47.5, now));
     }
 }

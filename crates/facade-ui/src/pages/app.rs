@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AppMetric, AppView, BackupReport, BackupRequest, BackupView, CommitView, DeployRequest,
-    DeploymentStatus, DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, SetOwner,
-    UpdateCheck, UserView, VolumeView,
+    AppView, BackupReport, BackupRequest, BackupView, CommitView, DeployRequest, DeploymentStatus,
+    DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, SetOwner, UpdateCheck,
+    UsagePoint, UserView, VolumeView,
 };
 use facade_core::proto::AppState;
 use facade_core::{Build, Source};
@@ -16,7 +16,7 @@ use uuid::Uuid;
 use super::domains::DomainTable;
 use super::spec_form::{SpecFields, SpecForm};
 use crate::api;
-use crate::components::{ErrorNote, Loading, Modal, Sparkline, StateBadge};
+use crate::components::{ErrorNote, Loading, Modal, Sample, Sparkline, StateBadge};
 use crate::util::{ago, bytes, clock, date, me, polled, run, short_hash, strip_ansi, toasts};
 
 const TABS: &[(&str, &str)] = &[
@@ -350,6 +350,56 @@ fn subtitle(app: &AppView) -> String {
 
 // ---------------------------------------------------------------- overview
 
+/// The periods the usage charts cover.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Range {
+    Hour,
+    Day,
+    Week,
+    Month,
+}
+
+impl Range {
+    const ALL: [Range; 4] = [Range::Hour, Range::Day, Range::Week, Range::Month];
+
+    fn key(self) -> &'static str {
+        match self {
+            Range::Hour => "1h",
+            Range::Day => "1d",
+            Range::Week => "7d",
+            Range::Month => "30d",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Range::Hour => "1 h",
+            Range::Day => "24 h",
+            Range::Week => "7 d",
+            Range::Month => "30 d",
+        }
+    }
+
+    fn secs(self) -> u64 {
+        match self {
+            Range::Hour => 3600,
+            Range::Day => 86400,
+            Range::Week => 7 * 86400,
+            Range::Month => 30 * 86400,
+        }
+    }
+
+    /// Seconds between points: the agents' reports, then the server's buckets.
+    fn step(self) -> u64 {
+        match self {
+            Range::Hour => 15,
+            Range::Day => 300,
+            Range::Week => 1800,
+            Range::Month => 7200,
+        }
+    }
+}
+
 #[component]
 fn OverviewTab(
     name: Memo<String>,
@@ -357,23 +407,43 @@ fn OverviewTab(
     deploying: RwSignal<bool>,
     on_deploy: Callback<Option<String>>,
 ) -> impl IntoView {
-    let metrics = polled(Some(Duration::from_secs(15)), move || {
+    let range = RwSignal::new(Range::Hour);
+    let usage = polled(Some(Duration::from_secs(15)), move || {
         let name = name.get();
-        async move { api::get::<Vec<AppMetric>>(&format!("/api/apps/{name}/metrics")).await }
+        let range = range.get();
+        async move {
+            api::get::<Vec<UsagePoint>>(&format!("/api/apps/{name}/usage?range={}", range.key()))
+                .await
+                .map(|points| (range, points))
+        }
     });
-    let series = move |f: fn(&AppMetric) -> f64| {
+    // Only the data of the range on screen: a slow answer for the previous one
+    // must not draw over it.
+    let series = move |f: fn(&UsagePoint) -> (f64, f64)| {
         Signal::derive(move || {
-            metrics.data.with(|m| {
-                m.iter()
-                    .flatten()
-                    .filter(|m| m.stats.state == AppState::Running)
-                    .map(|m| (m.at, f(m)))
-                    .collect::<Vec<_>>()
+            usage.data.with(|u| match u {
+                Some((r, points)) if *r == range.get() => points
+                    .iter()
+                    .map(|p| {
+                        let (value, peak) = f(p);
+                        Sample {
+                            at: p.at,
+                            value,
+                            peak,
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
             })
         })
     };
-    let cpu = series(|m| m.stats.cpu_percent as f64);
-    let mem = series(|m| m.stats.mem_used as f64);
+    let cpu = series(|p| (f64::from(p.cpu), f64::from(p.cpu_peak)));
+    let mem = series(|p| (p.mem as f64, p.mem_peak as f64));
+    let span = Signal::derive(move || {
+        let now = crate::util::now();
+        (now.saturating_sub(range.get().secs()), now)
+    });
+    let gap = Signal::derive(move || range.get().step() * 5 / 2);
     let spec = move || app.get().map(|a| a.spec);
     let stats = move || app.get().and_then(|a| a.stats);
     let cpu_max = Signal::derive(move || spec().and_then(|s| s.limits.cpus).map(|c| c * 100.0));
@@ -415,9 +485,20 @@ fn OverviewTab(
                     <span class="tile-sub">{move || stats().map(|s| format!("↑ {} sent", bytes(s.net_tx))).unwrap_or_default()}</span>
                 </div>
             </div>
+            <div class="charts-head">
+                <h2 class="section-title">"Usage"</h2>
+                <div class="segmented" role="radiogroup" aria-label="Period">
+                    {Range::ALL.into_iter().map(|r| view! {
+                        <button type="button" role="radio"
+                            class=move || if range.get() == r { "segment active" } else { "segment" }
+                            aria-checked=move || (range.get() == r).to_string()
+                            on:click=move |_| range.set(r)>{r.label()}</button>
+                    }).collect_view()}
+                </div>
+            </div>
             <div class="charts">
-                <Sparkline title="CPU, last hour" points=cpu max=cpu_max format=|v| format!("{v:.1} %")/>
-                <Sparkline title="Memory, last hour" points=mem max=mem_max format=|v| bytes(v as u64)/>
+                <Sparkline title="CPU" points=cpu span=span gap=gap max=cpu_max format=|v| format!("{v:.1} %")/>
+                <Sparkline title="Memory" points=mem span=span gap=gap max=mem_max format=|v| bytes(v as u64)/>
             </div>
         </Show>
         <Show when=move || spec().is_some_and(|s| !s.domains.is_empty())>

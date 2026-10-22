@@ -411,7 +411,11 @@ impl Server {
                 stats: report.node,
             },
         );
+        let mut usage = Vec::new();
         for stats in report.apps {
+            if stats.state == AppState::Running {
+                usage.push((stats.app.clone(), stats.cpu_percent, stats.mem_used));
+            }
             let app = live.apps.entry(stats.app.clone()).or_default();
             // A build in progress is more informative than "the old container runs".
             if app.state != AppState::Building {
@@ -419,6 +423,10 @@ impl Server {
             }
             app.stats = Some(stats.clone());
             push_capped(&mut app.history, AppMetric { at, stats });
+        }
+        drop(live);
+        if let Err(e) = self.store.record_usage(at, &usage) {
+            warn!("recording app usage: {e:#}");
         }
     }
 

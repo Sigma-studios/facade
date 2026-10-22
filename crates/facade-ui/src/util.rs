@@ -210,6 +210,12 @@ pub fn clock(at: u64) -> String {
     format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
 }
 
+/// Local day and month, `18/01`.
+pub fn day(at: u64) -> String {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(at as f64 * 1000.0));
+    format!("{:02}/{:02}", date.get_date(), date.get_month() + 1)
+}
+
 /// Local date, `2027-01-18`.
 pub fn date(at: u64) -> String {
     let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(at as f64 * 1000.0));

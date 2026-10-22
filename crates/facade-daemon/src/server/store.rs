@@ -7,7 +7,7 @@ use anyhow::Context;
 use facade_core::AppSpec;
 use facade_core::api::{
     DeploymentStatus, DeploymentView, GitCredentialKind, StackDeploymentService,
-    StackDeploymentView,
+    StackDeploymentView, UsagePoint,
 };
 use facade_core::stack::StackSpec;
 use parking_lot::Mutex;
@@ -129,7 +129,23 @@ CREATE TABLE IF NOT EXISTS registry_logins (
     secret BLOB NOT NULL,
     PRIMARY KEY (host, owner_id)
 );
+-- Apps' resource use, averaged per bucket (`USAGE_BUCKET`), kept `USAGE_KEEP`.
+CREATE TABLE IF NOT EXISTS app_usage (
+    app TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    samples INTEGER NOT NULL,
+    cpu REAL NOT NULL,
+    cpu_peak REAL NOT NULL,
+    mem REAL NOT NULL,
+    mem_peak INTEGER NOT NULL,
+    PRIMARY KEY (app, at)
+) WITHOUT ROWID;
 "#;
+
+/// Seconds of app usage stored as one row.
+pub const USAGE_BUCKET: u64 = 300;
+/// How long app usage is kept, in seconds.
+pub const USAGE_KEEP: u64 = 30 * 86400;
 
 /// The owner id of logins and credentials shared by every admin.
 pub const ADMINS: i64 = 0;
@@ -725,9 +741,67 @@ impl Store {
     }
 
     pub fn delete_app(&self, name: &str) -> anyhow::Result<()> {
+        let conn = self.0.lock();
+        conn.execute("DELETE FROM apps WHERE name = ?1", [name])?;
+        conn.execute("DELETE FROM app_usage WHERE app = ?1", [name])?;
+        Ok(())
+    }
+
+    // ---- usage
+
+    /// Folds one sample per app, `(app, cpu %, memory bytes)`, into its bucket.
+    pub fn record_usage(&self, at: u64, samples: &[(String, f32, u64)]) -> anyhow::Result<()> {
+        let bucket = at - at % USAGE_BUCKET;
+        let mut conn = self.0.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO app_usage (app, at, samples, cpu, cpu_peak, mem, mem_peak)
+                 VALUES (?1, ?2, 1, ?3, ?3, ?4, ?4)
+                 ON CONFLICT (app, at) DO UPDATE SET
+                    cpu = (cpu * samples + excluded.cpu) / (samples + 1),
+                    cpu_peak = max(cpu_peak, excluded.cpu),
+                    mem = (mem * samples + excluded.mem) / (samples + 1),
+                    mem_peak = max(mem_peak, excluded.mem_peak),
+                    samples = samples + 1",
+            )?;
+            for (app, cpu, mem) in samples {
+                stmt.execute(params![app, bucket as i64, f64::from(*cpu), *mem as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// An app's usage since `since`, in buckets of `step` seconds (a multiple of
+    /// `USAGE_BUCKET`), oldest first.
+    pub fn usage(&self, app: &str, since: u64, step: u64) -> anyhow::Result<Vec<UsagePoint>> {
+        let step = step.max(USAGE_BUCKET) as i64;
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT at / ?3 * ?3 AS b, SUM(cpu * samples) / SUM(samples), MAX(cpu_peak),
+                    SUM(mem * samples) / SUM(samples), MAX(mem_peak)
+             FROM app_usage WHERE app = ?1 AND at >= ?2 GROUP BY b ORDER BY b",
+        )?;
+        let rows = stmt
+            .query_map(params![app, since as i64, step], |r| {
+                Ok(UsagePoint {
+                    at: r.get::<_, i64>(0)? as u64,
+                    cpu: r.get::<_, f64>(1)? as f32,
+                    cpu_peak: r.get::<_, f64>(2)? as f32,
+                    mem: r.get::<_, f64>(3)? as u64,
+                    mem_peak: r.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Drops usage older than `before`.
+    pub fn prune_usage(&self, before: u64) -> anyhow::Result<()> {
         self.0
             .lock()
-            .execute("DELETE FROM apps WHERE name = ?1", [name])?;
+            .execute("DELETE FROM app_usage WHERE at < ?1", [before as i64])?;
         Ok(())
     }
 
@@ -1404,4 +1478,39 @@ fn migrate_from_branch_logins(conn: &Connection) -> anyhow::Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_is_bucketed_and_merged() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        // Two samples in one 5-minute bucket, one in the next.
+        store.record_usage(600, &[("a".into(), 10.0, 100)]).unwrap();
+        store
+            .record_usage(615, &[("a".into(), 30.0, 300), ("b".into(), 1.0, 1)])
+            .unwrap();
+        store
+            .record_usage(900, &[("a".into(), 50.0, 200), ("b".into(), 1.0, 1)])
+            .unwrap();
+        let points = store.usage("a", 0, USAGE_BUCKET).unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(
+            (points[0].at, points[0].cpu, points[0].cpu_peak),
+            (600, 20.0, 30.0)
+        );
+        assert_eq!((points[0].mem, points[0].mem_peak), (200, 300));
+        // Merged into one 30-minute bucket, weighted by samples.
+        let merged = store.usage("a", 0, 1800).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!((merged[0].cpu - 30.0).abs() < 1e-4);
+        assert_eq!(merged[0].cpu_peak, 50.0);
+        store.prune_usage(900).unwrap();
+        assert_eq!(store.usage("a", 0, USAGE_BUCKET).unwrap().len(), 1);
+        store.delete_app("a").unwrap();
+        assert!(store.usage("a", 0, USAGE_BUCKET).unwrap().is_empty());
+        assert_eq!(store.usage("b", 0, USAGE_BUCKET).unwrap().len(), 1);
+    }
 }
