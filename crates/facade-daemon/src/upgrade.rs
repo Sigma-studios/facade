@@ -97,7 +97,7 @@ async fn check_copy(cfg: &ServerConfig, copy: &std::path::Path, json: bool) -> a
         let change = match running.get(&spec.name) {
             None => Change::NotRunning,
             Some(_) if docker.inspect_image(&image).await.is_err() => Change::Rebuild,
-            Some(key) if *key != crate::agent::run_key(&w, &image) => Change::Restart,
+            Some(key) if !crate::agent::run_key_matches(&w, &image, key) => Change::Restart,
             Some(_) => Change::Unchanged,
         };
         planned.push(Planned {
