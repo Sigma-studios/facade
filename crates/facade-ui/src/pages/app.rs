@@ -437,12 +437,21 @@ fn OverviewTab(
                 <dl class="kv">
                     <dt>"Source"</dt>
                     <dd>{match &s.source {
-                        Source::Image { image } => format!("Docker image {image}"),
+                        Source::Image { image } => format!("Docker image {image}").into_any(),
                         Source::Executable { filename, arch, args, .. } => format!(
                             "Executable {filename} ({arch}){}",
                             if args.is_empty() { String::new() } else { format!(", run with {}", facade_core::join_command(args)) }
-                        ),
-                        Source::Git { repo, branch, .. } => format!("{repo} ({})", branch.clone().unwrap_or_else(|| "default branch".into())),
+                        ).into_any(),
+                        Source::Git { repo, branch, .. } => {
+                            let branch = format!(" ({})", branch.clone().unwrap_or_else(|| "default branch".into()));
+                            match facade_core::git::parse(repo) {
+                                Some(location) => view! {
+                                    <a href=location.web_url() target="_blank" rel="noopener">{repo.clone()}</a>
+                                    {branch}
+                                }.into_any(),
+                                None => format!("{repo}{branch}").into_any(),
+                            }
+                        }
                     }}</dd>
                     {matches!(s.source, Source::Git { .. }).then(|| view! {
                         <dt>"Deployed commit"</dt>
