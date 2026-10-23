@@ -110,11 +110,19 @@ pub fn planned_image(w: &Workload) -> Option<String> {
         Source::Image { image } => return Some(facade_core::image_with_tag(image)),
         Source::Git { build, .. } if build.is_static() => return None,
         Source::Executable { .. } => short_hash(&w.spec.source),
-        Source::Git { .. } => match (&w.build_key, &w.commit) {
-            (Some(content), _) => short_hash(&(&w.spec.source, content)),
-            (None, Some(commit)) => short_hash(&(&w.spec.source, commit)),
-            (None, None) => short_hash(&(&w.spec.source, w.revision)),
-        },
+        Source::Git { .. } => {
+            let key = match (&w.build_key, &w.commit) {
+                (Some(content), _) => short_hash(&(&w.spec.source, content)),
+                (None, Some(commit)) => short_hash(&(&w.spec.source, commit)),
+                (None, None) => short_hash(&(&w.spec.source, w.revision)),
+            };
+            // So does what its build was handed: a new value must not find the
+            // old image.
+            match &w.build_digest {
+                Some(digest) => short_hash(&(key, digest)),
+                None => key,
+            }
+        }
     };
     Some(format!("{}:{key}", image_repo(&w.spec.name)))
 }
@@ -438,8 +446,14 @@ impl Runtime {
                     let dockerfile = workdir.0.join("Dockerfile");
                     tokio::fs::write(&dockerfile, lang::executable::dockerfile(filename, args))
                         .await?;
-                    let options =
-                        build::BuildOptions::new(None, &w.registries, &workdir.0, rebuild)?;
+                    let options = build::BuildOptions::new(
+                        None,
+                        &w.registries,
+                        &[],
+                        None,
+                        &workdir.0,
+                        rebuild,
+                    )?;
                     build::docker_build(&w.spec.name, &tag, &dockerfile, &workdir.0, &options, log)
                         .await
                 })
@@ -455,6 +469,7 @@ impl Runtime {
                 // so it survives commits that do not touch it.
                 let tag = planned_image(w).expect("built sources have an image");
                 let key = tag.rsplit(':').next().unwrap_or_default().to_string();
+                let vars = w.build_vars();
                 if !rebuild && self.docker().inspect_image(&tag).await.is_ok() {
                     if log.is_deployment() {
                         log.line("this code was built before: reusing its image");
@@ -488,18 +503,35 @@ impl Runtime {
                         }
                         generated => {
                             let path = workdir.0.join(".facade.Dockerfile");
-                            let contents = lang::generated_dockerfile(&w.spec.name, generated)
-                                .expect("every other build kind generates a Dockerfile");
+                            let contents =
+                                lang::generated_dockerfile(&w.spec.name, generated, &w.build_env)
+                                    .expect("every other build kind generates a Dockerfile");
                             tokio::fs::write(&path, contents).await?;
                             (path, workdir.0.clone())
                         }
                     };
+                    // Without the argument, a cached step would keep an old value.
+                    let mut no_cache = rebuild;
+                    if w.build_digest.is_some() {
+                        let text = tokio::fs::read_to_string(&dockerfile)
+                            .await
+                            .unwrap_or_default();
+                        if !build::declares_build_vars_arg(&text) {
+                            log.line(format!(
+                                "the Dockerfile does not declare `ARG {}` before the steps reading build variables: building without the layer cache",
+                                build::BUILD_VARS_ARG
+                            ));
+                            no_cache = true;
+                        }
+                    }
                     crate::tls::create_private_dir(&private.0)?;
                     let options = build::BuildOptions::new(
                         w.git_auth.as_ref(),
                         &w.registries,
+                        &vars,
+                        w.build_digest.as_deref(),
                         &private.0,
-                        rebuild,
+                        no_cache,
                     )?;
                     build::docker_build(&w.spec.name, &tag, &dockerfile, &context, &options, log)
                         .await
@@ -1708,16 +1740,19 @@ impl Runtime {
             )),
             Build::Static { .. } => None,
             Build::Trunk { dir } => Some((
-                Recipe::Generated(lang::trunk::dockerfile(&w.spec.name, dir)),
+                Recipe::Generated(lang::trunk::dockerfile(&w.spec.name, dir, &w.build_env)),
                 ".".into(),
             )),
             _ => bail!("{} is not a static site", w.spec.name),
         };
         let dir = self.static_dir(&w.spec.name);
-        let key = match &w.commit {
+        let mut key = match &w.commit {
             Some(commit) => short_hash(&(&w.spec.source, commit)),
             None => short_hash(&(&w.spec.source, w.revision)),
         };
+        if let (Some(_), Some(digest)) = (&recipe, &w.build_digest) {
+            key = short_hash(&(key, digest));
+        }
         let marker = dir.join(".facade-key");
         if !rebuild
             && tokio::fs::read_to_string(&marker).await.ok().as_deref() == Some(key.as_str())
@@ -1759,12 +1794,27 @@ impl Runtime {
                         path
                     }
                 };
+                let mut no_cache = rebuild;
+                if w.build_digest.is_some() {
+                    let text = tokio::fs::read_to_string(&dockerfile)
+                        .await
+                        .unwrap_or_default();
+                    if !build::declares_build_vars_arg(&text) {
+                        log.line(format!(
+                            "the Dockerfile does not declare `ARG {}` before the steps reading build variables: building without the layer cache",
+                            build::BUILD_VARS_ARG
+                        ));
+                        no_cache = true;
+                    }
+                }
                 crate::tls::create_private_dir(&private.0)?;
                 let options = build::BuildOptions::new(
                     w.git_auth.as_ref(),
                     &w.registries,
+                    &w.build_vars(),
+                    w.build_digest.as_deref(),
                     &private.0,
-                    rebuild,
+                    no_cache,
                 )?;
                 build::docker_build_files(
                     &dockerfile,

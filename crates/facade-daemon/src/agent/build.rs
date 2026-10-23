@@ -78,19 +78,38 @@ pub async fn git_checkout(
 /// Extra `docker build` arguments. The app's git credential is handed over as
 /// build secrets, so Dockerfiles can fetch private dependencies with
 /// `RUN --mount=type=secret,id=gitconfig,target=/root/.gitconfig` (tokens) or
-/// `RUN --mount=type=ssh` (keys); neither ends up in the image. Registry logins
-/// go in a Docker config of their own, for `FROM` lines naming private images.
+/// `RUN --mount=type=ssh` (keys); neither ends up in the image. So are the
+/// variables marked for builds, each under its own name:
+/// `RUN --mount=type=secret,id=KEY,env=KEY`. Registry logins go in a Docker config
+/// of their own, for `FROM` lines naming private images.
 pub struct BuildOptions {
     args: Vec<String>,
     docker_config: Option<std::path::PathBuf>,
 }
 
+/// The build argument that changes with the build variables' values. BuildKit
+/// leaves secrets out of its cache keys, so the steps reading them declare it to be
+/// run again when a value changes.
+pub const BUILD_VARS_ARG: &str = "FACADE_BUILD_VARS";
+
+/// Whether a Dockerfile declares [`BUILD_VARS_ARG`] (`ARG FACADE_BUILD_VARS`).
+pub fn declares_build_vars_arg(dockerfile: &str) -> bool {
+    dockerfile.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next().is_some_and(|w| w.eq_ignore_ascii_case("ARG"))
+            && words.any(|w| w.split('=').next() == Some(BUILD_VARS_ARG))
+    })
+}
+
 impl BuildOptions {
-    /// Writes what the credential needs into `dir`, which must be outside the
-    /// build context and is deleted with the build. `no_cache` rebuilds every layer.
+    /// Writes what the credential and `vars` need into `dir`, which must be private,
+    /// outside the build context and deleted with the build. `vars_digest` stands
+    /// for their values in [`BUILD_VARS_ARG`]. `no_cache` rebuilds every layer.
     pub fn new(
         auth: Option<&GitAuth>,
         registries: &[RegistryLogin],
+        vars: &[(&str, &str)],
+        vars_digest: Option<&str>,
         dir: &Path,
         no_cache: bool,
     ) -> anyhow::Result<Self> {
@@ -113,6 +132,18 @@ impl BuildOptions {
         };
         if no_cache {
             args.push("--no-cache".to_string());
+        }
+        if let Some(digest) = vars_digest {
+            args.push("--build-arg".into());
+            args.push(format!("{BUILD_VARS_ARG}={digest}"));
+        }
+        for (key, value) in vars {
+            // Values go through files, like the credential: the command line only
+            // ever names them.
+            let path = dir.join(format!("env-{key}"));
+            crate::tls::write_private(&path, value.as_bytes())?;
+            args.push("--secret".into());
+            args.push(format!("id={key},src={}", path.display()));
         }
         match auth {
             Some(GitAuth::Token {
@@ -252,4 +283,22 @@ pub async fn run_logged(mut cmd: Command, log: &DeployLog) -> anyhow::Result<()>
         bail!("{last}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_build_vars_arg() {
+        assert!(declares_build_vars_arg(
+            "FROM rust\nARG FACADE_BUILD_VARS\nRUN cargo build"
+        ));
+        assert!(declares_build_vars_arg("  arg FACADE_BUILD_VARS=none"));
+        assert!(declares_build_vars_arg("ARG A=1 FACADE_BUILD_VARS"));
+        assert!(!declares_build_vars_arg(
+            "ARG FACADE_BUILD_VARS_OLD\n# ARG FACADE_BUILD_VARS"
+        ));
+        assert!(!declares_build_vars_arg("RUN echo ARG FACADE_BUILD_VARS"));
+    }
 }

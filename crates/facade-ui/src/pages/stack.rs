@@ -1080,7 +1080,16 @@ fn ServiceForm(
                 Ok(_) if !db_env.is_empty() => {
                     let set = db_env
                         .into_iter()
-                        .map(|(k, value, sensitive)| (k, SetEnv { value, sensitive }))
+                        .map(|(k, value, sensitive)| {
+                            (
+                                k,
+                                SetEnv {
+                                    value,
+                                    sensitive,
+                                    build: None,
+                                },
+                            )
+                        })
                         .collect();
                     api::patch(
                         &format!("/api/apps/{}.{svc}/env", spec.name),

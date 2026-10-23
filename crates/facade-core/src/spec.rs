@@ -722,6 +722,18 @@ impl Build {
     pub fn is_static(&self) -> bool {
         matches!(self, Build::Static { .. } | Build::Trunk { .. })
     }
+
+    /// Whether the node runs a build: everything but a static site served from the
+    /// repository as it is.
+    pub fn runs_build(&self) -> bool {
+        !matches!(
+            self,
+            Build::Static {
+                dockerfile: None,
+                ..
+            }
+        )
+    }
 }
 
 /// The Python used when a project does not say.

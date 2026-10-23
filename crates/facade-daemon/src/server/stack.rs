@@ -409,6 +409,7 @@ pub async fn plan(
                     key: k.clone(),
                     value: (!sensitive).then(|| v.clone()),
                     sensitive: *sensitive,
+                    build: false,
                 })
                 .collect(),
             missing: s.missing.clone(),
@@ -628,6 +629,7 @@ pub async fn get_env(
                 key: v.key,
                 value,
                 sensitive: v.sensitive,
+                build: false,
             })
         })
         .collect::<anyhow::Result<_>>()?;
@@ -1187,6 +1189,12 @@ pub async fn apply(
                     report.missing_secrets.push(format!("{app}: {key}"));
                 }
                 _ => {}
+            }
+            let was = current.iter().find(|r| r.key == *key).map(|r| r.build);
+            let exists = was.is_some() || entry.resolve().0.is_some();
+            if exists && was.unwrap_or(false) != entry.build() {
+                server.store.set_env_build(&app, key, entry.build())?;
+                changed = true;
             }
         }
     }

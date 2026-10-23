@@ -1679,6 +1679,7 @@ async fn get_env(
                 key: e.key,
                 value,
                 sensitive: e.sensitive,
+                build: e.build,
             })
         })
         .collect::<anyhow::Result<_>>()?;
@@ -1691,12 +1692,15 @@ pub fn valid_env_key(key: &str) -> bool {
         && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Applies the changes, then restarts the apps they reach. An app whose builds get
+/// a changed variable is rebuilt instead, at the commit it runs, by a deployment
+/// listed in the answer.
 async fn patch_env(
     State(server): S,
     user: User,
     Path(name): Path<String>,
     Json(patch): Json<EnvPatch>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Json<Vec<DeploymentView>>> {
     load_app_for(&server, &user, &name)?;
     for key in patch.set.keys().chain(&patch.unset) {
         if !valid_env_key(key) {
@@ -1705,22 +1709,69 @@ async fn patch_env(
             )));
         }
     }
+    // Apps whose variables refer to these get the new values too.
+    let mut apps = vec![name.clone()];
+    apps.extend(server.dependents(&name)?);
+    let before: Vec<_> = apps.iter().map(|app| build_vars(&server, app)).collect();
     for (key, var) in &patch.set {
         let sealed = server.secrets.seal(var.value.as_bytes());
         server.store.set_env(&name, key, &sealed, var.sensitive)?;
+        if let Some(build) = var.build {
+            server.store.set_env_build(&name, key, build)?;
+        }
     }
     for key in &patch.unset {
         server.store.delete_env(&name, key)?;
     }
-    // Apps whose variables refer to these get the new values too.
-    let mut apps = vec![name.clone()];
-    apps.extend(server.dependents(&name)?);
-    for app in apps {
-        if let Err(e) = server.push(&app).await {
+    let mut rebuilding = Vec::new();
+    for (app, before) in apps.iter().zip(before) {
+        if build_vars(&server, app) != before
+            && let Some(deployment) = rebuild_at_current_commit(&server, app).await
+        {
+            rebuilding.push(deployment);
+            continue;
+        }
+        if let Err(e) = server.push(app).await {
             warn!(%app, "push failed: {e:#}");
         }
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(rebuilding))
+}
+
+/// What `app`'s builds are handed, `None` if its variables do not resolve.
+fn build_vars(server: &Server, app: &str) -> Option<Vec<(String, String)>> {
+    let workload = server.workload(app).ok()?;
+    Some(
+        workload
+            .build_vars()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    )
+}
+
+/// Deploys the commit a built app runs again, so the build picks up new variables
+/// with a deployment log to show for it. `None` when the app has no such build
+/// (never deployed, not built from git, a stack service) or the deploy could not
+/// start; a push then carries the change, and the node rebuilds when it converges.
+async fn rebuild_at_current_commit(server: &Server, app: &str) -> Option<DeploymentView> {
+    let row = server.store.get_app(app).ok()??;
+    let built = matches!(&row.spec.source, facade_core::Source::Git { build, .. } if build.runs_build());
+    if row.revision == 0 || row.spec.stack.is_some() || !built {
+        return None;
+    }
+    let commit = row.commit.clone()?;
+    let request = DeployRequest {
+        commit: Some(commit),
+        rebuild: false,
+    };
+    match start_deploy(server, app, &request).await {
+        Ok(deployment) => Some(deployment),
+        Err(ApiError(_, e)) => {
+            warn!(%app, "could not rebuild for new build variables: {e}");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------- logs, metrics, deployments
@@ -1924,6 +1975,13 @@ async fn export(State(server): S, user: User) -> ApiResult<Response> {
                 EnvEntry::Detailed {
                     value: None,
                     sensitive: true,
+                    build: var.build,
+                }
+            } else if var.build {
+                EnvEntry::Detailed {
+                    value: Some(server.secrets.open_string(&var.sealed)?),
+                    sensitive: false,
+                    build: true,
                 }
             } else {
                 EnvEntry::Plain(server.secrets.open_string(&var.sealed)?)
@@ -2064,6 +2122,13 @@ async fn apply(State(server): S, user: User, body: String) -> ApiResult<Json<App
                     }
                 }
                 (None, None) => report.missing_secrets.push(format!("{name}: {key}")),
+            }
+            let was = current.map(|c| c.build);
+            let exists = was.is_some() || value.is_some();
+            // Set with its value above when new, so the app exists by now.
+            if exists && was.unwrap_or(false) != entry.build() {
+                server.store.set_env_build(&name, key, entry.build())?;
+                changed = true;
             }
         }
 

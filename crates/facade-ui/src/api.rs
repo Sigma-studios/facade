@@ -128,6 +128,13 @@ pub async fn put_empty<B: Serialize>(path: &str, body: &B) -> Result<(), String>
         .map(|_| ())
 }
 
+pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
+    path: &str,
+    body: &B,
+) -> Result<T, String> {
+    decode(call(Method::PATCH, path, json_body(body), None).await?).await
+}
+
 pub async fn patch<B: Serialize>(path: &str, body: &B) -> Result<(), String> {
     call(Method::PATCH, path, json_body(body), None)
         .await
