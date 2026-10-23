@@ -45,6 +45,15 @@ everything scriptable from a CLI with `--json` output.
 
 ## Install on a VPS (Ubuntu)
 
+On the VPS, with the latest build of main (`aarch64` instead of `x86_64` for ARM):
+
+```sh
+curl -fsSL https://github.com/Sigma-studios/facade/releases/download/edge/facade-linux-x86_64.tar.gz | tar -xz
+sudo facade/install.sh server VPS_PUBLIC_IP --domain facade.example.com --email you@example.com
+```
+
+Or with a build of your own:
+
 ```sh
 deploy/build-linux.sh            # static binaries in dist/amd64 (needs Docker, or podman, and trunk)
 scp -r dist/amd64 root@VPS:/root/facade
@@ -76,25 +85,47 @@ an SSH tunnel (`ssh -L 7701:127.0.0.1:7701 VPS`) as a way back in.
 
 ### Updating
 
+Every commit on main is tested, built for x86_64 and aarch64 by GitHub Actions
+(`.github/workflows/build.yml`) and published to the
+[`edge` release](https://github.com/Sigma-studios/facade/releases/tag/edge). The server
+checks it every six hours. To update, open **Settings → Updates** in the web UI
+(it lists the new commits; **Update to …** downloads the build, shows which apps
+it would restart, and installs it after you confirm), or from the CLI:
+
+```sh
+facade server update --check        # what is published, and the commits it brings
+facade server update                # download, show what it changes, install after a yes
+```
+
+A build of your own goes through SSH instead:
+
 ```sh
 deploy/build-linux.sh
 deploy/upgrade.sh root@VPS          # or ubuntu@VPS with passwordless sudo
 ```
 
-`upgrade.sh` first asks the new binary what it would do to the running apps (a new
-version can change how containers are fingerprinted: they are then recreated, or
-rebuilt from their branch's latest commit), and waits for a yes. Then it backs up
-the database and key, keeps the previous binary as `facaded.prev`, installs, and
-waits for the server to be healthy, going back to the previous binary if it is not
-within a minute. Last, `systemctl reload facaded-ingress` hands the entry point over
+Either way, facade first asks the new binary what it would do to the running apps
+(a new version can change how containers are fingerprinted: they are then
+recreated, or rebuilt at their deployed commit), and waits for a yes. Then
+`facaded apply-update` backs up the database and key, keeps the previous binary as
+`facaded.prev`, installs, and waits for the server to be healthy, going back to
+the previous binary if it is not within 90 seconds. From the web UI it runs as a
+systemd unit of its own (`facade-update`), so it outlives the server's restart;
+its progress and outcome show in Settings → Updates. Last, `systemctl reload facaded-ingress` hands the entry point over
 to the new binary: it takes the listening sockets, and the old process finishes its
 open connections (WebSockets included, up to an hour) before exiting. If the new
 binary does not start, the old one keeps serving.
 
 Apps run on through all of it: they belong to Docker. Other nodes update themselves:
-when an agent connects to a server running another build of facaded (for the same
-CPU), it downloads the server's binary, hands its node's entry point over to it and
-restarts. The server accepts agents from the previous protocol version on, so an
+when an agent connects to a server running another build of facaded, it downloads
+the server's binary (for a node with another CPU, the published build of the same
+commit, which the server fetched along with its own), hands its node's entry point
+over to it and restarts.
+
+Builds come from `Sigma-studios/facade` unless `[update]` in `server.toml` names
+another repository (a fork publishing its own builds with the same workflow).
+Servers installed before updates from the web UI existed need one update by
+`upgrade.sh` first. The server accepts agents from the previous protocol version on, so an
 update never locks nodes out.
 
 Installs from before the separate entry point serve apps from inside `facaded`: add
@@ -232,6 +263,7 @@ template in `lang::generated_dockerfile`.
 | `facade node ports <node>` | what listens on a node, and who holds each port |
 | `facade user add/ls/set/rm` / `app owner` / `app grant` / `whoami` | accounts and who manages what |
 | `facade server` / `server set` | the web UI's domain, ACME contact, direct API port |
+| `facade server update [--check]` | update facade to the latest build of main (see [Updating](#updating)) |
 | `facade stop` / `start` / `restart` / `app rm [--volumes]` | lifecycle |
 | `facade export -o facade.toml` / `facade apply -f facade.toml` | config as code |
 
@@ -578,7 +610,8 @@ secrets still to set. Applying is idempotent and never deletes anything.
 
 Servers and agents speak a versioned protocol; when it changes (it did with commit
 pinning and the build queue, then with stop settings, volume sizes and cgroup
-delegation), upgrade `facaded` on the server and on every node.
+delegation), agents one version behind are updated by the server; older ones need
+the server's `facaded` installed by hand.
 
 ## Not there yet
 

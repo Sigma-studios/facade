@@ -755,6 +755,133 @@ pub struct ServerSettingsUpdate {
     pub direct_api_local_only: Option<bool>,
 }
 
+/// Updating facade itself to the latest build published from its repository's
+/// main branch (Settings → Updates, `facade server update`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerUpdate {
+    /// GitHub repository the builds come from (`owner/name`).
+    pub repository: String,
+    pub current: RunningBuild,
+    /// The published build, as of the last check.
+    #[serde(default)]
+    pub latest: Option<PublishedBuild>,
+    #[serde(default)]
+    pub checked_at: Option<u64>,
+    #[serde(default)]
+    pub check_error: Option<String>,
+    /// `latest` is another build than the running one.
+    #[serde(default)]
+    pub available: bool,
+    /// Commits between the running build and `latest`, newest first (at most 50).
+    /// Empty when that is unknown (a local build).
+    #[serde(default)]
+    pub commits: Vec<CommitView>,
+    /// Downloaded and checked, ready to install.
+    #[serde(default)]
+    pub prepared: Option<PreparedUpdate>,
+    /// The update in progress, or the last one.
+    #[serde(default)]
+    pub run: Option<UpdateRun>,
+    #[serde(default)]
+    pub nodes: Vec<NodeBuild>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningBuild {
+    /// Commit the server's facaded was built from; `None` for a build without one.
+    pub commit: Option<String>,
+    pub version: String,
+    /// CPU architecture (`x86_64`, `aarch64`).
+    pub arch: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishedBuild {
+    pub commit: String,
+    pub subject: String,
+    /// Unix time of the commit.
+    pub time: u64,
+    /// CPU architectures it is built for.
+    pub arches: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedUpdate {
+    pub commit: String,
+    /// What installing it does to the apps on the server's node.
+    pub plan: Vec<PlannedChange>,
+}
+
+/// Output of `facaded upgrade-check --json`, run with the binary to install.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedChange {
+    pub app: String,
+    pub change: AppChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppChange {
+    Unchanged,
+    /// Its container is recreated (a few seconds down).
+    Restart,
+    /// Its image is rebuilt (git: at the deployed commit) or pulled.
+    Rebuild,
+    /// Not running on this node now; nothing to compare.
+    NotRunning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateRun {
+    /// Commit being installed.
+    pub to: String,
+    pub from: Option<String>,
+    pub state: UpdateState,
+    /// The step under way, or how it ended.
+    pub message: String,
+    pub started: u64,
+    #[serde(default)]
+    pub finished: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateState {
+    Running,
+    Done,
+    /// The new build did not come up healthy; the previous one is back.
+    RolledBack,
+    Failed,
+}
+
+/// Whether a node runs the server's build.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeBuild {
+    pub name: String,
+    pub connected: bool,
+    pub arch: Option<String>,
+    pub state: NodeBuildState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeBuildState {
+    Current,
+    /// Runs another build; it is sent the server's when it connects.
+    Updating,
+    /// Runs another build, and the server has none for its CPU: update it by hand
+    /// (or update the server from a published build, which brings them all).
+    Manual,
+    /// It has not said which build it runs.
+    Unknown,
+}
+
+/// The build a prepare or install is meant for, as last shown to the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTarget {
+    pub commit: String,
+}
+
 /// A container registry login. The secret is never sent back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryLoginView {

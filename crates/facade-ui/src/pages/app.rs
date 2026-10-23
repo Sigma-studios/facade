@@ -559,7 +559,7 @@ fn UpdateCheckPanel(
 }
 
 #[component]
-fn CommitRow(c: CommitView) -> impl IntoView {
+pub fn CommitRow(c: CommitView) -> impl IntoView {
     view! {
         <li class="commit">
             <code title=c.hash.clone()>{short_hash(&c.hash).to_string()}</code>

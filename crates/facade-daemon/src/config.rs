@@ -35,6 +35,10 @@ pub struct ServerConfig {
     pub api_domain: Option<String>,
     pub acme: AcmeConfig,
     pub backups: BackupConfig,
+    pub update: UpdateConfig,
+    /// The file this was read from (handed to the binary checking an update).
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 impl Default for ServerConfig {
@@ -53,6 +57,8 @@ impl Default for ServerConfig {
             api_domain: None,
             acme: AcmeConfig::default(),
             backups: BackupConfig::default(),
+            update: UpdateConfig::default(),
+            path: "/etc/facade/server.toml".into(),
         }
     }
 }
@@ -117,16 +123,44 @@ impl Default for BackupConfig {
     }
 }
 
+/// Where updates of facade itself come from: a GitHub release that CI replaces
+/// with each build of the main branch (`.github/workflows/build.yml`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// `owner/name` on GitHub. A fork publishing its own builds goes here.
+    pub repository: String,
+    /// The release tag holding the builds.
+    pub release: String,
+    /// Where the release's files are downloaded from instead of GitHub (a
+    /// mirror): `<url>/manifest.json` and the tarballs next to it.
+    pub url: Option<String>,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            repository: "Sigma-studios/facade".into(),
+            release: "edge".into(),
+            url: None,
+        }
+    }
+}
+
 impl ServerConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
             tracing::warn!("{} not found, using defaults", path.display());
-            return Ok(Self::default());
+            return Ok(Self {
+                path: path.to_path_buf(),
+                ..Self::default()
+            });
         }
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let config: Self =
+        let mut config: Self =
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        config.path = path.to_path_buf();
         facade_core::validate_name("local_node", &config.local_node)?;
         Ok(config)
     }
