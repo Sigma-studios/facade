@@ -186,9 +186,13 @@ impl Catalog<'_> {
             .iter()
             .map(|(k, v, _)| (k.clone(), v.clone()))
             .collect();
+        let mut build_env = Vec::new();
         for e in self.store.list_env(&app)? {
             let value = self.secrets.open_string(&e.sealed)?;
             vars.retain(|(k, _)| *k != e.key);
+            if e.build {
+                build_env.push(e.key.clone());
+            }
             vars.push((e.key, value));
         }
         let env = vars
@@ -199,7 +203,12 @@ impl Catalog<'_> {
                     .with_context(|| format!("{app}: variable {key}"))?;
                 Ok((key, value))
             })
-            .collect::<anyhow::Result<_>>()?;
+            .collect::<anyhow::Result<Vec<(String, String)>>>()?;
+        let build_digest = (!build_env.is_empty()).then(|| {
+            let values: Vec<_> = env.iter().filter(|(k, _)| build_env.contains(k)).collect();
+            self.secrets
+                .digest(&serde_json::to_vec(&values).expect("serializable"))
+        });
         let owner = owner.unwrap_or(store::ADMINS);
         let git_auth = match &spec.source {
             facade_core::Source::Git { repo, .. } => {
@@ -220,6 +229,8 @@ impl Catalog<'_> {
         Ok(Workload {
             spec,
             env,
+            build_env,
+            build_digest,
             revision,
             commit,
             git_auth,

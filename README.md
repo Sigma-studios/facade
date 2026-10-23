@@ -279,7 +279,7 @@ template in `lang::generated_dockerfile`.
 | `facade deployments <app> [--id ID]` | build history and logs |
 | `facade updates <app>` | commits on the app's branch since its deployed one |
 | `facade metrics <app>` / `facade node metrics <node>` | last hour of samples |
-| `facade env ls <app> [--reveal]` / `env set` / `env unset` | variables; sensitive unless `--public` |
+| `facade env ls <app> [--reveal]` / `env set` / `env unset` | variables; sensitive unless `--public`, handed to builds with `--build` |
 | `facade domain add <app> <domain>` | route a host name to an app |
 | `facade app update <app> --memory 512 --cpus 1 --node eu-2 …` | change settings (moving nodes works) |
 | `facade app update <app> --command "./worker" --release "./migrate up"` | command, and what runs before each deploy |
@@ -397,6 +397,40 @@ Dockerfiles can fetch private dependencies without baking them into the image:
 dependencies. Host keys of GitHub, GitLab and Bitbucket are built in; other hosts are
 remembered on first use. In the web UI, a scan that is refused offers to create the
 deploy key on the spot. URLs with a password or token in them are refused.
+
+### Variables for builds
+
+Some values are needed while building, not only at runtime: a key compiled into a
+WebAssembly game, a token to download build inputs. Mark those variables with `--build`
+(or *Hand to builds too* in the web UI):
+
+```sh
+facade env set portfolio TURN_PASSWORD --build     # prompts; sensitive by default
+```
+
+The node building the app hands each one to `docker build` as a build secret named like
+the variable, the same way as the git credential: never in the image, its history or
+the build's command line. A Dockerfile reads it in the steps that need it:
+
+```dockerfile
+ARG FACADE_BUILD_VARS
+RUN --mount=type=secret,id=TURN_PASSWORD,env=TURN_PASSWORD cargo build --release
+# where `env=` is not supported (older Docker): mount it, then read /run/secrets/TURN_PASSWORD
+```
+
+BuildKit leaves secrets out of its layer cache, so a step would keep an old value.
+`FACADE_BUILD_VARS` is a build argument facade sets to a digest of the values: declared
+before the steps that read them, those steps (and only those) run again when a value
+changes. A Dockerfile that does not declare it is built without the layer cache
+whenever it has build variables. facade's generated Rust and trunk builds do all of this, so
+`env!` and `option_env!` see the variables. Static sites built on the node (from a
+Dockerfile, or with trunk) get them the same way.
+
+The flag stays until `--no-build`, whatever later `env set` calls change. An image is
+keyed by its build variables' values as well as its commit, so a new value is never
+served from an old build: changing one rebuilds the app at the commit it runs, as a
+deployment (`facade env set` prints which). Stack variables are not handed to builds;
+a service's own variables are.
 
 ### Databases, volumes and links
 
@@ -641,7 +675,7 @@ Every command accepts `--json`. Instead of `facade login`, set `FACADE_SERVER`,
 ### Export / restore
 
 `facade export` writes every node, app and stack as TOML. Variables marked sensitive appear
-as `{ sensitive = true }` without their value. `facade apply` on a fresh server
+as `{ sensitive = true }` without their value; build variables carry `build = true`. `facade apply` on a fresh server
 recreates everything, prints join tokens for the nodes it had to create and lists the
 secrets still to set. Applying is idempotent and never deletes anything.
 
@@ -649,8 +683,8 @@ secrets still to set. Applying is idempotent and never deletes anything.
 
 Servers and agents speak a versioned protocol; when it changes (it did with commit
 pinning and the build queue, then with stop settings, volume sizes and cgroup
-delegation), agents one version behind are updated by the server; older ones need
-the server's `facaded` installed by hand.
+delegation, then with build variables), agents one version behind are updated by
+the server; older ones need the server's `facaded` installed by hand.
 
 ## Not there yet
 

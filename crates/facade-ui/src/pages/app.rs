@@ -261,7 +261,8 @@ pub fn AppPage() -> impl IntoView {
                             on_deployed=move || app.reload()/>
                     }.into_any(),
                     "env" => view! {
-                        <EnvTab path=Signal::derive(move || format!("/api/apps/{}/env", name.get()))
+                        <EnvTab builds=true
+                            path=Signal::derive(move || format!("/api/apps/{}/env", name.get()))
                             saved=Signal::derive(move || if deployed() {
                                 "Saved. The app restarts with the new values.".to_string()
                             } else {
@@ -868,12 +869,25 @@ pub fn DeployStatus(status: DeploymentStatus) -> impl IntoView {
 // ---------------------------------------------------------------- environment
 
 /// Variables at `path` (an app's, or a stack's); `saved` says what saving does.
+/// `builds`: an app's, which can be handed to its builds.
 #[component]
 pub fn EnvTab(
     #[prop(into)] path: Signal<String>,
     #[prop(into)] saved: Signal<String>,
+    #[prop(optional)] builds: bool,
 ) -> impl IntoView {
     let reveal = RwSignal::new(false);
+    // An app's variables answer with the rebuilds the change started.
+    let send = move |path: String, patch: EnvPatch| async move {
+        if !builds {
+            return api::patch(&path, &patch).await;
+        }
+        let rebuilding: Vec<DeploymentView> = api::patch_json(&path, &patch).await?;
+        if !rebuilding.is_empty() {
+            toasts().ok("Rebuilding for the new build variables: see Deployments");
+        }
+        Ok(())
+    };
     let vars = polled(None, move || {
         let (path, reveal) = (path.get(), reveal.get());
         async move { api::get::<Vec<EnvView>>(&format!("{path}?reveal={reveal}")).await }
@@ -885,18 +899,21 @@ pub fn EnvTab(
     let key = RwSignal::new(String::new());
     let value = RwSignal::new(String::new());
     let sensitive = RwSignal::new(true);
+    let build = RwSignal::new(false);
     let open_editor = move |var: Option<EnvView>| {
         match var {
             Some(v) => {
                 key.set(v.key);
                 value.set(v.value.unwrap_or_default());
                 sensitive.set(v.sensitive);
+                build.set(v.build);
                 editing_existing.set(true);
             }
             None => {
                 key.set(String::new());
                 value.set(String::new());
                 sensitive.set(true);
+                build.set(false);
                 editing_existing.set(false);
             }
         }
@@ -911,20 +928,17 @@ pub fn EnvTab(
                 SetEnv {
                     value: value.get_untracked(),
                     sensitive: sensitive.get_untracked(),
+                    build: builds.then(|| build.get_untracked()),
                 },
             )]
             .into(),
             unset: vec![],
         };
         let path = path.get_untracked();
-        run(
-            saved_message(),
-            async move { api::patch(&path, &patch).await },
-            move || {
-                editor_open.set(false);
-                vars.reload();
-            },
-        );
+        run(saved_message(), send(path, patch), move || {
+            editor_open.set(false);
+            vars.reload();
+        });
     };
     let remove = move |k: String| {
         let path = path.get_untracked();
@@ -932,11 +946,9 @@ pub fn EnvTab(
             set: Default::default(),
             unset: vec![k.clone()],
         };
-        run(
-            format!("{k} removed"),
-            async move { api::patch(&path, &patch).await },
-            move || vars.reload(),
-        );
+        run(format!("{k} removed"), send(path, patch), move || {
+            vars.reload()
+        });
     };
 
     // Bulk import from .env text.
@@ -964,6 +976,7 @@ pub fn EnvTab(
                     SetEnv {
                         value: v.to_string(),
                         sensitive: import_sensitive.get_untracked(),
+                        build: None,
                     },
                 );
             }
@@ -975,7 +988,7 @@ pub fn EnvTab(
         let path = path.get_untracked();
         run(
             format!("{count} variables saved"),
-            async move { api::patch(&path, &patch).await },
+            send(path, patch),
             move || {
                 import_open.set(false);
                 import_text.set(String::new());
@@ -999,10 +1012,14 @@ pub fn EnvTab(
                 fallback=|| view! { <div class="empty"><p>"No variables yet."</p></div> }>
                 <div class="table-wrap">
                     <table class="table env-table">
-                        <thead><tr><th>"Name"</th><th>"Value"</th><th>"Sensitive"</th><th></th></tr></thead>
+                        <thead><tr>
+                            <th>"Name"</th><th>"Value"</th><th>"Sensitive"</th>
+                            {builds.then(|| view! { <th>"Build"</th> })}
+                            <th></th>
+                        </tr></thead>
                         <tbody>
                             <For each=move || vars.data.get().unwrap_or_default()
-                                key=|v| (v.key.clone(), v.value.clone(), v.sensitive)
+                                key=|v| (v.key.clone(), v.value.clone(), v.sensitive, v.build)
                                 let:var>
                                 {
                                     let edit_var = var.clone();
@@ -1017,6 +1034,7 @@ pub fn EnvTab(
                                                 }}
                                             </td>
                                             <td>{if var.sensitive { "yes" } else { "no" }}</td>
+                                            {builds.then(|| view! { <td>{if var.build { "yes" } else { "no" }}</td> })}
                                             <td class="row-actions">
                                                 <button class="link-button" on:click=move |_| open_editor(Some(edit_var.clone()))>"Edit"</button>
                                                 <button class="link-button danger" on:click=move |_| remove(key_for_remove.clone())>"Remove"</button>
@@ -1052,6 +1070,12 @@ pub fn EnvTab(
                     <input type="checkbox" bind:checked=sensitive/>
                     "Sensitive (hidden, encrypted, not exported)"
                 </label>
+                {builds.then(|| view! {
+                    <label class="check">
+                        <input type="checkbox" bind:checked=build/>
+                        "Hand to builds too (a build secret named like the variable)"
+                    </label>
+                })}
                 <div class="form-actions">
                     <button type="button" class="button" on:click=move |_| editor_open.set(false)>"Cancel"</button>
                     <button type="submit" class="button button-primary">"Save"</button>

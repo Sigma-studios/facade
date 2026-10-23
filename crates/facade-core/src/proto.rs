@@ -17,7 +17,9 @@ use crate::spec::AppSpec;
 
 /// 4: workloads carry stop settings, a process limit, cgroup delegation and volume
 /// sizes, and agents run commands in containers (backup hooks).
-pub const PROTOCOL_VERSION: u32 = 4;
+/// 5: workloads name the variables their builds get (`build_env`), which an older
+/// agent would drop without a word.
+pub const PROTOCOL_VERSION: u32 = 5;
 /// The oldest agent protocol the server still talks to. Agents in between are
 /// sent the server's binary and update themselves.
 pub const MIN_AGENT_PROTOCOL: u32 = 3;
@@ -59,6 +61,13 @@ pub struct Workload {
     pub spec: AppSpec,
     /// Resolved environment, secrets included. Only ever sent over the pinned TLS link.
     pub env: Vec<(String, String)>,
+    /// The variables of `env` its builds get too, as BuildKit secrets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_env: Vec<String>,
+    /// Stands for those variables' values (a keyed hash, as image tags and build
+    /// arguments show it): built images are keyed by it, so a new value rebuilds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_digest: Option<String>,
     /// Bumped by every explicit deploy; a new revision recreates the container.
     pub revision: u64,
     /// The commit git sources are built from, resolved when the app was deployed.
@@ -104,6 +113,21 @@ pub struct RegistryLogin {
 impl std::fmt::Debug for RegistryLogin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "RegistryLogin({} as {})", self.host, self.username)
+    }
+}
+
+impl Workload {
+    /// `(key, value)` of each variable its builds get, as resolved in `env`.
+    pub fn build_vars(&self) -> Vec<(&str, &str)> {
+        self.build_env
+            .iter()
+            .filter_map(|key| {
+                self.env
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+            })
+            .collect()
     }
 }
 

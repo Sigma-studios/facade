@@ -44,8 +44,9 @@ pub fn detect_all(root: &Path) -> Vec<Candidate> {
     detectors().iter().flat_map(|d| d.detect(root)).collect()
 }
 
-/// The Dockerfile facade writes for builds that do not bring one.
-pub fn generated_dockerfile(app: &str, build: &Build) -> Option<String> {
+/// The Dockerfile facade writes for builds that do not bring one. `build_env`
+/// names the variables the build is handed.
+pub fn generated_dockerfile(app: &str, build: &Build, build_env: &[String]) -> Option<String> {
     match build {
         Build::Rust {
             package,
@@ -58,11 +59,42 @@ pub fn generated_dockerfile(app: &str, build: &Build) -> Option<String> {
             bin,
             features,
             *no_default_features,
+            build_env,
         )),
         Build::Python { version, entry } => python::dockerfile(version.as_deref(), entry).ok(),
         // Static sites build in `converge_static`; trunk's is `trunk::dockerfile`.
         Build::Dockerfile { .. } | Build::Static { .. } | Build::Trunk { .. } => None,
     }
+}
+
+/// What a generated Dockerfile needs for the variables its build gets: they are
+/// mounted as files and read into the environment of the build command only, so
+/// `env!`/`option_env!` see them (`env=` on the mount needs Dockerfile syntax 1.10,
+/// which older Docker installs do not bundle). The argument makes a new value run
+/// the step again, which BuildKit's cache would not.
+pub struct BuildVarLines {
+    /// `ARG FACADE_BUILD_VARS`, before the step.
+    pub arg: String,
+    /// Mount lines for the step's `RUN`.
+    pub secrets: String,
+    /// `export KEY=… && ` for each, before the command.
+    pub exports: String,
+}
+
+pub fn build_var_lines(build_env: &[String]) -> BuildVarLines {
+    let mut lines = BuildVarLines {
+        arg: String::new(),
+        secrets: String::new(),
+        exports: String::new(),
+    };
+    if !build_env.is_empty() {
+        lines.arg = format!("ARG {}\n", crate::agent::build::BUILD_VARS_ARG);
+    }
+    for key in build_env {
+        lines.secrets += &format!("    --mount=type=secret,id={key} \\\n");
+        lines.exports += &format!("export {key}=\"$(cat /run/secrets/{key})\" && ");
+    }
+    lines
 }
 
 // ---------------------------------------------------------------- shared hints

@@ -14,6 +14,7 @@
 //! [app.env]
 //! SIGNALLING_ADDR = "0.0.0.0:9090"     # plain string: a public variable
 //! TURN_PASSWORD = { sensitive = true } # value withheld; set it with `facade env set`
+//! GAME_KEY = { sensitive = true, build = true } # also handed to builds as a secret
 //! ```
 
 use std::collections::BTreeMap;
@@ -68,7 +69,14 @@ pub enum EnvEntry {
         value: Option<String>,
         #[serde(default = "yes")]
         sensitive: bool,
+        /// Handed to builds as a secret too.
+        #[serde(default, skip_serializing_if = "is_false")]
+        build: bool,
     },
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 fn yes() -> bool {
@@ -80,8 +88,15 @@ impl EnvEntry {
     pub fn resolve(&self) -> (Option<&str>, bool) {
         match self {
             EnvEntry::Plain(v) => (Some(v), false),
-            EnvEntry::Detailed { value, sensitive } => (value.as_deref(), *sensitive),
+            EnvEntry::Detailed {
+                value, sensitive, ..
+            } => (value.as_deref(), *sensitive),
         }
+    }
+
+    /// Whether builds get it.
+    pub fn build(&self) -> bool {
+        matches!(self, EnvEntry::Detailed { build: true, .. })
     }
 }
 
@@ -135,6 +150,7 @@ source = { type = "git", repo = "https://github.com/me/repo", build = { kind = "
 [app.env]
 SIGNALLING_ADDR = "0.0.0.0:9090"
 TURN_PASSWORD = { sensitive = true }
+GAME_KEY = { sensitive = true, build = true }
 
 [[app]]
 name = "landing"
@@ -202,6 +218,8 @@ source = { type = "git", repo = "https://github.com/me/editor", build = { kind =
             manifest.apps[0].env["TURN_PASSWORD"].resolve(),
             (None, true)
         );
+        assert!(!manifest.apps[0].env["TURN_PASSWORD"].build());
+        assert!(manifest.apps[0].env["GAME_KEY"].build());
         let again = Manifest::parse(&manifest.to_toml()).unwrap();
         for (a, b) in again.apps.iter().zip(&manifest.apps) {
             assert_eq!(a.spec, b.spec);

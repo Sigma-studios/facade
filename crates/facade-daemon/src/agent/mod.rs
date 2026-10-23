@@ -1,7 +1,7 @@
 //! The agent: keeps one control connection to the server, converges Docker to the
 //! desired workloads, and dials data connections on request.
 
-mod build;
+pub(crate) mod build;
 mod cgroups;
 mod compress;
 mod maintenance;

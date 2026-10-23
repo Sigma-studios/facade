@@ -97,6 +97,9 @@ pub struct EnvView {
     /// `None` when the variable is sensitive and was not revealed.
     pub value: Option<String>,
     pub sensitive: bool,
+    /// Handed to the app's builds as a secret, as well as to its container.
+    #[serde(default)]
+    pub build: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +107,10 @@ pub struct SetEnv {
     pub value: String,
     #[serde(default = "default_sensitive")]
     pub sensitive: bool,
+    /// Hand it to builds too; `None` keeps the variable's current setting (off
+    /// for a new one), so changing a value never drops it from builds by accident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<bool>,
 }
 
 /// Several env changes applied with a single restart.

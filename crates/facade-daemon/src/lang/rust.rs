@@ -241,7 +241,13 @@ pub fn dockerfile(
     bin: &str,
     features: &[String],
     no_default_features: bool,
+    build_env: &[String],
 ) -> String {
+    let super::BuildVarLines {
+        arg,
+        secrets,
+        exports,
+    } = super::build_var_lines(build_env);
     let mut args = String::new();
     if let Some(package) = package {
         args += &format!(" -p {package}");
@@ -259,13 +265,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=facade-cargo-registry \
+{arg}RUN --mount=type=cache,target=/usr/local/cargo/registry,id=facade-cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=facade-cargo-git \
     --mount=type=cache,target=/src/target,id=facade-{app}-target \
     --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
     --mount=type=secret,id=known_hosts,target=/root/.ssh/known_hosts \
     --mount=type=ssh \
-    cargo build --release{args} && cp target/release/{bin} /facade-app
+{secrets}    {exports}cargo build --release{args} && cp target/release/{bin} /facade-app
 
 FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 tzdata && rm -rf /var/lib/apt/lists/*
@@ -278,6 +284,21 @@ CMD ["/usr/local/bin/{bin}"]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hands_build_variables_to_cargo() {
+        let plain = dockerfile("api", None, "api", &[], false, &[]);
+        assert!(!plain.contains("/run/secrets/"));
+        assert!(!crate::agent::build::declares_build_vars_arg(&plain));
+        assert!(plain.contains("    --mount=type=ssh \\\n    cargo build --release --bin api"));
+
+        let file = dockerfile("api", None, "api", &[], false, &["GAME_KEY".into()]);
+        assert!(crate::agent::build::declares_build_vars_arg(&file));
+        assert!(file.contains("    --mount=type=secret,id=GAME_KEY \\\n"));
+        assert!(file.contains(
+            "export GAME_KEY=\"$(cat /run/secrets/GAME_KEY)\" && cargo build --release --bin api"
+        ));
+    }
 
     fn write(root: &Path, path: &str, contents: &str) {
         let full = root.join(path);

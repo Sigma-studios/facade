@@ -533,7 +533,11 @@ pub fn plan(
             };
             let entry = match value {
                 Some(v) if !sensitive => EnvEntry::Plain(v),
-                value => EnvEntry::Detailed { value, sensitive },
+                value => EnvEntry::Detailed {
+                    value,
+                    sensitive,
+                    build: false,
+                },
             };
             env.insert(key, entry);
         };
@@ -1034,7 +1038,8 @@ volumes:
             db.env["POSTGRES_PASSWORD"],
             EnvEntry::Detailed {
                 value: Some("generated".into()),
-                sensitive: true
+                sensitive: true,
+                build: false,
             }
         );
 
@@ -1082,7 +1087,8 @@ volumes:
             api.env["DATABASE_URL"],
             EnvEntry::Detailed {
                 value: Some("postgres://postgres:generated@db:5432/shop".into()),
-                sensitive: true
+                sensitive: true,
+                build: false,
             }
         );
         assert!(matches!(

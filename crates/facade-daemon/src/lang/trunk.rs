@@ -82,7 +82,12 @@ impl Detector for Trunk {
 /// The Dockerfile building the app in `dir`: its last stage holds only the site,
 /// for `docker build --output`. The repository is the build context, so path
 /// dependencies and workspaces resolve; a `rust-toolchain.toml` is honoured.
-pub fn dockerfile(app: &str, dir: &str) -> String {
+pub fn dockerfile(app: &str, dir: &str, build_env: &[String]) -> String {
+    let super::BuildVarLines {
+        arg,
+        secrets,
+        exports,
+    } = super::build_var_lines(build_env);
     format!(
         r#"FROM docker.io/library/rust:1-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl pkg-config libssl-dev git openssh-client && rm -rf /var/lib/apt/lists/*
@@ -91,14 +96,14 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR=/facade-target
 WORKDIR /src
 COPY . .
 WORKDIR /src/{dir}
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=facade-cargo-registry \
+{arg}RUN --mount=type=cache,target=/usr/local/cargo/registry,id=facade-cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=facade-cargo-git \
     --mount=type=cache,target=/facade-target,id=facade-{app}-target \
     --mount=type=cache,target=/root/.cache/trunk,id=facade-trunk \
     --mount=type=secret,id=gitconfig,target=/root/.gitconfig \
     --mount=type=secret,id=known_hosts,target=/root/.ssh/known_hosts \
     --mount=type=ssh \
-    (rustup toolchain install 2>/dev/null || true) \
+{secrets}    {exports}(rustup toolchain install 2>/dev/null || true) \
     && rustup target add wasm32-unknown-unknown \
     && trunk build --release --dist /facade-site
 
@@ -116,6 +121,20 @@ mod tests {
         let full = root.join(path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
         std::fs::write(full, contents).unwrap();
+    }
+
+    #[test]
+    fn hands_build_variables_to_trunk() {
+        let plain = dockerfile("web", "app", &[]);
+        assert!(!plain.contains("/run/secrets/"));
+        assert!(!crate::agent::build::declares_build_vars_arg(&plain));
+
+        let file = dockerfile("web", "app", &["TURN_PASSWORD".into()]);
+        assert!(crate::agent::build::declares_build_vars_arg(&file));
+        assert!(file.contains("    --mount=type=secret,id=TURN_PASSWORD \\\n"));
+        assert!(file.contains(
+            "export TURN_PASSWORD=\"$(cat /run/secrets/TURN_PASSWORD)\" && (rustup toolchain install"
+        ));
     }
 
     #[test]

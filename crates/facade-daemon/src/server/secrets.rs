@@ -10,7 +10,7 @@ use rand::RngCore;
 
 const NONCE_LEN: usize = 12;
 
-pub struct SecretBox(ChaCha20Poly1305);
+pub struct SecretBox(ChaCha20Poly1305, [u8; 32]);
 
 impl SecretBox {
     pub fn load_or_create(path: &Path) -> anyhow::Result<Self> {
@@ -25,7 +25,9 @@ impl SecretBox {
         if key.len() != 32 {
             return Err(anyhow!("master key must be 32 bytes"));
         }
-        Ok(Self(ChaCha20Poly1305::new(Key::from_slice(&key))))
+        let mut raw_key = [0u8; 32];
+        raw_key.copy_from_slice(&key);
+        Ok(Self(ChaCha20Poly1305::new(Key::from_slice(&key)), raw_key))
     }
 
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
@@ -48,6 +50,16 @@ impl SecretBox {
         self.0
             .decrypt(Nonce::from_slice(nonce), ciphertext)
             .map_err(|_| anyhow!("cannot decrypt value (wrong master key?)"))
+    }
+
+    /// A short fingerprint of `data` that only this server can compute: safe to
+    /// show where a plain hash of a short secret could be guessed back.
+    pub fn digest(&self, data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.1);
+        hasher.update(data);
+        hex::encode(&hasher.finalize()[..8])
     }
 
     pub fn open_string(&self, sealed: &[u8]) -> anyhow::Result<String> {

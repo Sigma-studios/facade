@@ -292,6 +292,8 @@ pub struct EnvRow {
     pub key: String,
     pub sealed: Vec<u8>,
     pub sensitive: bool,
+    /// Handed to builds as a secret too.
+    pub build: bool,
 }
 
 pub struct CertRow {
@@ -358,6 +360,7 @@ impl Store {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         migrate_from_branch_logins(&conn)?;
+        add_column(&conn, "env", "build", "INTEGER NOT NULL DEFAULT 0")?;
         // A server restart loses track of builds in progress.
         conn.execute(
             "UPDATE deployments SET status = 'failed', error = 'the server restarted during the deployment',
@@ -883,14 +886,15 @@ impl Store {
 
     pub fn list_env(&self, app: &str) -> anyhow::Result<Vec<EnvRow>> {
         let conn = self.0.lock();
-        let mut stmt =
-            conn.prepare("SELECT key, value, sensitive FROM env WHERE app = ?1 ORDER BY key")?;
+        let mut stmt = conn
+            .prepare("SELECT key, value, sensitive, build FROM env WHERE app = ?1 ORDER BY key")?;
         let rows = stmt
             .query_map([app], |r| {
                 Ok(EnvRow {
                     key: r.get(0)?,
                     sealed: r.get(1)?,
                     sensitive: r.get(2)?,
+                    build: r.get(3)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -916,6 +920,14 @@ impl Store {
         self.0.lock().execute(
             "UPDATE env SET sensitive = ?3 WHERE app = ?1 AND key = ?2",
             params![app, key, sensitive],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_env_build(&self, app: &str, key: &str, build: bool) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE env SET build = ?3 WHERE app = ?1 AND key = ?2",
+            params![app, key, build],
         )?;
         Ok(())
     }
@@ -1154,6 +1166,7 @@ impl Store {
                     key: r.get(0)?,
                     sealed: r.get(1)?,
                     sensitive: r.get(2)?,
+                    build: false,
                 })
             })?
             .collect::<Result<_, _>>()?;

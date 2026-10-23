@@ -1086,7 +1086,8 @@ enum EnvCommand {
         reveal: bool,
     },
     /// Set variables (`KEY=VALUE`, or `KEY` to read the value from stdin). Values are
-    /// sensitive unless --public. Restarts the app once.
+    /// sensitive unless --public. Restarts the app once, or rebuilds it when its
+    /// builds get a changed variable.
     Set {
         app: String,
         #[arg(required = true)]
@@ -1094,6 +1095,14 @@ enum EnvCommand {
         /// Mark as non-sensitive: shown in listings and included in exports.
         #[arg(long)]
         public: bool,
+        /// Hand them to the app's builds too, as BuildKit secrets named like the
+        /// variable (`RUN --mount=type=secret,id=KEY,env=KEY` in a Dockerfile; Rust
+        /// builds facade generates see them in `env!`). Kept until --no-build.
+        #[arg(long, conflicts_with = "no_build")]
+        build: bool,
+        /// Stop handing them to builds.
+        #[arg(long)]
+        no_build: bool,
     },
     Unset {
         app: String,
@@ -2783,7 +2792,16 @@ async fn service(api: &Api, cmd: ServiceCommand, json: bool) -> anyhow::Result<(
             if !db_env.is_empty() {
                 let set = db_env
                     .into_iter()
-                    .map(|(k, value, sensitive)| (k, SetEnv { value, sensitive }))
+                    .map(|(k, value, sensitive)| {
+                        (
+                            k,
+                            SetEnv {
+                                value,
+                                sensitive,
+                                build: None,
+                            },
+                        )
+                    })
                     .collect();
                 api.send(
                     api.request(Method::PATCH, &format!("/api/apps/{stack}.{service}/env"))
@@ -3583,17 +3601,32 @@ async fn env(api: &Api, cmd: EnvCommand, json: bool) -> anyhow::Result<()> {
                 return print_json(&vars);
             }
             table(
-                &["KEY", "VALUE", "SENSITIVE"],
+                &["KEY", "VALUE", "SENSITIVE", "BUILD"],
                 vars.iter().map(|v| {
                     vec![
                         v.key.clone(),
                         v.value.clone().unwrap_or_else(|| "••••••".into()),
                         if v.sensitive { "yes" } else { "no" }.into(),
+                        if v.build { "yes" } else { "no" }.into(),
                     ]
                 }),
             );
         }
-        EnvCommand::Set { app, vars, public } => {
+        EnvCommand::Set {
+            app,
+            vars,
+            public,
+            build,
+            no_build,
+        } => {
+            let path = env_path(api, &app).await;
+            let stack = path.starts_with("/api/stacks/");
+            if stack && (build || no_build) {
+                bail!(
+                    "stack variables are not handed to builds; set --build on a service's own variable (facade env set {app}.<service> …)"
+                );
+            }
+            let build = (build || no_build).then_some(build);
             let mut set = BTreeMap::new();
             for var in vars {
                 let (key, value) = match var.split_once('=') {
@@ -3614,34 +3647,50 @@ async fn env(api: &Api, cmd: EnvCommand, json: bool) -> anyhow::Result<()> {
                     SetEnv {
                         value,
                         sensitive: !public,
+                        build,
                     },
                 );
             }
             let keys: Vec<String> = set.keys().cloned().collect();
-            let path = env_path(api, &app).await;
-            api.send(
-                api.request(Method::PATCH, &path)
-                    .json(&EnvPatch { set, unset: vec![] }),
-            )
-            .await?;
+            let resp = api
+                .send(
+                    api.request(Method::PATCH, &path)
+                        .json(&EnvPatch { set, unset: vec![] }),
+                )
+                .await?;
             eprintln!("set {} on {app}", keys.join(", "));
-            if path.starts_with("/api/stacks/") {
+            if stack {
                 eprintln!("stack variables apply from its next deploy: facade deploy {app}");
+            } else {
+                print_rebuilds(resp).await;
             }
         }
         EnvCommand::Unset { app, keys } => {
-            api.send(
-                api.request(Method::PATCH, &env_path(api, &app).await)
-                    .json(&EnvPatch {
-                        set: BTreeMap::new(),
-                        unset: keys.clone(),
-                    }),
-            )
-            .await?;
+            let path = env_path(api, &app).await;
+            let resp = api
+                .send(api.request(Method::PATCH, &path).json(&EnvPatch {
+                    set: BTreeMap::new(),
+                    unset: keys.clone(),
+                }))
+                .await?;
             eprintln!("unset {} on {app}", keys.join(", "));
+            if !path.starts_with("/api/stacks/") {
+                print_rebuilds(resp).await;
+            }
         }
     }
     Ok(())
+}
+
+/// The rebuilds an env change started, from the answer to its `PATCH`.
+async fn print_rebuilds(resp: reqwest::Response) {
+    let rebuilding: Vec<DeploymentView> = resp.json().await.unwrap_or_default();
+    for d in rebuilding {
+        eprintln!(
+            "rebuilding {} for its build variables: facade deployments {} --id {}",
+            d.app, d.app, d.id
+        );
+    }
 }
 
 fn print_nodes(nodes: &[NodeView]) {
