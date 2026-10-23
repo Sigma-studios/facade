@@ -163,9 +163,49 @@ pub async fn docker_build(
         );
     }
     log.line(format!("building {tag}"));
+    let extra = [
+        "-t".to_string(),
+        tag.to_string(),
+        "--label".into(),
+        format!("facade.app={app}"),
+    ];
+    let cmd = build_command(dockerfile, context, options, &extra);
+    run_logged(cmd, log).await.context("docker build failed")
+}
+
+/// Builds `dockerfile` and writes the files of its last stage into `dest` (a
+/// static site's build), without making an image.
+pub async fn docker_build_files(
+    dockerfile: &Path,
+    context: &Path,
+    dest: &Path,
+    options: &BuildOptions,
+    log: &DeployLog,
+) -> anyhow::Result<()> {
+    if !dockerfile.is_file() {
+        bail!(
+            "no Dockerfile at {} (set build.dockerfile, or serve the repository as-is)",
+            dockerfile.display()
+        );
+    }
+    log.line("building the site");
+    let extra = [
+        "--output".to_string(),
+        format!("type=local,dest={}", dest.display()),
+    ];
+    let cmd = build_command(dockerfile, context, options, &extra);
+    run_logged(cmd, log).await.context("docker build failed")
+}
+
+fn build_command(
+    dockerfile: &Path,
+    context: &Path,
+    options: &BuildOptions,
+    extra: &[String],
+) -> Command {
     let mut cmd = Command::new("docker");
-    cmd.args(["build", "--progress=plain", "--pull", "-t", tag])
-        .args(["--label", &format!("facade.app={app}")])
+    cmd.args(["build", "--progress=plain", "--pull"])
+        .args(extra)
         .args(&options.args)
         .arg("-f")
         .arg(dockerfile)
@@ -174,7 +214,7 @@ pub async fn docker_build(
     if let Some(dir) = &options.docker_config {
         cmd.env("DOCKER_CONFIG", dir);
     }
-    run_logged(cmd, log).await.context("docker build failed")
+    cmd
 }
 
 /// Runs `cmd`, forwarding stdout and stderr line by line to the deploy log.

@@ -34,6 +34,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use super::DeployLog;
 use super::build;
 use super::cgroups;
+use super::compress;
 use super::sized::SizedVolume;
 use super::volumes;
 use crate::gitauth::Access;
@@ -107,10 +108,7 @@ pub fn run_key_matches(w: &Workload, image: &str, key: &str) -> bool {
 pub fn planned_image(w: &Workload) -> Option<String> {
     let key = match &w.spec.source {
         Source::Image { image } => return Some(facade_core::image_with_tag(image)),
-        Source::Git {
-            build: Build::Static { .. },
-            ..
-        } => return None,
+        Source::Git { build, .. } if build.is_static() => return None,
         Source::Executable { .. } => short_hash(&w.spec.source),
         Source::Git { .. } => match (&w.build_key, &w.commit) {
             (Some(content), _) => short_hash(&(&w.spec.source, content)),
@@ -149,6 +147,18 @@ async fn within_build_time<T>(
                 BUILD_TIMEOUT.as_secs() / 60
             )
         })?
+}
+
+/// Where a built static site's Dockerfile comes from.
+enum Recipe {
+    /// A path in the repository.
+    Repository(String),
+    /// Written by facade (`lang`).
+    Generated(String),
+}
+
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1e6)
 }
 
 /// A working directory removed when dropped, even when the build is cancelled.
@@ -253,7 +263,7 @@ impl Runtime {
                 log.begin();
                 return Ok(AppState::Stopped);
             }
-            return self.converge_static(w, log).await;
+            return self.converge_static(w, log, rebuild).await;
         }
         if !w.spec.enabled {
             log.begin();
@@ -473,7 +483,9 @@ impl Runtime {
                             dockerfile,
                             context,
                         } => (workdir.0.join(dockerfile), workdir.0.join(context)),
-                        Build::Static { .. } => unreachable!("static sites have no image"),
+                        Build::Static { .. } | Build::Trunk { .. } => {
+                            unreachable!("static sites have no image")
+                        }
                         generated => {
                             let path = workdir.0.join(".facade.Dockerfile");
                             let contents = lang::generated_dockerfile(&w.spec.name, generated)
@@ -1669,9 +1681,37 @@ impl Runtime {
         Ok(SocketAddr::from(([127, 0, 0, 1], host_port)))
     }
 
-    async fn converge_static(&self, w: &Workload, log: &DeployLog) -> anyhow::Result<AppState> {
-        let Source::Git { repo, branch, .. } = &w.spec.source else {
+    async fn converge_static(
+        &self,
+        w: &Workload,
+        log: &DeployLog,
+        rebuild: bool,
+    ) -> anyhow::Result<AppState> {
+        let Source::Git {
+            repo,
+            branch,
+            build,
+        } = &w.spec.source
+        else {
             bail!("static sites come from git");
+        };
+        // How the files are made: none (the repository's own), the repository's
+        // Dockerfile, or one facade writes.
+        let recipe = match build {
+            Build::Static {
+                dockerfile: Some(dockerfile),
+                context,
+                ..
+            } => Some((
+                Recipe::Repository(dockerfile.clone()),
+                context.clone().unwrap_or_else(|| ".".into()),
+            )),
+            Build::Static { .. } => None,
+            Build::Trunk { dir } => Some((
+                Recipe::Generated(lang::trunk::dockerfile(&w.spec.name, dir)),
+                ".".into(),
+            )),
+            _ => bail!("{} is not a static site", w.spec.name),
         };
         let dir = self.static_dir(&w.spec.name);
         let key = match &w.commit {
@@ -1679,7 +1719,9 @@ impl Runtime {
             None => short_hash(&(&w.spec.source, w.revision)),
         };
         let marker = dir.join(".facade-key");
-        if tokio::fs::read_to_string(&marker).await.ok().as_deref() == Some(key.as_str()) {
+        if !rebuild
+            && tokio::fs::read_to_string(&marker).await.ok().as_deref() == Some(key.as_str())
+        {
             log.begin();
             return Ok(AppState::Running);
         }
@@ -1691,23 +1733,66 @@ impl Runtime {
                 .join("static")
                 .join(format!(".{}-{key}", w.spec.name)),
         );
+        // A built site is checked out apart: only its build's output is served.
+        let builds = self.0.dir.join("builds");
+        let checkout = Scratch::new(builds.join(format!("{}-{key}", w.spec.name)));
+        let private = Scratch::new(builds.join(format!(".{}-{key}", w.spec.name)));
         within_build_time(async {
             let _ = tokio::fs::remove_dir_all(&staging.0).await;
+            let _ = tokio::fs::remove_dir_all(&checkout.0).await;
+            let source = if recipe.is_some() {
+                &checkout.0
+            } else {
+                &staging.0
+            };
             let access = Access::new(repo, w.git_auth.as_ref(), &self.git_dir())?;
-            let (sha, title) = build::git_checkout(
-                &access,
-                branch.as_deref(),
-                w.commit.as_deref(),
-                &staging.0,
-                log,
-            )
-            .await?;
+            let (sha, title) =
+                build::git_checkout(&access, branch.as_deref(), w.commit.as_deref(), source, log)
+                    .await?;
             log.commit(&sha, &title);
+            if let Some((recipe, context)) = &recipe {
+                let dockerfile = match recipe {
+                    Recipe::Repository(path) => checkout.0.join(path),
+                    Recipe::Generated(contents) => {
+                        let path = checkout.0.join(".facade.Dockerfile");
+                        tokio::fs::write(&path, contents).await?;
+                        path
+                    }
+                };
+                crate::tls::create_private_dir(&private.0)?;
+                let options = build::BuildOptions::new(
+                    w.git_auth.as_ref(),
+                    &w.registries,
+                    &private.0,
+                    rebuild,
+                )?;
+                build::docker_build_files(
+                    &dockerfile,
+                    &checkout.0.join(context),
+                    &staging.0,
+                    &options,
+                    log,
+                )
+                .await?;
+            } else {
+                let _ = tokio::fs::remove_dir_all(staging.0.join(".git")).await;
+            }
+            let root = staging.0.clone();
+            let summary = tokio::task::spawn_blocking(move || compress::precompress(&root))
+                .await?
+                .context("compressing the site")?;
+            if summary.files > 0 {
+                log.line(format!(
+                    "compressed {} files: {} -> {} with brotli",
+                    summary.files,
+                    megabytes(summary.bytes),
+                    megabytes(summary.brotli_bytes)
+                ));
+            }
             Ok(())
         })
         .await?;
         log.build_done();
-        let _ = tokio::fs::remove_dir_all(staging.0.join(".git")).await;
         tokio::fs::write(staging.0.join(".facade-key"), &key).await?;
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::rename(&staging.0, &dir).await?;
@@ -1716,14 +1801,18 @@ impl Runtime {
     }
 
     pub fn static_root(&self, w: &Workload) -> anyhow::Result<PathBuf> {
-        let Source::Git {
-            build: Build::Static { dir },
-            ..
-        } = &w.spec.source
-        else {
-            bail!("{} is not a static site", w.spec.name);
+        let root = match &w.spec.source {
+            Source::Git {
+                build: Build::Static { dir, .. },
+                ..
+            } => self.static_dir(&w.spec.name).join(dir),
+            // trunk's output is the site itself.
+            Source::Git {
+                build: Build::Trunk { .. },
+                ..
+            } => self.static_dir(&w.spec.name),
+            _ => bail!("{} is not a static site", w.spec.name),
         };
-        let root = self.static_dir(&w.spec.name).join(dir);
         if !root.is_dir() {
             bail!("{} has not been fetched yet", w.spec.name);
         }

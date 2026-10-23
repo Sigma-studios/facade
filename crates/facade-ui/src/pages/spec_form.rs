@@ -33,6 +33,10 @@ pub struct SpecForm {
     python_version: RwSignal<String>,
     python_entry: RwSignal<String>,
     static_dir: RwSignal<String>,
+    trunk_dir: RwSignal<String>,
+    /// Optional: the Dockerfile that builds a static site, and its context.
+    static_dockerfile: RwSignal<String>,
+    static_context: RwSignal<String>,
     http_port: RwSignal<String>,
     domains: RwSignal<Vec<DomainRow>>,
     redirects: RwSignal<Vec<DomainRow>>,
@@ -96,6 +100,9 @@ impl SpecForm {
             python_version: s(""),
             python_entry: s(""),
             static_dir: s("."),
+            trunk_dir: s("."),
+            static_dockerfile: s(""),
+            static_context: s(""),
             http_port: s(""),
             domains: RwSignal::new(vec![]),
             redirects: RwSignal::new(vec![]),
@@ -185,9 +192,20 @@ impl SpecForm {
                         form.python_version.set(version.clone().unwrap_or_default());
                         form.python_entry.set(entry.clone());
                     }
-                    Build::Static { dir } => {
+                    Build::Static {
+                        dir,
+                        dockerfile,
+                        context,
+                    } => {
                         form.build.set("static");
                         form.static_dir.set(dir.clone());
+                        form.static_dockerfile
+                            .set(dockerfile.clone().unwrap_or_default());
+                        form.static_context.set(context.clone().unwrap_or_default());
+                    }
+                    Build::Trunk { dir } => {
+                        form.build.set("trunk");
+                        form.trunk_dir.set(dir.clone());
                     }
                 }
             }
@@ -286,9 +304,19 @@ impl SpecForm {
                 self.python_version.set(version.unwrap_or_default());
                 self.python_entry.set(entry);
             }
-            Build::Static { dir } => {
+            Build::Static {
+                dir,
+                dockerfile,
+                context,
+            } => {
                 self.build.set("static");
                 self.static_dir.set(dir);
+                self.static_dockerfile.set(dockerfile.unwrap_or_default());
+                self.static_context.set(context.unwrap_or_default());
+            }
+            Build::Trunk { dir } => {
+                self.build.set("trunk");
+                self.trunk_dir.set(dir);
             }
         }
         if let Some(port) = candidate.http_port
@@ -360,13 +388,20 @@ impl SpecForm {
                     .unwrap_or_else(|| DEFAULT_PYTHON.into()),
                 self.python_entry.get()
             ),
-            "static" => format!("static files from {}", self.static_dir.get()),
+            "trunk" => format!("Rust web app in {}, built with trunk", self.trunk_dir.get()),
+            "static" => match Some(self.static_dockerfile.get()).filter(|d| !d.trim().is_empty()) {
+                Some(dockerfile) => format!(
+                    "static files from {}, built by {dockerfile}",
+                    self.static_dir.get()
+                ),
+                None => format!("static files from {}", self.static_dir.get()),
+            },
             _ => format!("{} in {}", self.dockerfile.get(), self.context.get()),
         }
     }
 
     fn is_static(&self) -> bool {
-        self.source.get() == "git" && self.build.get() == "static"
+        self.source.get() == "git" && matches!(self.build.get(), "static" | "trunk")
     }
 
     pub fn to_spec(self) -> Result<AppSpec, String> {
@@ -408,8 +443,13 @@ impl SpecForm {
                     version: optional(self.python_version),
                     entry: text(self.python_entry),
                 },
+                "trunk" => Build::Trunk {
+                    dir: optional(self.trunk_dir).unwrap_or_else(|| ".".into()),
+                },
                 "static" => Build::Static {
                     dir: optional(self.static_dir).unwrap_or_else(|| ".".into()),
+                    dockerfile: optional(self.static_dockerfile),
+                    context: optional(self.static_context),
                 },
                 _ => Build::Dockerfile {
                     dockerfile: optional(self.dockerfile).unwrap_or_else(|| "Dockerfile".into()),
@@ -422,13 +462,7 @@ impl SpecForm {
                 build,
             }
         };
-        let is_static = matches!(
-            &source,
-            Source::Git {
-                build: Build::Static { .. },
-                ..
-            }
-        );
+        let is_static = matches!(&source, Source::Git { build, .. } if build.is_static());
         let http_port = match optional(self.http_port) {
             Some(p) if !is_static => Some(
                 p.parse::<u16>()
@@ -978,7 +1012,7 @@ pub fn SpecFields(
                     </summary>
                     <div class="build-details-body">
                         <Segmented value=f.build label="Build"
-                            options=&[("dockerfile", "Dockerfile"), ("rust", "Rust binary"), ("python", "Python"), ("static", "Static site")]/>
+                            options=&[("dockerfile", "Dockerfile"), ("rust", "Rust binary"), ("python", "Python"), ("trunk", "Rust web app (trunk)"), ("static", "Static site")]/>
                         <Show when=move || f.build.get() == "dockerfile">
                             <div class="form-row">
                                 <label class="field">
@@ -1027,12 +1061,30 @@ pub fn SpecFields(
                             </div>
                             <p class="muted small">"Dependencies come from requirements.txt and/or pyproject.toml."</p>
                         </Show>
+                        <Show when=move || f.build.get() == "trunk">
+                            <label class="field">
+                                <span>"App directory"</span>
+                                <input type="text" bind:value=f.trunk_dir placeholder="apps/web"/>
+                                <small>"Where the index.html with <link data-trunk rel=\"rust\"> is. trunk builds it to WebAssembly; the output is served as a static site."</small>
+                            </label>
+                        </Show>
                         <Show when=move || f.build.get() == "static">
                             <label class="field">
                                 <span>"Directory to serve"</span>
                                 <input type="text" bind:value=f.static_dir placeholder="public"/>
                                 <small>"Served as-is; index.html and 404.html are used when present."</small>
                             </label>
+                            <div class="form-row">
+                                <label class="field grow">
+                                    <span>"Build with a Dockerfile"</span>
+                                    <input type="text" bind:value=f.static_dockerfile placeholder="(none: serve the repository's files)"/>
+                                    <small>"Its last stage's files are served (usually FROM scratch + COPY --from=build); the directory is then a path inside them."</small>
+                                </label>
+                                <label class="field">
+                                    <span>"Build context"</span>
+                                    <input type="text" bind:value=f.static_context placeholder="."/>
+                                </label>
+                            </div>
                         </Show>
                     </div>
                 </details>

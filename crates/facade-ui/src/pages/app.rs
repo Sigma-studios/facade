@@ -331,6 +331,7 @@ fn subtitle(app: &AppView) -> String {
                 Build::Rust { .. } => "Rust",
                 Build::Python { .. } => "Python",
                 Build::Static { .. } => "static site",
+                Build::Trunk { .. } => "Rust web app (trunk)",
             };
             let commit = app
                 .commit

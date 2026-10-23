@@ -116,6 +116,7 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::{Build, Source};
 
     #[test]
     fn parses_and_round_trips() {
@@ -153,9 +154,46 @@ source = { type = "git", repo = "git@github.com:me/shop.git", build = { kind = "
 
 [app.env]
 DATABASE_URL = "${{db.DATABASE_URL}}"
+
+[[app]]
+name = "paint"
+node = "main"
+source = { type = "git", repo = "https://github.com/me/paint", build = { kind = "trunk", dir = "apps/web" } }
+
+[[app]]
+name = "editor"
+node = "main"
+domains = ["editor.example.com"]
+source = { type = "git", repo = "https://github.com/me/editor", build = { kind = "static", dockerfile = "web/Dockerfile" } }
 "#;
         let manifest = Manifest::parse(src).unwrap();
-        assert_eq!(manifest.apps.len(), 3);
+        assert_eq!(manifest.apps.len(), 5);
+        assert!(manifest.apps[3].spec.is_static());
+        let editor = &manifest.apps[4].spec;
+        assert!(editor.is_static());
+        assert_eq!(
+            editor.source,
+            Source::Git {
+                repo: "https://github.com/me/editor".into(),
+                branch: None,
+                build: Build::Static {
+                    dir: ".".into(),
+                    dockerfile: Some("web/Dockerfile".into()),
+                    context: None,
+                },
+            }
+        );
+        let mut no_dockerfile = editor.clone();
+        no_dockerfile.source = Source::Git {
+            repo: "https://github.com/me/editor".into(),
+            branch: None,
+            build: Build::Static {
+                dir: ".".into(),
+                dockerfile: None,
+                context: Some("web".into()),
+            },
+        };
+        assert!(no_dockerfile.validate().is_err());
         let api = &manifest.apps[2].spec;
         assert_eq!(api.links[1].host(), "redis");
         assert_eq!(api.volumes[0].path, "/srv/uploads");

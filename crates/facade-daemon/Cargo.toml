@@ -39,6 +39,7 @@ libc = "0.2"
 sysinfo = "0.39"
 tar = "0.4"
 flate2 = "1"
+brotli = "8"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util = { version = "0.7", features = ["io"] }

@@ -3,6 +3,7 @@
 
 mod build;
 mod cgroups;
+mod compress;
 mod maintenance;
 mod ports;
 mod queue;

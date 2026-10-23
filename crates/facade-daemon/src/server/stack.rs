@@ -95,7 +95,7 @@ async fn build_key(dir: &std::path::Path, build: &Build) -> anyhow::Result<Strin
             Access::object_id(dir, dockerfile).await?
         ),
         Build::Rust { .. } | Build::Python { .. } => Access::object_id(dir, ".").await?,
-        Build::Static { dir: d } => Access::object_id(dir, d).await?,
+        Build::Static { dir: d, .. } | Build::Trunk { dir: d } => Access::object_id(dir, d).await?,
     })
 }
 

@@ -132,7 +132,7 @@ impl ServiceSpec {
         {
             return err(format!("service {service}: invalid image"));
         }
-        if matches!(self.build, Some(Build::Static { .. })) {
+        if self.build.as_ref().is_some_and(Build::is_static) {
             return err(format!(
                 "service {service}: static sites are apps of their own, not stack services"
             ));
