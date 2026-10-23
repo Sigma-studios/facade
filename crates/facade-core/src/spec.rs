@@ -273,13 +273,7 @@ fn is_false(b: &bool) -> bool {
 
 impl AppSpec {
     pub fn is_static(&self) -> bool {
-        matches!(
-            self.source,
-            Source::Git {
-                build: Build::Static { .. },
-                ..
-            }
-        )
+        matches!(&self.source, Source::Git { build, .. } if build.is_static())
     }
 
     /// The service name, for the apps of a stack.
@@ -557,7 +551,22 @@ impl AppSpec {
                         }
                         PythonEntry::parse(entry)?;
                     }
-                    Build::Static { dir } => validate_repo_path(dir)?,
+                    Build::Static {
+                        dir,
+                        dockerfile,
+                        context,
+                    } => {
+                        validate_repo_path(dir)?;
+                        if let Some(dockerfile) = dockerfile {
+                            validate_repo_path(dockerfile)?;
+                        } else if context.is_some() {
+                            return err("a static site's build context needs a dockerfile");
+                        }
+                        if let Some(context) = context {
+                            validate_repo_path(context)?;
+                        }
+                    }
+                    Build::Trunk { dir } => validate_repo_path(dir)?,
                 }
             }
         }
@@ -685,11 +694,34 @@ pub enum Build {
         /// the project installs (`mybot`).
         entry: String,
     },
-    /// Files served as-is from a directory of the repository. No container.
+    /// Files served by the node's entry point. No container: `dir` is a directory
+    /// of the repository, or with a `dockerfile`, of what its last stage holds
+    /// (built with `docker build --output`, so the stage is usually `FROM scratch`
+    /// plus a `COPY --from` of the build's output).
     Static {
         #[serde(default = "default_context")]
         dir: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dockerfile: Option<String>,
+        /// Docker build context for `dockerfile`; the repository root when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
     },
+    /// A Rust web app built with [trunk](https://trunkrs.dev) (its `index.html`
+    /// links the crate with `data-trunk`), in a generated Dockerfile; what trunk
+    /// outputs is served like a static site.
+    Trunk {
+        /// The directory holding the app's `index.html` (and `Trunk.toml`).
+        #[serde(default = "default_context")]
+        dir: String,
+    },
+}
+
+impl Build {
+    /// Files served by the node's entry point, without a container.
+    pub fn is_static(&self) -> bool {
+        matches!(self, Build::Static { .. } | Build::Trunk { .. })
+    }
 }
 
 /// The Python used when a project does not say.

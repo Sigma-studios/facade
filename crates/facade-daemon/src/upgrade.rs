@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use bollard::Docker;
 use bollard::query_parameters::ListContainersOptions;
+use facade_core::Source;
 use facade_core::api::{AppChange as Change, PlannedChange, UpdateRun, UpdateState};
-use facade_core::{Build, Source};
 
 use crate::config::ServerConfig;
 use crate::server::{Catalog, secrets::SecretBox, store::Store};
@@ -97,17 +97,13 @@ async fn check_copy(cfg: &ServerConfig, copy: &std::path::Path, json: bool) -> a
             Change::Unchanged => "unchanged".to_string(),
             Change::Restart => "RESTARTS: its container is recreated (a few seconds down)".into(),
             Change::Rebuild => match &spec.source {
-                Source::Git { build, .. } if !matches!(build, Build::Static { .. }) => {
-                    match &row.commit {
-                        Some(sha) => format!(
-                            "REBUILDS at its deployed commit {}, then restarts",
-                            &sha[..sha.len().min(7)]
-                        ),
-                        None => {
-                            "REBUILDS from the latest commit of its branch, then restarts".into()
-                        }
-                    }
-                }
+                Source::Git { build, .. } if !build.is_static() => match &row.commit {
+                    Some(sha) => format!(
+                        "REBUILDS at its deployed commit {}, then restarts",
+                        &sha[..sha.len().min(7)]
+                    ),
+                    None => "REBUILDS from the latest commit of its branch, then restarts".into(),
+                },
                 Source::Image { .. } => "PULLS its image again, then restarts".into(),
                 _ => "REBUILDS its image, then restarts".into(),
             },

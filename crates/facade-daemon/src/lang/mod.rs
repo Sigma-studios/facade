@@ -14,6 +14,7 @@ pub mod executable;
 pub mod python;
 pub mod rust;
 pub mod static_site;
+pub mod trunk;
 
 use std::path::Path;
 
@@ -30,6 +31,9 @@ pub trait Detector {
 pub fn detectors() -> Vec<Box<dyn Detector>> {
     vec![
         Box::new(dockerfile::Dockerfiles),
+        // Before cargo binaries: a crate with a trunk page is a web app, and its
+        // other binaries are rarely what a repository is deployed for.
+        Box::new(trunk::Trunk),
         Box::new(rust::Cargo),
         Box::new(python::Python),
         Box::new(static_site::StaticSite),
@@ -56,7 +60,8 @@ pub fn generated_dockerfile(app: &str, build: &Build) -> Option<String> {
             *no_default_features,
         )),
         Build::Python { version, entry } => python::dockerfile(version.as_deref(), entry).ok(),
-        Build::Dockerfile { .. } | Build::Static { .. } => None,
+        // Static sites build in `converge_static`; trunk's is `trunk::dockerfile`.
+        Build::Dockerfile { .. } | Build::Static { .. } | Build::Trunk { .. } => None,
     }
 }
 

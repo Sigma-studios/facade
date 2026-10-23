@@ -520,8 +520,43 @@ async fn serve_static(req: Request<Incoming>, root: PathBuf) -> anyhow::Result<R
         .precompressed_gzip()
         .precompressed_br()
         .not_found_service(not_found);
-    let response = service.oneshot(req).await?;
+    let cache = cache_control(req.uri().path());
+    let mut response = service.oneshot(req).await?;
+    // A missing file may exist after the next deploy.
+    let cache = if response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED {
+        cache
+    } else {
+        "no-cache"
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    // The same URL is answered with brotli, gzip or plain bytes.
+    headers.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
     Ok(response.map(Body::new))
+}
+
+/// Files whose name carries a content hash (`app-3f2a9c1d.js`, Vite's
+/// `index-DiwrgTda.js`) never change: browsers keep them. Anything else is
+/// revalidated on every use (a cheap 304 while it is unchanged), so a deploy is
+/// seen at once.
+fn cache_control(path: &str) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or_default();
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let hashed = stem.split(['-', '.', '_']).skip(1).any(|part| {
+        let hex = part.len() >= 8
+            && part.chars().all(|c| c.is_ascii_hexdigit())
+            && part.chars().any(|c| c.is_ascii_digit());
+        let rollup = part.len() == 8
+            && part.chars().all(|c| c.is_ascii_alphanumeric())
+            && part.chars().skip(1).any(|c| c.is_ascii_uppercase())
+            && part.chars().any(|c| c.is_ascii_lowercase());
+        hex || rollup
+    });
+    if hashed {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
 }
 
 fn redirect(location: String) -> Response<Body> {
@@ -596,6 +631,35 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caches_hashed_files_only() {
+        for path in [
+            "/prisme-web-d283876f31793b05.js",
+            "/assets/index-DiwrgTda.js",
+            "/static/js/main.8c3a2f1e.chunk.js",
+            "/app_bg-0123abcd.wasm",
+        ] {
+            assert_eq!(
+                cache_control(path),
+                "public, max-age=31536000, immutable",
+                "{path}"
+            );
+        }
+        for path in [
+            "/",
+            "/index.html",
+            "/prisme-web_bg.wasm",
+            "/worker.js",
+            "/jquery-3.7.1.min.js",
+            "/bootstrap.bundle.js",
+            "/fonts/Inter-Regular.ttf",
+            "/deadbeef.js",
+            "/logo-Facebook.png",
+        ] {
+            assert_eq!(cache_control(path), "no-cache", "{path}");
+        }
+    }
 
     fn host_of(h: &str) -> Option<String> {
         request_host(&Request::builder().header("host", h).body(()).unwrap())

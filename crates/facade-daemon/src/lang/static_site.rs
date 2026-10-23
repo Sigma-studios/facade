@@ -26,7 +26,11 @@ impl Detector for StaticSite {
                         if rel == "." { "the root" } else { &rel }
                     ),
                     detail: format!("{rel}/index.html, served as-is"),
-                    build: Build::Static { dir: rel },
+                    build: Build::Static {
+                        dir: rel,
+                        dockerfile: None,
+                        context: None,
+                    },
                     http_port: None,
                     env: vec![],
                     command: vec![],

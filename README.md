@@ -175,9 +175,9 @@ An app comes from one of three sources:
   (with the features they need, the port they listen on and the environment variables
   they read), Python programs (a script with a `__main__` block, a package with
   `__main__.py` or a `pyproject.toml` command; dependencies from `requirements.txt`
-  and/or `pyproject.toml`; the version from `.python-version` or `requires-python`)
-  or a static site. The best match is used unless you pick a build yourself
-  (`--dockerfile`, `--rust-bin`, `--python`, `--static`). The scan also suggests a
+  and/or `pyproject.toml`; the version from `.python-version` or `requires-python`),
+  Rust web apps built with trunk, or a static site. The best match is used unless you pick a build yourself
+  (`--dockerfile`, `--rust-bin`, `--python`, `--trunk`, `--static`). The scan also suggests a
   command when needed: a Python server whose `--host` defaults to `127.0.0.1` gets
   `--host 0.0.0.0`, since loopback is unreachable from outside its container. A
   repository holding several services (a monorepo with a docker-compose file, say) is
@@ -220,6 +220,45 @@ facade registry login ghcr.io --user me           # token with read:packages
 facade app create blog --image ghcr.io/me/blog --port 3000 --domain example.com \
   --redirect www.example.com --volume data:/data
 ```
+
+### Static sites
+
+A static site has no container: its node's entry point serves the files itself.
+They are the repository's (`--static public`), or what a Dockerfile builds
+(`--static . --dockerfile web/Dockerfile`): the node builds the commit with
+`docker build --output`, which writes the files of the last stage, usually
+`FROM scratch` plus a `COPY --from` of the build's output. The scan offers a
+Dockerfile ending that way as a built static site.
+
+```dockerfile
+FROM rust:1-slim AS build
+# … build the site into /src/dist, with cache mounts for faster rebuilds
+FROM scratch
+COPY --from=build /src/dist/ /
+```
+
+```sh
+facade app create editor --git https://github.com/me/editor \
+  --static . --dockerfile apps/web/Dockerfile --domain editor.example.com
+```
+
+A **Rust web app built with [trunk](https://trunkrs.dev)** (egui/eframe, Yew,
+Leptos CSR…) needs nothing more: the scan finds the `index.html` that links the
+crate (`<link data-trunk rel="rust">`), facade writes the Dockerfile (Rust with the
+wasm32 target, trunk and the wasm-bindgen and wasm-opt it fetches, a
+`rust-toolchain.toml` honoured, cached between builds) and serves what trunk
+outputs.
+
+```sh
+facade app create paint --git https://github.com/me/paint --domain paint.example.com
+# or explicitly: --trunk apps/web
+```
+
+Each deploy compresses the site once (`.br` and `.gz` next to text files, kept only
+when smaller; files the site ships compressed are left alone), so nothing is
+compressed per request. Files named with a content hash (`app-3f2a9c1d.js`) are
+cached by browsers for a year; anything else is revalidated on each use, a cheap
+304 until the next deploy. `index.html` and `404.html` are used when present.
 
 `--command` replaces the image's command (`CMD`), for any build: with a scanned
 Python server it is what the scan suggests (`python server.py --host 0.0.0.0`);

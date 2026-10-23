@@ -767,7 +767,8 @@ struct SpecArgs {
     git: Option<String>,
     #[arg(long)]
     branch: Option<String>,
-    /// Dockerfile path in the repository (default build kind).
+    /// Dockerfile path in the repository (default build kind). With --static, it
+    /// builds the site: the files of its last stage are served.
     #[arg(long)]
     dockerfile: Option<String>,
     /// Docker build context in the repository.
@@ -783,9 +784,14 @@ struct SpecArgs {
     features: Vec<String>,
     #[arg(long, requires = "rust_bin")]
     no_default_features: bool,
-    /// Serve this repository directory as a static site.
-    #[arg(long = "static", conflicts_with = "dockerfile")]
+    /// Serve this directory as a static site: of the repository, or with
+    /// --dockerfile, of what the build outputs (`.` for all of it).
+    #[arg(long = "static")]
     static_dir: Option<String>,
+    /// Build the Rust web app in this directory with trunk (its index.html has
+    /// `<link data-trunk rel="rust">`) and serve the result as a static site.
+    #[arg(long, conflicts_with_all = ["dockerfile", "static_dir", "rust_bin"])]
+    trunk: Option<String>,
     /// Run a Python program: a script (server.py), `-m module` or a command the
     /// project installs. Dependencies come from requirements.txt / pyproject.toml.
     #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["dockerfile", "static_dir", "rust_bin"])]
@@ -922,6 +928,7 @@ impl SpecArgs {
             || self.context.is_some()
             || self.rust_bin.is_some()
             || self.static_dir.is_some()
+            || self.trunk.is_some()
             || self.python.is_some();
         if !touches_git {
             return Ok(None);
@@ -946,8 +953,14 @@ impl SpecArgs {
                 features: self.features.clone(),
                 no_default_features: self.no_default_features,
             }
+        } else if let Some(dir) = &self.trunk {
+            Build::Trunk { dir: dir.clone() }
         } else if let Some(dir) = &self.static_dir {
-            Build::Static { dir: dir.clone() }
+            Build::Static {
+                dir: dir.clone(),
+                dockerfile: self.dockerfile.clone(),
+                context: self.context.clone(),
+            }
         } else if let Some(entry) = &self.python {
             Build::Python {
                 version: self.python_version.clone(),
@@ -981,6 +994,7 @@ impl SpecArgs {
             && self.context.is_none()
             && self.rust_bin.is_none()
             && self.static_dir.is_none()
+            && self.trunk.is_none()
             && self.python.is_none()
     }
 
@@ -3778,7 +3792,22 @@ fn print_app_detail(view: &AppView) {
                         format!(" --features {}", features.join(","))
                     }
                 ),
-                Build::Static { dir } => println!("build:     static files from {dir}"),
+                Build::Static {
+                    dir,
+                    dockerfile: None,
+                    ..
+                } => println!("build:     static files from {dir}"),
+                Build::Static {
+                    dir,
+                    dockerfile: Some(dockerfile),
+                    context,
+                } => println!(
+                    "build:     static files from {dir} of what {dockerfile} builds (context {})",
+                    context.as_deref().unwrap_or(".")
+                ),
+                Build::Trunk { dir } => {
+                    println!("build:     Rust web app in {dir}, built with trunk")
+                }
                 Build::Python { version, entry } => println!(
                     "build:     python {} {entry}",
                     version.as_deref().unwrap_or(facade_core::DEFAULT_PYTHON)

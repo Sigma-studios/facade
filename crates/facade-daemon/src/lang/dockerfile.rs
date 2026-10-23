@@ -94,6 +94,30 @@ fn copied_paths(dockerfile: &str) -> Vec<String> {
     paths
 }
 
+/// Whether the last stage only holds files (`FROM scratch` with nothing to run):
+/// a static site built with `docker build --output`.
+fn builds_files(dockerfile: &str) -> bool {
+    let mut last_stage_scratch = false;
+    let mut runs = false;
+    for line in dockerfile.lines() {
+        let mut words = line.split_whitespace();
+        let Some(instruction) = words.next() else {
+            continue;
+        };
+        if instruction.eq_ignore_ascii_case("from") {
+            let image = words.find(|w| !w.starts_with("--")).unwrap_or_default();
+            last_stage_scratch = image.eq_ignore_ascii_case("scratch");
+            runs = false;
+        } else if ["cmd", "entrypoint"]
+            .iter()
+            .any(|i| instruction.eq_ignore_ascii_case(i))
+        {
+            runs = true;
+        }
+    }
+    last_stage_scratch && !runs
+}
+
 /// The build context: the Dockerfile's directory, unless what it copies is only
 /// found at the repository root (a monorepo Dockerfile built from the root).
 fn context_for(root: &Path, dir: &Path, contents: &str) -> PathBuf {
@@ -153,6 +177,22 @@ impl Detector for Dockerfiles {
                         " · built from {}",
                         if context == "." { "the root" } else { &context }
                     );
+                }
+                if builds_files(&contents) {
+                    return Some(Candidate {
+                        detector: "dockerfile".into(),
+                        title: format!("Static site built by {dockerfile}"),
+                        detail: format!("{detail} · its last stage's files, served as-is"),
+                        build: Build::Static {
+                            dir: ".".into(),
+                            dockerfile: Some(dockerfile),
+                            context: (context != ".").then_some(context),
+                        },
+                        http_port: None,
+                        env: vec![],
+                        command: vec![],
+                        notes: vec![],
+                    });
                 }
                 if let Some(p) = http_port {
                     detail += &format!(" · exposes {p}");
@@ -230,6 +270,47 @@ mod tests {
             found[0].detail,
             "apps/web/Dockerfile · built from the root · exposes 3000"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_scratch_last_stage_is_a_built_static_site() {
+        let dir = std::env::temp_dir().join(format!("facade-docker-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "Cargo.toml", "[workspace]\n");
+        write(&dir, "crates/app/src/lib.rs", "");
+        write(
+            &dir,
+            "apps/web/Dockerfile",
+            "FROM rust AS build\nCOPY Cargo.toml ./\nCOPY crates crates\nRUN trunk build\n\
+             FROM scratch\nCOPY --from=build /src/dist/ /\n",
+        );
+        // Ends in scratch but runs something: a container, not files.
+        write(
+            &dir,
+            "tools/Dockerfile",
+            "FROM rust AS build\nRUN cargo build\nFROM scratch\nCOPY --from=build /app /app\nENTRYPOINT [\"/app\"]\n",
+        );
+        let found = Dockerfiles.detect(&dir);
+        assert_eq!(found.len(), 2);
+        let web = found
+            .iter()
+            .find(|c| c.detail.starts_with("apps/web/"))
+            .unwrap();
+        let tools = found
+            .iter()
+            .find(|c| c.detail.starts_with("tools/"))
+            .unwrap();
+        assert_eq!(web.title, "Static site built by apps/web/Dockerfile");
+        assert_eq!(
+            web.build,
+            Build::Static {
+                dir: ".".into(),
+                dockerfile: Some("apps/web/Dockerfile".into()),
+                context: None,
+            }
+        );
+        assert!(matches!(tools.build, Build::Dockerfile { .. }));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
