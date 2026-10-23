@@ -302,7 +302,10 @@ pub fn Nodes() -> impl IntoView {
                                                 <td><code>{v.name.clone()}</code></td>
                                                 <td class="muted">{v.node.clone()}</td>
                                                 <td>{v.app.clone()}</td>
-                                                <td class="num">{v.size.map(bytes).unwrap_or_else(|| "—".into())}</td>
+                                                <td class="num">
+                                                    {v.size.map(bytes).unwrap_or_else(|| "—".into())}
+                                                    {v.limit.map(|l| view! { <span class="muted small">{format!(" of {}", bytes(l))}</span> })}
+                                                </td>
                                                 <td>{if !v.declared {
                                                     view! { <span class="badge badge-neutral">"orphaned"</span> }.into_any()
                                                 } else if v.in_use {

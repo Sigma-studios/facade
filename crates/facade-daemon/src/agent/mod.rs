@@ -2,11 +2,13 @@
 //! desired workloads, and dials data connections on request.
 
 mod build;
+mod cgroups;
 mod maintenance;
 mod ports;
 mod queue;
 mod routes;
 mod runtime;
+mod sized;
 mod stats;
 mod volumes;
 
@@ -140,6 +142,7 @@ impl Agent {
         // Apps stay reachable while the server is away.
         self.start_routing();
         tokio::spawn(maintenance::run(self.clone()));
+        tokio::spawn(cgroups::watch(self.runtime.clone()));
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = std::time::Instant::now();
@@ -250,7 +253,7 @@ impl Agent {
     }
 
     /// Requests answer quickly; long work (builds) runs in the background and
-    /// reports through events.
+    /// reports through events. Commands run in containers answer once done.
     async fn handle(
         self: &Arc<Self>,
         req: AgentRequest,
@@ -440,6 +443,14 @@ impl Agent {
                     let _ = stream.write_all(answer.as_bytes()).await;
                     let _ = stream.shutdown().await;
                 });
+            }
+            AgentRequest::Exec {
+                app,
+                command,
+                timeout_secs,
+            } => {
+                let timeout = Duration::from_secs(u64::from(timeout_secs));
+                self.runtime.exec(&app, &command, timeout).await?;
             }
         }
         Ok(None)

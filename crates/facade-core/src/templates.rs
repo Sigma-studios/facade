@@ -6,6 +6,10 @@ use crate::env::reference;
 use crate::spec::{AppSpec, HealthCheck, Limits, Source, SpecError, Volume};
 use crate::stack::ServiceSpec;
 
+/// Databases get a minute to flush and shut down cleanly; they stop as soon as
+/// they are done.
+const DATABASE_STOP_TIMEOUT: u32 = 60;
+
 /// A variable to set on the new app: `(key, value, sensitive)`.
 pub type EnvVar = (String, String, bool);
 
@@ -76,8 +80,9 @@ pub fn database(
         host_network: false,
         limits: Limits {
             memory_mb: req.memory_mb,
-            cpus: None,
+            ..Default::default()
         },
+        delegate_cgroups: false,
         enabled: true,
         command: parts.command,
         release_command: None,
@@ -85,6 +90,9 @@ pub fn database(
         volumes: vec![parts.volume],
         links: vec![],
         stack: None,
+        stop_timeout_secs: Some(DATABASE_STOP_TIMEOUT),
+        stop_signal: None,
+        backup: None,
     };
     spec.validate()?;
     Ok(Database {
@@ -111,6 +119,7 @@ pub fn database_service(
             image: Some(parts.image),
             command: (!parts.command.is_empty()).then_some(parts.command),
             volumes: Some(vec![parts.volume]),
+            stop_timeout_secs: Some(DATABASE_STOP_TIMEOUT),
             ..Default::default()
         },
         env: parts.env,
@@ -241,6 +250,7 @@ fn parts(
         volume: Volume {
             name: "data".into(),
             path: data_path.into(),
+            size_mb: None,
         },
         env,
         command,

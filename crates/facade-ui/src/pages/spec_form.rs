@@ -43,6 +43,12 @@ pub struct SpecForm {
     volumes: RwSignal<String>,
     memory: RwSignal<String>,
     cpus: RwSignal<String>,
+    pids: RwSignal<String>,
+    delegate_cgroups: RwSignal<bool>,
+    backup_before: RwSignal<String>,
+    backup_after: RwSignal<String>,
+    stop_timeout: RwSignal<String>,
+    stop_signal: RwSignal<String>,
     enabled: RwSignal<bool>,
     /// The saved limits of a running app: they are freed when it changes, so they
     /// count as available in the owner's share.
@@ -99,6 +105,12 @@ impl SpecForm {
             volumes: s(""),
             memory: s(""),
             cpus: s(""),
+            pids: s(""),
+            delegate_cgroups: RwSignal::new(false),
+            backup_before: s(""),
+            backup_after: s(""),
+            stop_timeout: s(""),
+            stop_signal: s(""),
             enabled: RwSignal::new(true),
             own_memory: None,
             own_cpus: None,
@@ -204,6 +216,15 @@ impl SpecForm {
         );
         form.memory.set(opt_text(spec.limits.memory_mb));
         form.cpus.set(opt_text(spec.limits.cpus));
+        form.pids.set(opt_text(spec.limits.pids));
+        form.delegate_cgroups.set(spec.delegate_cgroups);
+        if let Some(b) = &spec.backup {
+            form.backup_before.set(b.before.clone().unwrap_or_default());
+            form.backup_after.set(b.after.clone().unwrap_or_default());
+        }
+        form.stop_timeout.set(opt_text(spec.stop_timeout_secs));
+        form.stop_signal
+            .set(spec.stop_signal.clone().unwrap_or_default());
         form.enabled.set(spec.enabled);
         if spec.enabled {
             form.own_memory = spec.limits.memory_mb.map(|m| m as f64);
@@ -450,6 +471,34 @@ impl SpecForm {
                     .map_err(|_| "CPUs must be a number".to_string())
             })
             .transpose()?;
+        let pids = optional(self.pids)
+            .map(|p| {
+                p.parse::<u32>()
+                    .map_err(|_| "processes must be a whole number".to_string())
+            })
+            .transpose()?;
+        let (stop_timeout_secs, stop_signal) = if is_static {
+            (None, None)
+        } else {
+            let timeout = optional(self.stop_timeout)
+                .map(|t| {
+                    t.parse::<u32>()
+                        .map_err(|_| "the stop timeout must be a number of seconds".to_string())
+                })
+                .transpose()?;
+            (
+                timeout,
+                optional(self.stop_signal).map(|s| s.to_uppercase()),
+            )
+        };
+        let (backup_before, backup_after) =
+            (optional(self.backup_before), optional(self.backup_after));
+        let backup = (!is_static && (backup_before.is_some() || backup_after.is_some())).then_some(
+            facade_core::BackupSpec {
+                before: backup_before,
+                after: backup_after,
+            },
+        );
         let host_network = !is_static && self.host_network.get_untracked();
         let (command, release_command, volumes, links) = if is_static {
             (vec![], None, vec![], vec![])
@@ -485,7 +534,12 @@ impl SpecForm {
             ports,
             tls_ports,
             host_network,
-            limits: Limits { memory_mb, cpus },
+            limits: Limits {
+                memory_mb,
+                cpus,
+                pids,
+            },
+            delegate_cgroups: !is_static && self.delegate_cgroups.get_untracked(),
             enabled: self.enabled.get_untracked(),
             command,
             release_command,
@@ -496,6 +550,9 @@ impl SpecForm {
                 .then(|| optional(self.health))
                 .flatten()
                 .map(|h| facade_core::HealthCheck::shell(&h)),
+            stop_timeout_secs,
+            stop_signal,
+            backup,
         };
         spec.validate().map_err(|e| e.to_string())?;
         Ok(spec)
@@ -1062,6 +1119,18 @@ pub fn SpecFields(
                     <input type="text" bind:value=f.health autocomplete="off" placeholder="curl -fs localhost:8080/health"/>
                     <small>"Run in the container; exit 0 means ready. A deploy waits for it before counting as done."</small>
                 </label>
+                <div class="form-row">
+                    <label class="field">
+                        <span>"Stop timeout (seconds)"</span>
+                        <input type="number" min="1" max="3600" bind:value=f.stop_timeout placeholder="10"/>
+                        <small>"Time to shut down cleanly when stopped, restarted or replaced by a deploy, before being killed."</small>
+                    </label>
+                    <label class="field">
+                        <span>"Stop signal"</span>
+                        <input type="text" bind:value=f.stop_signal autocomplete="off" placeholder="SIGTERM"/>
+                        <small>"For apps that save on another signal, like " <code>"SIGINT"</code> "."</small>
+                    </label>
+                </div>
             </fieldset>
 
             <fieldset class="form-section">
@@ -1071,9 +1140,24 @@ pub fn SpecFields(
                     <textarea rows="2" class="mono" bind:value=f.volumes placeholder="data:/var/lib/data"></textarea>
                     <small>
                         "name:/path, one per line. What the app writes there survives restarts and deploys. "
-                        "Volumes live on the app's node; moving the app copies them over when you ask to."
+                        "Volumes live on the app's node; moving the app copies them over when you ask to. "
+                        "Add a size (" <code>"data:/data:20G"</code> ") to keep a volume from filling the node's disk: it can grow later, not shrink."
                     </small>
                 </label>
+                <div class="form-row">
+                    <label class="field grow">
+                        <span>"Before each backup"</span>
+                        <input type="text" bind:value=f.backup_before autocomplete="off" placeholder="rcon-cli save-off && rcon-cli save-all flush"/>
+                    </label>
+                    <label class="field grow">
+                        <span>"After each backup"</span>
+                        <input type="text" bind:value=f.backup_after autocomplete="off" placeholder="rcon-cli save-on"/>
+                    </label>
+                </div>
+                <small class="muted">
+                    "Run in the container (with " <code>"sh -c"</code> ") around backups of its volumes, so what is on disk "
+                    "is whole while it is copied; if the first fails, nothing is copied."
+                </small>
                 <div class="field">
                     <span>"Links"</span>
                     <Show when=move || !f.host_network.get()
@@ -1133,6 +1217,22 @@ pub fn SpecFields(
                             me.cpu_cap().map(|(used, cap)| cap - used + f.own_cpus.unwrap_or(0.0))
                         })/>
                 </div>
+                <div class="form-row">
+                    <label class="field">
+                        <span>"Processes"</span>
+                        <input type="number" min="16" bind:value=f.pids placeholder="4096"/>
+                        <small>"Most processes and threads at once. Threads count too."</small>
+                    </label>
+                </div>
+                <label class="check">
+                    <input type="checkbox" bind:checked=f.delegate_cgroups/>
+                    "Let the app divide these limits between its own processes"
+                </label>
+                <small class="muted">
+                    "For process supervisors: " <code>"/sys/fs/cgroup"</code>
+                    " becomes writable in the container, so the app can give each child its own memory and CPU share. "
+                    "The limits above stay out of its reach."
+                </small>
             </fieldset>
         </Show>
     }

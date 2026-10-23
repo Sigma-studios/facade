@@ -622,6 +622,23 @@ pub fn plan(
                 ));
                 continue;
             }
+            // A named volume's size, from its `x-facade:` in the top-level `volumes:`.
+            let size_mb = match source.as_deref().map(|s| {
+                doc.get("volumes")
+                    .and_then(|v| v.get(s))
+                    .and_then(|v| v.get("x-facade"))
+                    .and_then(|x| x.get("size"))
+                    .and_then(scalar)
+            }) {
+                Some(Some(size)) => match facade_core::parse_size_mb(&size) {
+                    Ok(mb) => Some(mb),
+                    Err(e) => {
+                        note(format!("volume size ignored: {e}"));
+                        None
+                    }
+                },
+                _ => None,
+            };
             let base = source.unwrap_or_else(|| {
                 let last = Path::new(&target)
                     .file_name()
@@ -637,6 +654,7 @@ pub fn plan(
                     vol_name
                 },
                 path: target.trim_end_matches('/').to_string(),
+                size_mb,
             };
             if volume.validate().is_err()
                 || volumes
@@ -667,6 +685,39 @@ pub fn plan(
             .or(field("cpus"))
         {
             spec.limits.cpus = scalar(c).and_then(|c| c.parse().ok()).filter(|c| *c > 0.0);
+        }
+        if let Some(p) = resource_limits
+            .and_then(|l| l.get("pids"))
+            .or(field("pids_limit"))
+            .and_then(scalar)
+        {
+            // -1 and 0 mean no limit to Compose; facade keeps its default then.
+            spec.limits.pids = p.parse().ok().filter(|p| *p > 0);
+            if let Some(n) = spec.limits.pids.filter(|n| *n < 16) {
+                note(format!("pids limit {n} raised to 16"));
+                spec.limits.pids = Some(16);
+            }
+        }
+        if let Some(t) = field("stop_grace_period") {
+            match duration_secs(t) {
+                Some(secs) if secs <= facade_core::MAX_STOP_TIMEOUT => {
+                    spec.stop_timeout_secs = Some(secs)
+                }
+                Some(_) => {
+                    note(format!(
+                        "stop_grace_period lowered to {} seconds",
+                        facade_core::MAX_STOP_TIMEOUT
+                    ));
+                    spec.stop_timeout_secs = Some(facade_core::MAX_STOP_TIMEOUT);
+                }
+                None => note("stop_grace_period is not a duration and was left out".into()),
+            }
+        }
+        if let Some(signal) = field("stop_signal").and_then(scalar) {
+            match facade_core::validate_signal(&signal) {
+                Ok(()) => spec.stop_signal = Some(signal),
+                Err(e) => note(format!("stop_signal left out: {e}")),
+            }
         }
 
         match field("healthcheck") {
@@ -796,7 +847,7 @@ fn healthcheck(h: &Value, note: &mut dyn FnMut(String)) -> Option<HealthCheck> {
 }
 
 /// A service's `x-facade:` section: domains, http_port, release, memory (MB),
-/// cpus, publish (`3478:3478/udp`, …).
+/// cpus, publish (`3478:3478/udp`, …), delegate_cgroups, backup (`before`, `after`).
 fn facade_settings(x: &Value, note: &mut dyn FnMut(String)) -> ServiceSpec {
     let mut spec = ServiceSpec::default();
     let get = |k: &str| x.get(k);
@@ -830,6 +881,21 @@ fn facade_settings(x: &Value, note: &mut dyn FnMut(String)) -> ServiceSpec {
             }
         }
         spec.ports = Some(ports);
+    }
+    if let Some(b) = get("backup") {
+        match serde_yaml_ng::from_value::<facade_core::BackupSpec>(b.clone()) {
+            Ok(backup) => spec.backup = Some(backup),
+            Err(e) => note(format!("x-facade backup ignored: {e}")),
+        }
+    }
+    if let Some(d) = get("delegate_cgroups").and_then(scalar) {
+        match d.as_str() {
+            "true" => spec.delegate_cgroups = Some(true),
+            "false" => spec.delegate_cgroups = Some(false),
+            other => note(format!(
+                "x-facade delegate_cgroups `{other}` is not true or false"
+            )),
+        }
     }
     spec
 }
@@ -914,11 +980,14 @@ services:
     ports: ["8080:8080", "9000-9001:9000-9001/udp"]
     depends_on: [db]
     volumes: ["./config:/config", "/tmp/cache", "pgdata:/backup"]
-    deploy: { resources: { limits: { memory: 512M, cpus: "0.5" } } }
+    deploy: { resources: { limits: { memory: 512M, cpus: "0.5", pids: 8192 } } }
+    stop_grace_period: 1m30s
+    stop_signal: SIGINT
     x-facade:
       domains: [API.example.com]
       release: ./api migrate
       publish: ["9000-9001:9000-9001/udp"]
+      backup: { before: ./api freeze, after: ./api thaw }
   web:
     build: ../apps/web
     ports: ["3000"]
@@ -929,6 +998,7 @@ services:
     profiles: [debug]
 volumes:
   pgdata:
+    x-facade: { size: 20G }
 "#,
         )
         .unwrap();
@@ -958,7 +1028,7 @@ volumes:
         assert_eq!(db.spec.http_port, None);
         assert_eq!(
             db.spec.volumes.as_ref().unwrap()[0].to_string(),
-            "pgdata:/var/lib/postgresql/data"
+            "pgdata:/var/lib/postgresql/data:20G"
         );
         assert_eq!(
             db.env["POSTGRES_PASSWORD"],
@@ -993,9 +1063,18 @@ volumes:
             .map(|v| v.to_string())
             .collect();
         // The named volume is the same one the database uses.
-        assert_eq!(volumes, ["api-server-cache:/tmp/cache", "pgdata:/backup"]);
+        assert_eq!(
+            volumes,
+            ["api-server-cache:/tmp/cache", "pgdata:/backup:20G"]
+        );
         assert_eq!(api.spec.limits.memory_mb, Some(512));
         assert_eq!(api.spec.limits.cpus, Some(0.5));
+        assert_eq!(api.spec.limits.pids, Some(8192));
+        assert_eq!(api.spec.stop_timeout_secs, Some(90));
+        assert_eq!(api.spec.stop_signal.as_deref(), Some("SIGINT"));
+        let backup = api.spec.backup.as_ref().unwrap();
+        assert_eq!(backup.before.as_deref(), Some("./api freeze"));
+        assert_eq!(backup.after.as_deref(), Some("./api thaw"));
         assert_eq!(api.spec.depends_on.as_ref().unwrap(), &["db"]);
         assert_eq!(api.env["RUST_LOG"], EnvEntry::Plain("info".into()));
         // The generated password is shared, so the API reaches the database.

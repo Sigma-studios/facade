@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use facade_core::api::{BackupReport, BackupView};
+use facade_core::proto::{AgentRequest, AppState};
 use tracing::{info, warn};
 
 use super::Server;
@@ -83,9 +84,29 @@ pub async fn backup_all(server: &Server, app: Option<&str>) -> BackupReport {
         if app.is_some_and(|a| a != row.spec.name) || row.revision == 0 {
             continue;
         }
+        let hooks = row.spec.backup.clone().unwrap_or_default();
+        let running = !row.spec.volumes.is_empty()
+            && server
+                .live
+                .read()
+                .apps
+                .get(&row.spec.name)
+                .is_some_and(|a| a.state == AppState::Running);
+        // The app makes what is on disk whole first; if it cannot, nothing is
+        // copied rather than a copy that may not open.
+        let before = match &hooks.before {
+            Some(command) if running => run_hook(server, &row.spec, command)
+                .await
+                .map_err(|e| format!("the before command failed: {e:#}")),
+            _ => Ok(()),
+        };
         for volume in &row.spec.volumes {
             let key = format!("{}/{}", row.spec.name, volume.name);
-            match backup_volume(server, &row.spec.name, &volume.name).await {
+            let copied = match &before {
+                Ok(()) => backup_volume(server, &row.spec.name, &volume.name).await,
+                Err(e) => Err(anyhow!("{e}")),
+            };
+            match copied {
                 Ok(view) => {
                     server.backup_errors.write().remove(&key);
                     report.done.push(view);
@@ -100,8 +121,47 @@ pub async fn backup_all(server: &Server, app: Option<&str>) -> BackupReport {
                 }
             }
         }
+        if let Some(command) = hooks.after.as_ref().filter(|_| running) {
+            let key = format!("{}/after", row.spec.name);
+            match run_hook(server, &row.spec, command).await {
+                Ok(()) => {
+                    server.backup_errors.write().remove(&key);
+                }
+                Err(e) => {
+                    let message = format!("the after command failed: {e:#}");
+                    warn!("backing up {}: {message}", row.spec.name);
+                    server
+                        .backup_errors
+                        .write()
+                        .insert(key.clone(), message.clone());
+                    report.failed.push(format!("{key}: {message}"));
+                }
+            }
+        }
     }
     report
+}
+
+/// Longest a backup command may run.
+const HOOK_TIMEOUT_SECS: u32 = 600;
+
+/// Runs one of the app's backup commands in its container.
+async fn run_hook(
+    server: &Server,
+    spec: &facade_core::AppSpec,
+    command: &str,
+) -> anyhow::Result<()> {
+    server
+        .hub
+        .request(
+            &spec.node,
+            AgentRequest::Exec {
+                app: spec.name.clone(),
+                command: command.to_string(),
+                timeout_secs: HOOK_TIMEOUT_SECS,
+            },
+        )
+        .await
 }
 
 pub async fn backup_volume(server: &Server, app: &str, volume: &str) -> anyhow::Result<BackupView> {

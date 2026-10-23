@@ -47,6 +47,12 @@ pub struct AppSpec {
     pub host_network: bool,
     #[serde(default, skip_serializing_if = "Limits::is_empty")]
     pub limits: Limits,
+    /// Lets the app divide its limits between its own processes, as a supervisor
+    /// giving each child its share: `/sys/fs/cgroup` becomes writable in the
+    /// container, holding the container's cgroup and nothing else. The container's
+    /// own limits stay out of its reach. Needs cgroup v2 on the node.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delegate_cgroups: bool,
     /// Stopped apps keep their config but have no running container.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
@@ -73,6 +79,67 @@ pub struct AppSpec {
     /// a stack starts a service's dependents only then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthCheck>,
+    /// Seconds between the stop signal and a kill, whenever the container stops:
+    /// stopped, restarted or replaced by a deploy. Time for the app to save its state
+    /// ([`DEFAULT_STOP_TIMEOUT`] when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_secs: Option<u32>,
+    /// Signal asking the app to stop, `SIGINT` say, for apps that save on Ctrl-C
+    /// only. Defaults to the image's `STOPSIGNAL`, or `SIGTERM`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+    /// Commands run in the container around backups of its volumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<BackupSpec>,
+}
+
+/// Commands making what is on disk whole while the app's volumes are backed up.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupSpec {
+    /// Run with `sh -c` in the app's container before its volumes are copied:
+    /// `rcon-cli save-off && rcon-cli save-all flush`. If it fails, nothing is
+    /// copied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Run after the copy, whether it worked or not: `rcon-cli save-on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+impl BackupSpec {
+    pub fn validate(&self) -> Result<(), SpecError> {
+        for hook in [&self.before, &self.after].into_iter().flatten() {
+            if hook.trim().is_empty() {
+                return err("a backup command is empty");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Seconds Docker waits for a container to stop before killing it, by default.
+pub const DEFAULT_STOP_TIMEOUT: u32 = 10;
+/// Longest stop timeout: an hour.
+pub const MAX_STOP_TIMEOUT: u32 = 3600;
+/// Processes and threads a container may run, by default.
+pub const DEFAULT_PIDS: u32 = 4096;
+
+/// `SIGTERM`, `SIGRTMIN+3` or a signal number.
+pub fn validate_signal(signal: &str) -> Result<(), SpecError> {
+    let named = signal.strip_prefix("SIG").is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '+')
+    });
+    let numbered = signal.parse::<u8>().is_ok_and(|n| (1..=64).contains(&n));
+    if named || numbered {
+        Ok(())
+    } else {
+        err(format!(
+            "`{signal}` is not a signal: use a name like SIGTERM or SIGINT, or a number"
+        ))
+    }
 }
 
 /// A Docker health check (`HEALTHCHECK`).
@@ -263,6 +330,11 @@ impl AppSpec {
         }
     }
 
+    /// Seconds the app is given to stop.
+    pub fn stop_wait_secs(&self) -> u32 {
+        self.stop_timeout_secs.unwrap_or(DEFAULT_STOP_TIMEOUT)
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         match &self.stack {
             Some(stack) => {
@@ -351,10 +423,26 @@ impl AppSpec {
                 ));
             }
         }
-        if let Some(cpus) = self.limits.cpus
-            && !(cpus > 0.0 && cpus <= 1024.0)
-        {
-            return err("limits.cpus must be > 0");
+        self.limits.validate()?;
+        if self.stop_timeout_secs.is_some_and(|t| t > MAX_STOP_TIMEOUT) {
+            return err(format!(
+                "stop timeout must be at most {MAX_STOP_TIMEOUT} seconds"
+            ));
+        }
+        if let Some(signal) = &self.stop_signal {
+            validate_signal(signal)?;
+        }
+        if self.is_static() && (self.stop_timeout_secs.is_some() || self.stop_signal.is_some()) {
+            return err("static sites have no container to stop");
+        }
+        if self.is_static() && self.delegate_cgroups {
+            return err("static sites have no container to delegate cgroups to");
+        }
+        if let Some(backup) = &self.backup {
+            backup.validate()?;
+            if self.volumes.is_empty() {
+                return err("backup commands go with volumes: give the app one first");
+            }
         }
         if !self.command.is_empty() && matches!(self.source, Source::Executable { .. }) {
             return err("executables take arguments (args), not a command");
@@ -864,12 +952,48 @@ impl fmt::Display for TlsPort {
     }
 }
 
-/// A named Docker volume mounted into the container: `data:/var/lib/postgresql`.
+/// A named Docker volume mounted into the container: `data:/var/lib/postgresql`,
+/// or `data:/var/lib/postgresql:20G` with a size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Volume {
     pub name: String,
     pub path: String,
+    /// Most the volume holds, in MB: the node gives it a filesystem of its own,
+    /// which can grow later but not shrink. Without one it shares the node's
+    /// disk, and a volume that has a size keeps it.
+    pub size_mb: Option<u64>,
+}
+
+/// Smallest volume size: a filesystem needs some room for itself.
+pub const MIN_VOLUME_MB: u64 = 64;
+
+/// `512M`, `20G`, `1T` (`MB`, `GB`… too) → MB.
+pub fn parse_size_mb(s: &str) -> Result<u64, SpecError> {
+    let upper = s.trim().to_ascii_uppercase();
+    let digits = upper.trim_end_matches('B');
+    let (number, unit) = digits.split_at(digits.len().saturating_sub(1));
+    let factor = match unit {
+        "M" => 1,
+        "G" => 1024,
+        "T" => 1024 * 1024,
+        _ => return err(format!("`{s}` is not a size: use M, G or T, like 20G")),
+    };
+    match number.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n * factor),
+        _ => err(format!("`{s}` is not a size: use M, G or T, like 20G")),
+    }
+}
+
+/// The reverse of [`parse_size_mb`]: `20G`.
+pub fn format_size_mb(mb: u64) -> String {
+    if mb.is_multiple_of(1024 * 1024) {
+        format!("{}T", mb / (1024 * 1024))
+    } else if mb.is_multiple_of(1024) {
+        format!("{}G", mb / 1024)
+    } else {
+        format!("{mb}M")
+    }
 }
 
 impl Volume {
@@ -901,6 +1025,12 @@ impl Volume {
                 self.path
             ));
         }
+        if self.size_mb.is_some_and(|mb| mb < MIN_VOLUME_MB) {
+            return err(format!(
+                "volume `{}` must be at least {MIN_VOLUME_MB}M",
+                self.name
+            ));
+        }
         Ok(())
     }
 
@@ -915,12 +1045,17 @@ impl FromStr for Volume {
     type Err = SpecError;
 
     fn from_str(s: &str) -> Result<Self, SpecError> {
-        let Some((name, path)) = s.split_once(':') else {
-            return err(format!("`{s}`: expected name:/path"));
+        let Some((name, rest)) = s.split_once(':') else {
+            return err(format!("`{s}`: expected name:/path or name:/path:size"));
+        };
+        let (path, size_mb) = match rest.split_once(':') {
+            Some((path, size)) => (path, Some(parse_size_mb(size)?)),
+            None => (rest, None),
         };
         let volume = Volume {
             name: name.trim().to_string(),
             path: path.trim().trim_end_matches('/').to_string(),
+            size_mb,
         };
         volume.validate()?;
         Ok(volume)
@@ -942,7 +1077,11 @@ impl From<Volume> for String {
 
 impl fmt::Display for Volume {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.name, self.path)
+        write!(f, "{}:{}", self.name, self.path)?;
+        if let Some(mb) = self.size_mb {
+            write!(f, ":{}", format_size_mb(mb))?;
+        }
+        Ok(())
     }
 }
 
@@ -1015,11 +1154,29 @@ pub struct Limits {
     pub memory_mb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<f64>,
+    /// Most processes and threads running at once ([`DEFAULT_PIDS`] when unset).
+    /// Each thread counts: a JVM or a busy worker pool needs more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<u32>,
 }
 
 impl Limits {
     pub fn is_empty(&self) -> bool {
-        self.memory_mb.is_none() && self.cpus.is_none()
+        self.memory_mb.is_none() && self.cpus.is_none() && self.pids.is_none()
+    }
+
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if let Some(cpus) = self.cpus
+            && !(cpus > 0.0 && cpus <= 1024.0)
+        {
+            return err("limits.cpus must be > 0");
+        }
+        if let Some(pids) = self.pids
+            && !(16..=4_194_304).contains(&pids)
+        {
+            return err("limits.pids must be between 16 and 4194304");
+        }
+        Ok(())
     }
 }
 
@@ -1121,6 +1278,15 @@ mod tests {
         assert!("data:relative".parse::<Volume>().is_err());
         assert!("Data:/x".parse::<Volume>().is_err());
         assert!("data:/".parse::<Volume>().is_err());
+        let sized: Volume = "world:/data:20G".parse().unwrap();
+        assert_eq!(sized.size_mb, Some(20 * 1024));
+        assert_eq!(sized.to_string(), "world:/data:20G");
+        assert_eq!(
+            "w:/d:1536mb".parse::<Volume>().unwrap().to_string(),
+            "w:/d:1536M"
+        );
+        assert!("w:/d:32M".parse::<Volume>().is_err());
+        assert!("w:/d:20".parse::<Volume>().is_err());
         let l: Link = "shop-db:db".parse().unwrap();
         assert_eq!((l.app.as_str(), l.host()), ("shop-db", "db"));
         assert_eq!("db:db".parse::<Link>().unwrap().to_string(), "db");
@@ -1207,6 +1373,16 @@ mod tests {
         assert!(s.validate().is_err(), "needs a domain for its certificate");
         assert!("443:8443".parse::<TlsPort>().is_err());
         assert_eq!("993".parse::<TlsPort>().unwrap().container, 993);
+    }
+
+    #[test]
+    fn validates_signals() {
+        for ok in ["SIGTERM", "SIGINT", "SIGRTMIN+3", "15"] {
+            assert!(validate_signal(ok).is_ok(), "{ok}");
+        }
+        for bad in ["TERM", "sigterm", "SIG", "0", "65", "SIG TERM"] {
+            assert!(validate_signal(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

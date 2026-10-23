@@ -215,6 +215,10 @@ template in `lang::generated_dockerfile`.
 | `facade app update <app> --command "./worker" --release "./migrate up"` | command, and what runs before each deploy |
 | `facade app update <app> -v data:/data --link db` | volumes, and apps it reaches by name |
 | `facade app update <app> --redirect www.example.com` | domains redirecting to the main one |
+| `facade app update <app> -v world:/data:20G` | a volume with a size of its own |
+| `facade app update <app> --stop-timeout 60 --stop-signal SIGINT --pids 8192` | how it stops, and how many processes it may run |
+| `facade app update <app> --delegate-cgroups true` | let a process supervisor divide the app's limits |
+| `facade app update <app> --backup-before "…" --backup-after "…"` | commands making its files whole while backed up |
 | `facade deploy <app> [--commit REF] [--rebuild]` / `rollback` / `cancel` | deploys |
 | `facade updates <app>` | commits on the app's branch since its deployed one |
 | `facade builds` | what each node builds, what waits, recent deployments |
@@ -262,6 +266,42 @@ A **health check** (`--health "curl -fs localhost:8080/health"`, or the image's 
 `HEALTHCHECK`) tells when the app is ready: a deploy waits for it to pass, and fails if
 it does not. Without one, a deploy waits for the container to stay up a few seconds.
 
+### Stopping cleanly
+
+Whenever a container stops (`facade stop`, a restart, a deploy or a settings change
+replacing it, the app moving or being removed), it gets its **stop signal**, then its
+**stop timeout** to exit before it is killed. The defaults are the image's
+`STOPSIGNAL` (`SIGTERM` unless it says otherwise) and 10 seconds; databases made with
+`facade db create` get a minute. An app that saves state on the way out (a game
+server writing its world, a queue draining) needs more:
+
+```sh
+facade app update world --stop-timeout 120 --stop-signal SIGINT
+```
+
+The old container stops before the new one starts, so a replaced app is down for as
+long as it takes to stop. Docker uses the same settings when the node reboots.
+
+A container may run 4096 processes and threads at once; `--pids` changes that, for
+a JVM or a supervisor running many programs.
+
+### Process supervisors (cgroup delegation)
+
+An app that runs programs of its own (game servers, CI jobs, workers) can give each
+one part of its limits: with `--delegate-cgroups true`, `/sys/fs/cgroup` in the
+container is writable and holds the container's cgroup, so the app creates a cgroup
+per program with its own `memory.max`, `cpu.weight` and `pids.max`. The container's
+own limits stay out of its reach: the kernel refuses writes to them from inside its
+cgroup namespace (cgroup2's `nsdelegate`, which systemd sets). The node needs cgroup
+v2, as Ubuntu 22.04 and later have.
+
+Docker mounts `/sys/fs/cgroup` read-only, so the agent remounts it each time the
+container starts, a moment after its first process does: wait until
+`/sys/fs/cgroup/cgroup.subtree_control` is writable. Then, as cgroup v2 asks, move
+your own processes into a leaf (`mkdir /sys/fs/cgroup/supervisor`, write their pids,
+`1` included, to its `cgroup.procs`) before enabling controllers for children
+(`echo "+memory +cpu +pids" > /sys/fs/cgroup/cgroup.subtree_control`).
+
 ### Private repositories
 
 facade needs read access to private repositories, for scans and builds alike:
@@ -291,7 +331,14 @@ deploy key on the spot. URLs with a password or token in them are refused.
 
 A **volume** (`-v data:/var/lib/data`) keeps what an app writes there across restarts
 and deploys. Volumes live on the app's node; an app with volumes moves to another node with
-`--move-data`, which copies them over (see [Volumes and backups](#volumes-and-backups)).
+`--move-data`, which copies them over (see [Volumes and backups](#volumes-and-backups)). Volumes share the node's disk unless given a **size**
+(`-v data:/var/lib/data:20G`): the node then gives the volume a filesystem of its own,
+in an image file under the agent's data directory, mounted at boot by a systemd unit
+before Docker starts, and the app gets "no space left" once it is full. A size can
+grow later (the filesystem grows while the app runs), not shrink; a volume that had
+no size moves its data into its new filesystem when it gets one. Nodes need
+`e2fsprogs` (on Ubuntu already). In a compose file, a named volume's size goes in
+the top-level `volumes:` section: `pgdata: { x-facade: { size: 20G } }`.
 `facade app rm <app> --volumes` deletes them with the app; otherwise they stay, listed
 as orphaned in `facade volume ls` until `facade volume rm`.
 
@@ -342,8 +389,8 @@ From the compose file: `image:` and `build:` (with its context and Dockerfile),
 `command`, `environment` (interpolated like Compose does, from the stack's variables
 and a committed `.env`), `ports` (the first one is where HTTP for the service's domains
 goes; nothing is published on the node's public address unless asked), named volumes
-(shared by the services naming them, as in Compose), `depends_on`, `healthcheck` and
-resource limits. Passwords the file expects from the environment (`${DB_PASSWORD}`)
+(shared by the services naming them, as in Compose), `depends_on`, `healthcheck`,
+resource limits (memory, cpus, pids), `stop_grace_period` and `stop_signal`. Passwords the file expects from the environment (`${DB_PASSWORD}`)
 are generated once and kept as stack variables (`facade env ls shop`). Bind mounts,
 `env_file`, build arguments and profiles are left out, and the plan says so. What
 Compose has no words for goes in an `x-facade:` section of the service:
@@ -359,6 +406,8 @@ services:
       release: ./api migrate        # runs before each deploy replaces it
       memory: 512                   # MB
       publish: ["3478:3478/udp"]    # on the node's public address
+      delegate_cgroups: true        # see "Process supervisors"
+      backup: { before: ./api freeze, after: ./api thaw }
 ```
 
 The same settings can be set from facade instead (`facade stack service update`, or a
@@ -430,6 +479,18 @@ database and master key. They are on the server's disk: take copies elsewhere wi
 the key to its secrets, in one file). `facade backup run [app]` backs up now and
 `facade backup restore <app> <volume> <id>` puts a backup back. A failed backup is
 an alert.
+
+Pausing captures files at one instant, which is not enough for a program that
+keeps part of its state in memory (a game server writing its world now and then).
+Such an app names commands run in its container around its backups:
+
+```sh
+facade app update world --backup-before "rcon-cli save-off && rcon-cli save-all flush" \
+  --backup-after "rcon-cli save-on"
+```
+
+`before` runs before its volumes are copied, and if it fails, nothing is copied;
+`after` runs once they are, whether the copy worked or not.
 
 ### Private registries
 
@@ -516,7 +577,8 @@ secrets still to set. Applying is idempotent and never deletes anything.
 ### Upgrading
 
 Servers and agents speak a versioned protocol; when it changes (it did with commit
-pinning and the build queue), upgrade `facaded` on the server and on every node.
+pinning and the build queue, then with stop settings, volume sizes and cgroup
+delegation), upgrade `facaded` on the server and on every node.
 
 ## Not there yet
 

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
+use facade_core::MAX_STOP_TIMEOUT;
 use facade_core::proto::{
     AgentEvent, AgentMsg, AgentRequest, Hello, MIN_AGENT_PROTOCOL, PROTOCOL_VERSION, ServerMsg,
 };
@@ -40,6 +41,21 @@ type Answer = Result<Option<serde_json::Value>, String>;
 pub struct NodeConn {
     tx: mpsc::Sender<ServerMsg>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
+}
+
+/// How long an agent may take to answer `req`. Removing or restarting an app
+/// waits for it to stop, which takes up to its stop timeout; commands and volume
+/// commands run in containers answer once they exit.
+fn answer_within(req: &AgentRequest) -> Duration {
+    match req {
+        AgentRequest::Remove { .. } | AgentRequest::Restart { .. } => {
+            REQUEST_TIMEOUT + Duration::from_secs(u64::from(MAX_STOP_TIMEOUT))
+        }
+        AgentRequest::Exec { timeout_secs, .. } => {
+            REQUEST_TIMEOUT + Duration::from_secs(u64::from(*timeout_secs))
+        }
+        _ => REQUEST_TIMEOUT,
+    }
 }
 
 impl Hub {
@@ -78,13 +94,14 @@ impl Hub {
             .connection(node)
             .ok_or_else(|| anyhow!("node {node} is offline"))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let within = answer_within(&req);
         let (tx, rx) = oneshot::channel();
         conn.pending.lock().insert(id, tx);
         if conn.tx.send(ServerMsg::Request { id, req }).await.is_err() {
             conn.pending.lock().remove(&id);
             bail!("node {node} disconnected");
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        match tokio::time::timeout(within, rx).await {
             Ok(Ok(Ok(data))) => Ok(data),
             Ok(Ok(Err(error))) => Err(anyhow!(error)),
             Ok(Err(_)) => Err(anyhow!("node {node} disconnected")),

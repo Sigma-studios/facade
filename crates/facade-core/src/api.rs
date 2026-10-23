@@ -459,6 +459,9 @@ pub struct VolumeView {
     pub app: String,
     pub volume: String,
     pub size: Option<u64>,
+    /// Bytes it may hold, for volumes with a size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
     pub in_use: bool,
     /// Still declared by the app's spec (on this node).
     pub declared: bool,

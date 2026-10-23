@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    AppSpec, Build, HealthCheck, Limits, PortMap, Source, SpecError, StackRef, Volume,
+    AppSpec, BackupSpec, Build, HealthCheck, Limits, PortMap, Source, SpecError, StackRef, Volume,
     validate_domain, validate_name,
 };
 
@@ -68,6 +68,15 @@ pub struct ServiceSpec {
     pub limits: Limits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthCheck>,
+    /// Compose's `stop_grace_period`, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate_cgroups: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<BackupSpec>,
 }
 
 impl ServiceSpec {
@@ -93,13 +102,20 @@ impl ServiceSpec {
             ports,
             volumes,
             depends_on,
-            healthcheck
+            healthcheck,
+            stop_timeout_secs,
+            stop_signal,
+            delegate_cgroups,
+            backup
         );
         if self.limits.memory_mb.is_some() {
             out.limits.memory_mb = self.limits.memory_mb;
         }
         if self.limits.cpus.is_some() {
             out.limits.cpus = self.limits.cpus;
+        }
+        if self.limits.pids.is_some() {
+            out.limits.pids = self.limits.pids;
         }
         out
     }
@@ -172,6 +188,7 @@ impl ServiceSpec {
             tls_ports: vec![],
             host_network: false,
             limits: self.limits.clone(),
+            delegate_cgroups: self.delegate_cgroups.unwrap_or(false),
             enabled,
             command: self.command.clone().unwrap_or_default(),
             release_command: self
@@ -185,6 +202,9 @@ impl ServiceSpec {
                 host: host.to_string(),
             }),
             healthcheck: self.healthcheck.clone(),
+            stop_timeout_secs: self.stop_timeout_secs,
+            stop_signal: self.stop_signal.clone(),
+            backup: self.backup.clone(),
         };
         spec.validate()
             .map_err(|e| SpecError(format!("service {service}: {}", e.0)))?;
