@@ -605,6 +605,16 @@ enum ServerCommand {
         #[arg(long)]
         direct_api_open: bool,
     },
+    /// Update facade to the latest build of its main branch: the server
+    /// downloads it, says which apps it would restart, installs it after a yes
+    /// and rolls back if it does not come up. Other nodes follow by themselves.
+    Update {
+        /// Only show what is published and which commits it brings.
+        #[arg(long)]
+        check: bool,
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1217,6 +1227,145 @@ fn confirm(question: &str) -> anyhow::Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
+/// `facade server update`.
+async fn update_server(api: &Api, check: bool, yes: bool, json: bool) -> anyhow::Result<()> {
+    let short = |h: &str| h.get(..7).unwrap_or(h).to_string();
+    let status: ServerUpdate = api
+        .json(api.request(Method::POST, "/api/server-update/check"))
+        .await?;
+    if json && (check || !status.available) {
+        return print_json(&status);
+    }
+    if let Some(e) = &status.check_error {
+        bail!("checking {} for a new build: {e}", status.repository);
+    }
+    let Some(latest) = status.latest.clone() else {
+        bail!("{} has no published build", status.repository);
+    };
+    let running = match &status.current.commit {
+        Some(c) => short(c),
+        None => "a build without a commit".into(),
+    };
+    println!("running:    {running} (facade {})", status.current.version);
+    println!(
+        "published:  {} {}  ({})",
+        short(&latest.commit),
+        latest.subject,
+        output::ago(latest.time)
+    );
+    if let Some(run) = &status.run {
+        let state = match run.state {
+            UpdateState::Running => "in progress",
+            UpdateState::Done => "done",
+            UpdateState::RolledBack => "rolled back",
+            UpdateState::Failed => "failed",
+        };
+        println!(
+            "last update: to {} {state} ({}): {}",
+            short(&run.to),
+            output::ago(run.started),
+            run.message.lines().next().unwrap_or_default()
+        );
+    }
+    for node in &status.nodes {
+        match node.state {
+            NodeBuildState::Current => {}
+            NodeBuildState::Updating => {
+                println!("node {}: updates itself when it connects", node.name)
+            }
+            NodeBuildState::Manual => println!(
+                "node {}: runs another build, and the server has none for its CPU ({}): update it by hand",
+                node.name,
+                node.arch.as_deref().unwrap_or("unknown")
+            ),
+            NodeBuildState::Unknown => println!("node {}: build unknown", node.name),
+        }
+    }
+    if !status.available {
+        println!("up to date");
+        return Ok(());
+    }
+    if !status.commits.is_empty() {
+        println!("new commits:");
+        for c in &status.commits {
+            println!(
+                "  {} {}  ({}, {})",
+                short(&c.hash),
+                c.subject,
+                c.author,
+                output::ago(c.time)
+            );
+        }
+    }
+    if check {
+        println!("install it with `facade server update`");
+        return Ok(());
+    }
+
+    eprintln!("downloading and checking {}…", short(&latest.commit));
+    let target = UpdateTarget {
+        commit: latest.commit.clone(),
+    };
+    let status: ServerUpdate = api
+        .json(
+            api.request(Method::POST, "/api/server-update/prepare")
+                .json(&target),
+        )
+        .await?;
+    let plan = status.prepared.map(|p| p.plan).unwrap_or_default();
+    let mut affected = 0;
+    for change in &plan {
+        let what = match change.change {
+            AppChange::Restart => "restarts (its container is recreated, a few seconds down)",
+            AppChange::Rebuild => "is rebuilt at its deployed commit (or pulled), then restarts",
+            AppChange::Unchanged | AppChange::NotRunning => continue,
+        };
+        affected += 1;
+        println!("  {:<24} {what}", change.app);
+    }
+    if affected == 0 {
+        println!("no running app is restarted by this update");
+    }
+    if !yes && !confirm("Install it?")? {
+        bail!("aborted");
+    }
+    let _: ServerUpdate = api
+        .json(
+            api.request(Method::POST, "/api/server-update/install")
+                .json(&target),
+        )
+        .await?;
+    eprintln!("installing; the server restarts…");
+
+    // The server goes away for a few seconds: keep asking.
+    let mut said = String::new();
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let Ok(status) = api.get::<ServerUpdate>("/api/server-update").await else {
+            continue;
+        };
+        let Some(run) = status.run.clone() else {
+            continue;
+        };
+        if run.message != said {
+            eprintln!("  {}", run.message);
+            said = run.message.clone();
+        }
+        match run.state {
+            UpdateState::Running => {}
+            UpdateState::Done => {
+                if json {
+                    return print_json(&status);
+                }
+                println!("facade is now at {}", short(&run.to));
+                return Ok(());
+            }
+            UpdateState::RolledBack | UpdateState::Failed => bail!("the update did not go through"),
+        }
+    }
+    bail!("the update is still running after 5 minutes: see `facade server update --check`")
+}
+
 async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()> {
     match command {
         Command::Login { .. } => unreachable!(),
@@ -1531,9 +1680,13 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 println!("change your password: facade passwd");
             }
         }
+        Command::Server {
+            action: Some(ServerCommand::Update { check, yes }),
+        } => update_server(api, check, yes, json).await?,
         Command::Server { action } => {
             let settings: ServerSettings = match action {
                 None => api.get("/api/server-settings").await?,
+                Some(ServerCommand::Update { .. }) => unreachable!(),
                 Some(ServerCommand::Set {
                     api_domain,
                     acme_email,

@@ -1,5 +1,6 @@
-//! The running `facaded` executable: a fingerprint to tell builds apart, and the
-//! path it is installed at (where an update puts the next one).
+//! The running `facaded` executable: a fingerprint to tell builds apart, the
+//! commit it was built from, and the path it is installed at (where an update
+//! puts the next one).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -9,6 +10,25 @@ pub struct Binary {
     /// SHA-256 of the executable, hex.
     pub sha256: String,
     pub size: u64,
+}
+
+/// The commit this binary was built from: `FACADE_COMMIT` at build time, set by
+/// CI and by `deploy/build-linux.sh` for a clean checkout.
+pub fn commit() -> Option<&'static str> {
+    option_env!("FACADE_COMMIT").filter(|c| !c.is_empty())
+}
+
+/// `facaded --version`: the crate version, and the commit when known.
+pub fn version_line() -> &'static str {
+    static LINE: OnceLock<String> = OnceLock::new();
+    LINE.get_or_init(|| match commit() {
+        Some(c) => format!("{} ({})", env!("CARGO_PKG_VERSION"), short_commit(c)),
+        None => env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
+pub fn short_commit(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
 }
 
 /// The running executable, read once. `/proc/self/exe` still reads the running

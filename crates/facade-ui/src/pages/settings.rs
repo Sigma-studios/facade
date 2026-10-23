@@ -1,17 +1,19 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    ApplyReport, ChangePassword, CreateGitCredential, GitCredentialKind, GitCredentialView,
-    NewGitSecret, RegistryLoginView, ServerSettings, ServerSettingsUpdate, SetRegistryLogin,
+    AppChange, ApplyReport, ChangePassword, CreateGitCredential, GitCredentialKind,
+    GitCredentialView, NewGitSecret, NodeBuildState, RegistryLoginView, ServerSettings,
+    ServerSettingsUpdate, ServerUpdate, SetRegistryLogin, UpdateRun, UpdateState, UpdateTarget,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
 use leptos_router::hooks::use_navigate;
 
+use super::app::CommitRow;
 use crate::api;
 use crate::components::{CopyField, ErrorNote, Loading, Modal};
-use crate::util::{ago, download, me, polled, run, toasts};
+use crate::util::{ago, download, me, polled, run, short_hash, toasts};
 
 #[component]
 pub fn Settings() -> impl IntoView {
@@ -23,6 +25,7 @@ pub fn Settings() -> impl IntoView {
             <Password/>
             <Show when=move || me.is_admin()>
                 <ServerAccess/>
+                <Updates/>
             </Show>
             <GitAccess/>
             <RegistryLogins/>
@@ -250,6 +253,269 @@ fn ServerAccess() -> impl IntoView {
             </div>
         </Modal>
     }
+}
+
+/// façade's own build, and updating it to the latest build of its main branch.
+#[component]
+fn Updates() -> impl IntoView {
+    let status = polled(Some(Duration::from_secs(5)), || async {
+        api::get::<ServerUpdate>("/api/server-update").await
+    });
+    // The build this page was loaded from: after an update, a reload brings the
+    // new web UI.
+    let first_seen = StoredValue::new(None::<Option<String>>);
+    Effect::new(move |_| {
+        if first_seen.get_value().is_none()
+            && let Some(s) = status.data.get()
+        {
+            first_seen.set_value(Some(s.current.commit));
+        }
+    });
+    let current = move || status.data.get();
+    let updating = move || {
+        current()
+            .and_then(|s| s.run)
+            .is_some_and(|r| r.state == UpdateState::Running)
+    };
+    let reload_needed = move || {
+        let now = current().map(|s| s.current.commit);
+        matches!((first_seen.get_value(), now), (Some(a), Some(b)) if a != b)
+    };
+    let repo = move || current().map(|s| s.repository).unwrap_or_default();
+    let commit_link = move |hash: String| {
+        let short = short_hash(&hash).to_string();
+        view! {
+            <a href=format!("https://github.com/{}/commit/{hash}", repo()) target="_blank"
+                rel="noreferrer"><code>{short}</code></a>
+        }
+    };
+
+    let checking = RwSignal::new(false);
+    let check = move |_| {
+        checking.set(true);
+        spawn_local(async move {
+            match api::act_json::<ServerUpdate>("/api/server-update/check").await {
+                Ok(s) => {
+                    if let Some(e) = &s.check_error {
+                        toasts().err(e.clone());
+                    } else if !s.available {
+                        toasts().ok("façade is up to date");
+                    }
+                    status.data.try_set(Some(s));
+                }
+                Err(e) => toasts().err(e),
+            }
+            checking.try_set(false);
+        });
+    };
+
+    // Preparing (download and check) happens when the dialog opens.
+    let dialog = RwSignal::new(false);
+    let preparing = RwSignal::new(false);
+    let prepare_error = RwSignal::new(None::<String>);
+    let target = move || current().and_then(|s| s.latest).map(|l| l.commit);
+    let open_dialog = move |_| {
+        let Some(commit) = target() else { return };
+        dialog.set(true);
+        preparing.set(true);
+        prepare_error.set(None);
+        spawn_local(async move {
+            let body = UpdateTarget { commit };
+            match api::post::<_, ServerUpdate>("/api/server-update/prepare", &body).await {
+                Ok(s) => {
+                    status.data.try_set(Some(s));
+                }
+                Err(e) => {
+                    prepare_error.try_set(Some(e));
+                }
+            }
+            preparing.try_set(false);
+        });
+    };
+    let prepared = move || {
+        current()
+            .and_then(|s| s.prepared)
+            .filter(|p| Some(&p.commit) == target().as_ref())
+    };
+    let installing = RwSignal::new(false);
+    let install = move |_| {
+        let Some(commit) = target() else { return };
+        installing.set(true);
+        spawn_local(async move {
+            let body = UpdateTarget { commit };
+            match api::post::<_, ServerUpdate>("/api/server-update/install", &body).await {
+                Ok(s) => {
+                    status.data.try_set(Some(s));
+                    dialog.try_set(false);
+                    toasts().ok("Updating: façade restarts in a moment");
+                }
+                Err(e) => {
+                    prepare_error.try_set(Some(e));
+                }
+            }
+            installing.try_set(false);
+        });
+    };
+
+    view! {
+        <section class="card form">
+            <h2 class="section-title">"Updates"</h2>
+            // The server is away for a few seconds while it restarts.
+            <Show when=move || !updating()>
+                <ErrorNote error=status.error/>
+            </Show>
+            <Show when=reload_needed>
+                <div class="note">
+                    "façade was updated. "
+                    <button class="button" on:click=|_| {
+                        if let Some(w) = web_sys::window() {
+                            let _ = w.location().reload();
+                        }
+                    }>"Reload the page"</button>
+                    " for the new web UI."
+                </div>
+            </Show>
+            <Show when=move || status.loaded() fallback=Loading>
+                <div class="field">
+                    <span>"Running"</span>
+                    <p class="small">
+                        {move || current().map(|s| {
+                            let build = format!(" · façade {} on {}", s.current.version, s.current.arch);
+                            match s.current.commit {
+                                Some(c) => view! { {commit_link(c)} {build} }.into_any(),
+                                None => view! { "a build without a commit (built by hand)" {build} }.into_any(),
+                            }
+                        })}
+                    </p>
+                </div>
+                <div class="field">
+                    <span>"Latest build of main"</span>
+                    {move || current().map(|s| match (s.latest, s.check_error) {
+                        (_, Some(e)) => view! { <div class="note note-error">{e}</div> }.into_any(),
+                        (None, None) => view! { <p class="small muted">"Not checked yet."</p> }.into_any(),
+                        (Some(l), None) => view! {
+                            <p class="small">
+                                {commit_link(l.commit.clone())}
+                                {format!(" {} · {}", l.subject, ago(l.time))}
+                                {(!s.available).then_some(" (running)")}
+                            </p>
+                        }.into_any(),
+                    })}
+                    <small>
+                        {move || current().and_then(|s| s.checked_at)
+                            .map(|t| format!("Checked {} on github.com/{}.", ago(t), repo()))}
+                    </small>
+                    {move || current().filter(|s| s.available && !s.commits.is_empty()).map(|s| view! {
+                        <div class="muted small">
+                            {format!("{} new commit{}:", s.commits.len(), if s.commits.len() == 1 { "" } else { "s" })}
+                        </div>
+                        <ul class="commit-list">
+                            {s.commits.into_iter().map(|c| view! { <CommitRow c=c/> }).collect_view()}
+                        </ul>
+                    })}
+                </div>
+                {move || current().and_then(|s| s.run).map(|r| view! { <RunNote run=r/> })}
+                {move || {
+                    let nodes: Vec<_> = current()
+                        .map(|s| s.nodes.into_iter().filter(|n| n.state != NodeBuildState::Current).collect())
+                        .unwrap_or_default();
+                    (!nodes.is_empty()).then(|| view! {
+                        <div class="field">
+                            <span>"Nodes"</span>
+                            <ul class="access-list small">
+                                {nodes.into_iter().map(|n| {
+                                    let what = match n.state {
+                                        NodeBuildState::Updating => "runs another build; updates itself when it connects".to_string(),
+                                        NodeBuildState::Manual => format!(
+                                            "runs another build, and the server has none for its CPU ({}): update it by hand",
+                                            n.arch.as_deref().unwrap_or("unknown")
+                                        ),
+                                        _ => "has not said which build it runs".to_string(),
+                                    };
+                                    view! { <li><span>{n.name}</span><span class="muted">{what}</span></li> }
+                                }).collect_view()}
+                            </ul>
+                        </div>
+                    })
+                }}
+                <div class="form-actions push-left">
+                    <button class="button" disabled=move || checking.get() || updating()
+                        on:click=check>
+                        {move || if checking.get() { "Checking…" } else { "Check now" }}
+                    </button>
+                    <Show when=move || current().is_some_and(|s| s.available)>
+                        <button class="button button-primary" disabled=updating on:click=open_dialog>
+                            {move || format!("Update to {}…", target().map(|c| short_hash(&c).to_string()).unwrap_or_default())}
+                        </button>
+                    </Show>
+                </div>
+            </Show>
+        </section>
+
+        <Modal open=dialog title="Update façade">
+            <Show when=move || !preparing.get()
+                fallback=|| view! { <p>"Downloading the new build and checking what it changes…"</p> }>
+                <ErrorNote error=prepare_error/>
+                {move || prepared().map(|p| {
+                    let affected: Vec<_> = p.plan.into_iter()
+                        .filter(|c| matches!(c.change, AppChange::Restart | AppChange::Rebuild))
+                        .collect();
+                    if affected.is_empty() {
+                        view! { <p>"No running app is restarted by this update."</p> }.into_any()
+                    } else {
+                        view! {
+                            <p>"These apps on the server's node restart with it:"</p>
+                            <ul class="access-list small">
+                                {affected.into_iter().map(|c| view! {
+                                    <li>
+                                        <span>{c.app}</span>
+                                        <span class="muted">{match c.change {
+                                            AppChange::Rebuild => "rebuilt at its deployed commit, then restarted",
+                                            _ => "container recreated (a few seconds down)",
+                                        }}</span>
+                                    </li>
+                                }).collect_view()}
+                            </ul>
+                        }.into_any()
+                    }
+                })}
+                <p class="small muted">
+                    "façade restarts and the web UI is away for a few seconds; apps keep running. \
+                     If the new version is not healthy within 90 seconds, the previous one comes back. \
+                     Other nodes update themselves."
+                </p>
+            </Show>
+            <div class="form-actions">
+                <button class="button" on:click=move |_| dialog.set(false)>"Cancel"</button>
+                <button class="button button-primary"
+                    disabled=move || preparing.get() || installing.get() || prepared().is_none()
+                    on:click=install>"Install"</button>
+            </div>
+        </Modal>
+    }
+}
+
+/// The update in progress, or how the last one ended.
+#[component]
+fn RunNote(run: UpdateRun) -> impl IntoView {
+    let to = short_hash(&run.to).to_string();
+    let when = run.finished.map(ago).unwrap_or_default();
+    let (class, text) = match run.state {
+        UpdateState::Running => ("note", format!("Updating to {to}: {}…", run.message)),
+        UpdateState::Done => ("note", format!("Updated to {to} {when}.")),
+        UpdateState::RolledBack => (
+            "note note-error",
+            format!(
+                "The update to {to} ({when}) was rolled back: {}",
+                run.message
+            ),
+        ),
+        UpdateState::Failed => (
+            "note note-error",
+            format!("The update to {to} ({when}) failed: {}", run.message),
+        ),
+    };
+    view! { <div class=class>{text}</div> }
 }
 
 /// Logins for private container registries.

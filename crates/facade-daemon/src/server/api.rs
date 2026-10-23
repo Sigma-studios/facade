@@ -44,6 +44,16 @@ pub fn router(server: Arc<Server>) -> Router {
             "/api/server-settings",
             get(server_settings).put(update_server_settings),
         )
+        .route("/api/server-update", get(super::release::status))
+        .route("/api/server-update/check", post(super::release::check_now))
+        .route(
+            "/api/server-update/prepare",
+            post(super::release::prepare_now),
+        )
+        .route(
+            "/api/server-update/install",
+            post(super::release::install_now),
+        )
         .route("/api/status", get(status))
         .route("/api/alerts", get(alerts))
         .route("/api/alerts/test", post(test_alert))

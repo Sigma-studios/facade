@@ -10,6 +10,7 @@ mod git;
 mod hub;
 mod inspect;
 mod monitor;
+mod release;
 pub mod secrets;
 mod settings;
 mod stack;
@@ -66,6 +67,8 @@ pub struct Server {
     pub settings: settings::SettingsCell,
     /// Last binary sent to each node to update its agent, and when.
     pub upgrade_attempts: parking_lot::Mutex<HashMap<String, (String, u64)>>,
+    /// Published builds of facade itself (Settings → Updates).
+    pub releases: release::Releases,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -87,6 +90,10 @@ pub struct NodeLive {
     /// Listening sockets, from the last report.
     pub listeners: Vec<Listener>,
     pub ingress_errors: Vec<String>,
+    /// SHA-256 of the facaded its agent runs, and its CPU architecture, as said
+    /// when it last connected.
+    pub binary: Option<String>,
+    pub arch: Option<String>,
 }
 
 pub struct AppLive {
@@ -511,6 +518,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         backup_errors: Default::default(),
         settings,
         upgrade_attempts: Default::default(),
+        releases: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -557,6 +565,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tasks.spawn(monitor::run(server.clone()));
     tasks.spawn(artifacts::collect_garbage(server.clone()));
     tasks.spawn(backups::run(server.clone()));
+    tokio::spawn(release::check_regularly(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
     let ingress = match server.cfg.ingress {

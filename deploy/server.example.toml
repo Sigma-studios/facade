@@ -27,6 +27,13 @@ public_host = "203.0.113.10"
 # every_hours = 24
 # keep = 7
 
+# Where Settings → Updates and `facade server update` get new builds of facade:
+# a GitHub release that CI replaces with every build of main.
+# [update]
+# repository = "Sigma-studios/facade"
+# release = "edge"
+# url = "https://mirror.example.com/facade"   # the release's files elsewhere
+
 [acme]
 # enabled = true
 email = "you@example.com"

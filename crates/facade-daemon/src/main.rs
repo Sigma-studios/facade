@@ -24,7 +24,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "facaded", version, about = "facade daemon")]
+#[command(name = "facaded", version = selfbin::version_line(), about = "facade daemon")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -97,6 +97,21 @@ enum Command {
         #[arg(long, short, default_value = "/etc/facade/server.toml")]
         config: PathBuf,
     },
+    /// Install a release folder (this binary, `facade`, the systemd units) on
+    /// the server and restart it, going back to the previous binary if the new
+    /// one is not healthy within 90 s. Run as root by deploy/upgrade.sh, and by
+    /// the server when updating itself.
+    ApplyUpdate {
+        /// The release folder.
+        stage: PathBuf,
+        #[arg(long, short, default_value = "/etc/facade/server.toml")]
+        config: PathBuf,
+        #[arg(long, default_value = "/usr/local/bin")]
+        bin_dir: PathBuf,
+        /// The commit being replaced, for the record.
+        #[arg(long)]
+        from: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -116,6 +131,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::BackupState { config } => {
             upgrade::backup_state(&config::ServerConfig::load(&config)?)
+        }
+        Command::ApplyUpdate {
+            stage,
+            config,
+            bin_dir,
+            from,
+        } => {
+            let options = upgrade::ApplyOptions {
+                stage,
+                bin_dir,
+                from,
+            };
+            upgrade::apply(&config::ServerConfig::load(&config)?, options).await
         }
         Command::Server { config } => {
             let config = config::ServerConfig::load(&config)?;

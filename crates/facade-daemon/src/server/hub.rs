@@ -349,13 +349,13 @@ async fn control(
     server
         .store
         .node_connected(&node, &hostname, &peer.ip().to_string(), &agent_version)?;
-    server
-        .live
-        .write()
-        .nodes
-        .entry(node.clone())
-        .or_default()
-        .offline_since = None;
+    {
+        let mut live = server.live.write();
+        let entry = live.nodes.entry(node.clone()).or_default();
+        entry.offline_since = None;
+        entry.binary = binary.clone();
+        entry.arch = arch.clone();
+    }
     info!(%node, %peer, %hostname, "node connected");
 
     // Full desired state first, so a reconnecting agent converges.
@@ -440,8 +440,9 @@ async fn control(
 }
 
 /// Agents run the server's build: one running another is sent the server's
-/// binary (at most once per build and node every ten minutes, so an agent that
-/// cannot install it is not asked in a loop).
+/// binary, or for another CPU the published one of the same commit when the
+/// server downloaded it (at most once per build and node every ten minutes, so
+/// an agent that cannot install it is not asked in a loop).
 async fn offer_upgrade(server: &Server, node: &str, binary: Option<&str>, arch: Option<&str>) {
     let Some(own) = crate::selfbin::current() else {
         return;
@@ -449,35 +450,44 @@ async fn offer_upgrade(server: &Server, node: &str, binary: Option<&str>, arch: 
     if node == server.cfg.local_node || binary == Some(own.sha256.as_str()) {
         return;
     }
-    if arch != Some(std::env::consts::ARCH) {
-        warn!(
-            %node,
-            "runs another build of facaded on {}, and this server's binary is for {}: update it by hand",
-            arch.unwrap_or("an unknown CPU"),
-            std::env::consts::ARCH
-        );
+    let target = if arch == Some(std::env::consts::ARCH) {
+        own.sha256.clone()
+    } else {
+        match arch.and_then(|a| super::release::binary_for(server, a)) {
+            Some((sha, _)) => sha,
+            None => {
+                warn!(
+                    %node,
+                    "runs another build of facaded on {}, and this server only has its own, for {}: \
+                     update it by hand, or update the server from a published build",
+                    arch.unwrap_or("an unknown CPU"),
+                    std::env::consts::ARCH
+                );
+                return;
+            }
+        }
+    };
+    if binary == Some(target.as_str()) {
         return;
     }
     {
         let now = facade_core::now();
         let mut attempts = server.upgrade_attempts.lock();
         if let Some((sha, at)) = attempts.get(node)
-            && *sha == own.sha256
+            && *sha == target
             && now.saturating_sub(*at) < 600
         {
             return;
         }
-        attempts.insert(node.to_string(), (own.sha256.clone(), now));
+        attempts.insert(node.to_string(), (target.clone(), now));
     }
     info!(
         %node,
         from = binary.map(crate::selfbin::short).unwrap_or("unknown"),
-        to = crate::selfbin::short(&own.sha256),
-        "sending the node this server's facaded"
+        to = crate::selfbin::short(&target),
+        "sending the node this server's build of facaded"
     );
-    let request = AgentRequest::Upgrade {
-        sha256: own.sha256.clone(),
-    };
+    let request = AgentRequest::Upgrade { sha256: target };
     if let Err(e) = server.hub.request(node, request).await {
         warn!(%node, "updating its agent: {e:#}");
     }
@@ -499,6 +509,14 @@ async fn send_artifact(
         stream
             .write_all(format!("ok {}\n", own.size).as_bytes())
             .await?;
+        tokio::io::copy(&mut file, &mut stream).await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+    if let Some(path) = super::release::binary_with_sha(server, sha256) {
+        let mut file = tokio::fs::File::open(path).await?;
+        let size = file.metadata().await?.len();
+        stream.write_all(format!("ok {size}\n").as_bytes()).await?;
         tokio::io::copy(&mut file, &mut stream).await?;
         stream.shutdown().await?;
         return Ok(());

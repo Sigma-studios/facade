@@ -1,0 +1,163 @@
+# Tests every push and pull request. Every commit on main is also built for
+# x86_64 and aarch64 and published to the `edge` release, which servers update
+# from (Settings → Updates, `facade server update`):
+#
+#   facade-linux-<arch>.tar.gz   a facade/ folder: facaded, facade, install.sh, units
+#   manifest.json                the commit, and the SHA-256 of each tarball and of
+#                                the facaded inside (uploaded last)
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# On main, runs queue (a newer commit waiting replaces an older one waiting).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TRUNK_VERSION: 0.21.14
+  RELEASE: edge
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  ui:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install trunk
+        run: |
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v$TRUNK_VERSION/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin
+      - run: trunk build --release
+        working-directory: crates/facade-ui
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ui
+          path: crates/facade-ui/dist
+          if-no-files-found: error
+
+  build:
+    needs: ui
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            platform: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            platform: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: ui
+          path: crates/facade-ui/dist
+      - uses: actions/cache@v6
+        with:
+          path: .build-cache
+          key: musl-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: musl-${{ matrix.arch }}-
+      - name: Build
+        env:
+          FACADE_COMMIT: ${{ github.sha }}
+          FACADE_BUILD_CACHE: ${{ github.workspace }}/.build-cache
+        run: deploy/build-linux.sh ${{ matrix.platform }} --skip-ui
+      - name: Package
+        run: |
+          mkdir -p package/facade
+          cp dist/${{ matrix.platform }}/* package/facade/
+          tar -C package -czf facade-linux-${{ matrix.arch }}.tar.gz facade
+          package/facade/facaded --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.arch }}
+          path: facade-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [test, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: assets
+      - name: Check that main has not moved on
+        id: head
+        run: |
+          head=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [[ $head != "$GITHUB_SHA" ]]; then
+            echo "main is at $head now: its own run publishes it"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Write the manifest
+        if: steps.head.outputs.skip != 'true'
+        run: |
+          builds='{}'
+          for tarball in assets/facade-linux-*.tar.gz; do
+            file=$(basename "$tarball")
+            arch=${file#facade-linux-}
+            arch=${arch%.tar.gz}
+            sha=$(sha256sum "$tarball" | cut -d' ' -f1)
+            facaded_sha=$(tar -xzOf "$tarball" facade/facaded | sha256sum | cut -d' ' -f1)
+            builds=$(jq -c --arg a "$arch" --arg f "$file" --arg s "$sha" --arg d "$facaded_sha" \
+              '. + {($a): {file: $f, sha256: $s, facaded_sha256: $d}}' <<<"$builds")
+          done
+          jq -n --arg c "$GITHUB_SHA" --arg s "$(git log -1 --format=%s)" \
+            --argjson t "$(git log -1 --format=%ct)" --argjson b "$builds" \
+            '{commit: $c, subject: $s, time: $t, builds: $b}' > assets/manifest.json
+          cat assets/manifest.json
+      - name: Publish
+        if: steps.head.outputs.skip != 'true'
+        run: |
+          git tag -f "$RELEASE" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$RELEASE"
+          if ! gh release view "$RELEASE" >/dev/null 2>&1; then
+            gh release create "$RELEASE" --prerelease --verify-tag \
+              --title "Latest build of main" --notes "Being published…"
+          fi
+          # The tarballs first: servers trust the manifest, uploaded last, and
+          # check the tarballs against it.
+          gh release upload "$RELEASE" assets/*.tar.gz --clobber
+          gh release upload "$RELEASE" assets/manifest.json --clobber
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE"
+          gh release edit "$RELEASE" --notes "$(cat <<NOTES
+          Built from $GITHUB_SHA: $(git log -1 --format=%s)
+
+          Replaced with every commit on main. Update a running server from **Settings → Updates** in the web UI, or with \`facade server update\`.
+
+          Install on a new server (x86_64; \`aarch64\` for ARM):
+
+          \`\`\`sh
+          curl -fsSL $base/facade-linux-x86_64.tar.gz | tar -xz
+          sudo facade/install.sh server PUBLIC_IP --domain facade.example.com --email you@example.com
+          \`\`\`
+          NOTES
+          )"
