@@ -22,7 +22,7 @@ use bollard::query_parameters::{
     RemoveVolumeOptions, RestartContainerOptions, StartContainerOptions, StatsOptions,
     StopContainerOptions, WaitContainerOptions,
 };
-use facade_core::proto::{AppState, AppStats, JoinToken, VolumeUsage, Workload};
+use facade_core::proto::{AppDisk, AppState, AppStats, JoinToken, VolumeUsage, Workload};
 use facade_core::{Build, DEFAULT_PIDS, MAX_STOP_TIMEOUT, Protocol, Source};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -70,6 +70,39 @@ fn network(app: &str) -> String {
 /// A stack's network. The dot keeps it apart from app networks.
 fn stack_network(stack: &str) -> String {
     format!("facade.{stack}")
+}
+
+/// Space the files under `path` take on disk, like `du -x`: other filesystems
+/// mounted inside (sized volumes) and the paths in `skip` are left out.
+pub async fn dir_size(path: PathBuf, skip: Vec<PathBuf>) -> u64 {
+    fn walk(path: &std::path::Path, dev: u64, skip: &[PathBuf]) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if meta.dev() != dev || skip.iter().any(|s| s == path) {
+            return 0;
+        }
+        let mut size = meta.blocks() * 512;
+        if meta.is_dir()
+            && let Ok(entries) = std::fs::read_dir(path)
+        {
+            size += entries
+                .flatten()
+                .map(|e| walk(&e.path(), dev, skip))
+                .sum::<u64>();
+        }
+        size
+    }
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(root) = std::fs::symlink_metadata(&path) else {
+            return 0;
+        };
+        walk(&path, root.dev(), &skip)
+    })
+    .await
+    .unwrap_or(0)
 }
 
 fn image_repo(app: &str) -> String {
@@ -235,6 +268,12 @@ impl Runtime {
             u64::from(MAX_STOP_TIMEOUT) + 60,
         ));
         docker
+    }
+
+    /// Where sized volumes keep their filesystems: volume data, which Docker
+    /// reports with the volumes.
+    pub fn sized_volumes_dir(&self) -> PathBuf {
+        self.0.dir.join("volumes")
     }
 
     fn static_dir(&self, app: &str) -> PathBuf {
@@ -1646,6 +1685,73 @@ impl Runtime {
             .into_iter()
             .filter_map(|c| Some((c.labels?.get(LABEL_APP)?.clone(), c.image?)))
             .collect()
+    }
+
+    /// Each app's images, what its container wrote and its static files. Asks
+    /// Docker to size every container's writable layer, so it is not cheap.
+    pub async fn app_disk(&self) -> anyhow::Result<Vec<AppDisk>> {
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![
+                LABEL_APP.to_string(),
+                format!("{LABEL_NODE}={}", self.0.token.node),
+            ],
+        )]);
+        let containers = self
+            .docker()
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                size: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await?;
+        let images = self
+            .docker()
+            .list_images(Some(ListImagesOptions {
+                shared_size: true,
+                ..Default::default()
+            }))
+            .await?;
+        let mut apps: HashMap<String, AppDisk> = HashMap::new();
+        let mut running: HashMap<String, String> = HashMap::new();
+        for c in containers {
+            let Some(app) = c.labels.and_then(|mut l| l.remove(LABEL_APP)) else {
+                continue;
+            };
+            let disk = apps.entry(app.clone()).or_default();
+            disk.written += c.size_rw.unwrap_or(0).max(0) as u64;
+            if let Some(id) = c.image_id {
+                running.insert(app, id);
+            }
+        }
+        // The running image counts whole; the others only for the layers they
+        // alone hold.
+        for (app, disk) in &mut apps {
+            let repo = format!("{}:", image_repo(app));
+            let current = running.get(app);
+            for image in &images {
+                if current == Some(&image.id) {
+                    disk.images += image.size.max(0) as u64;
+                } else if image.repo_tags.iter().any(|t| t.starts_with(&repo)) {
+                    disk.images += (image.size - image.shared_size.max(0)).max(0) as u64;
+                    disk.rollback_images += 1;
+                }
+            }
+        }
+        let mut dirs = tokio::fs::read_dir(self.0.dir.join("static")).await?;
+        while let Some(entry) = dirs.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with('.') {
+                apps.entry(name).or_default().files = dir_size(entry.path(), vec![]).await;
+            }
+        }
+        let mut list: Vec<AppDisk> = apps
+            .into_iter()
+            .map(|(app, disk)| AppDisk { app, ..disk })
+            .collect();
+        list.sort_by(|a, b| a.app.cmp(&b.app));
+        Ok(list)
     }
 
     /// Apps with a managed container or static directory on this node.

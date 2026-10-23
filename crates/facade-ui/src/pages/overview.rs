@@ -31,7 +31,6 @@ pub fn Overview() -> impl IntoView {
         <div class="page">
             <header class="page-head">
                 <h1>"Overview"</h1>
-                <A href="/apps/new" attr:class="button button-primary">"New app"</A>
             </header>
             <ErrorNote error=status.error/>
             <Show when=move || me.memory_cap().is_some() || me.cpu_cap().is_some()>
@@ -74,7 +73,12 @@ pub fn Overview() -> impl IntoView {
                     </div>
                 </section>
                 <section>
-                    <h2 class="section-title">"Apps"</h2>
+                    <div class="section-head">
+                        <h2 class="section-title">"Apps"</h2>
+                        <Show when=move || status.data.with(|s| s.as_ref().is_some_and(|s| !s.apps.is_empty()))>
+                            <A href="/apps/new" attr:class="button button-primary">"New app"</A>
+                        </Show>
+                    </div>
                     <AppsTable apps=Signal::derive(move || {
                         status.data.get().map(|s| s.apps).unwrap_or_default()
                     })/>

@@ -89,7 +89,35 @@ pub struct AppView {
     /// Other members who can manage it.
     #[serde(default)]
     pub access: Vec<String>,
+    /// From the node's last storage report (every 15 minutes).
+    #[serde(default)]
+    pub disk: Option<AppDiskView>,
 }
+
+/// What an app takes on its node's disk.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AppDiskView {
+    pub at: u64,
+    /// The image it runs, plus what the rollback images add.
+    pub images: u64,
+    pub rollback_images: u32,
+    /// Written inside the container, outside volumes: lost on redeploy.
+    pub written: u64,
+    /// Static site files.
+    pub files: u64,
+    /// Its volumes; a stack volume counts for each service mounting it.
+    pub volumes: u64,
+}
+
+impl AppDiskView {
+    pub fn total(&self) -> u64 {
+        self.images + self.written + self.files + self.volumes
+    }
+}
+
+/// Above this, what an app writes inside its container gets flagged: it belongs in
+/// a volume.
+pub const WRITTEN_WARNING: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvView {

@@ -16,6 +16,7 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use super::Agent;
+use super::runtime::dir_size;
 
 const CHECK_EVERY: Duration = Duration::from_secs(5 * 60);
 const ROUTINE_EVERY: Duration = Duration::from_secs(6 * 3600);
@@ -148,11 +149,21 @@ fn parse_size(s: &str) -> u64 {
     (n * factor) as u64
 }
 
-/// Sizes from `docker system df`, and this node's volumes.
+/// Sizes from `docker system df`, this node's volumes, each app's share, and
+/// facade's own files.
 pub async fn refresh_report(agent: &Agent) {
+    let (disk_used, disk_total) = disk_usage();
+    let facade_files = dir_size(
+        agent.files_dir.clone(),
+        vec![agent.runtime.sized_volumes_dir()],
+    )
+    .await;
     let mut report = StorageReport {
         at: facade_core::now(),
         last_cleanup: agent.last_cleanup.lock().clone(),
+        disk_used,
+        disk_total,
+        facade_files,
         ..Default::default()
     };
     if let Ok(out) = Command::new("docker")
@@ -168,6 +179,8 @@ pub async fn refresh_report(agent: &Agent) {
             let field = |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("");
             match field("Type") {
                 "Images" => report.images = parse_size(field("Size")),
+                "Containers" => report.containers = parse_size(field("Size")),
+                "Local Volumes" => report.volumes_size = parse_size(field("Size")),
                 "Build Cache" => {
                     report.build_cache = parse_size(field("Size"));
                     report.build_cache_reclaimable = parse_size(field("Reclaimable"));
@@ -197,6 +210,10 @@ pub async fn refresh_report(agent: &Agent) {
             report.volumes = volumes;
         }
         Err(e) => warn!("listing volumes: {e:#}"),
+    }
+    match agent.runtime.app_disk().await {
+        Ok(apps) => report.apps = apps,
+        Err(e) => warn!("measuring apps: {e:#}"),
     }
     agent.set_storage(report);
 }

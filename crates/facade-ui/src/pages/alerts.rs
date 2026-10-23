@@ -19,7 +19,7 @@ pub fn Alerts() -> impl IntoView {
             <header class="page-head"><h1>"Alerts"</h1></header>
             <p class="muted lead">
                 "Raised when a problem lasts a minute: a node offline, an app crashed or failing to deploy, "
-                "disk ≥ 90 %, memory ≥ 95 %, or an app at its memory or CPU limit."
+                "disk ≥ 90 %, memory ≥ 95 %, an app at its memory or CPU limit, or an app writing over 100 MB inside its container (instead of a volume)."
             </p>
             <ErrorNote error=alerts.error/>
             <Show when=move || alerts.loaded() fallback=Loading>

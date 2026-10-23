@@ -297,7 +297,7 @@ pub enum AgentMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
-    Report(NodeReport),
+    Report(Box<NodeReport>),
     AppState {
         app: String,
         state: AppState,
@@ -412,7 +412,7 @@ pub struct Listener {
     pub app: Option<String>,
 }
 
-/// What Docker keeps on a node's disk, and the last cleanup.
+/// What Docker and facade keep on a node's disk, and the last cleanup.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StorageReport {
     pub at: u64,
@@ -420,8 +420,51 @@ pub struct StorageReport {
     pub build_cache: u64,
     /// Build cache Docker could drop right away.
     pub build_cache_reclaimable: u64,
+    /// What containers wrote outside their volumes.
+    #[serde(default)]
+    pub containers: u64,
+    /// Every Docker volume of the node, facade's or not.
+    #[serde(default)]
+    pub volumes_size: u64,
+    /// facade's own files: static sites, certificates, build folders (and on the
+    /// server's node, its database, uploads and backups). Sized volumes' files
+    /// are volume data, left to `volumes_size`.
+    #[serde(default)]
+    pub facade_files: u64,
+    /// The node's filesystem when the report was made, so the parts add up.
+    #[serde(default)]
+    pub disk_used: u64,
+    #[serde(default)]
+    pub disk_total: u64,
     pub volumes: Vec<VolumeUsage>,
+    /// Per app, what is not in volumes (those are listed above).
+    #[serde(default)]
+    pub apps: Vec<AppDisk>,
     pub last_cleanup: Option<Cleanup>,
+}
+
+impl StorageReport {
+    /// Used space neither Docker nor facade accounts for: the system, other
+    /// programs, logs.
+    pub fn other(&self) -> u64 {
+        self.disk_used.saturating_sub(
+            self.images + self.build_cache + self.containers + self.volumes_size + self.facade_files,
+        )
+    }
+}
+
+/// One app's footprint on its node, volumes aside.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AppDisk {
+    pub app: String,
+    /// The image it runs, plus what the images kept for rollbacks add to it.
+    pub images: u64,
+    /// Rollback images kept besides the running one.
+    pub rollback_images: u32,
+    /// Written inside the container, outside volumes: lost on redeploy.
+    pub written: u64,
+    /// Static site files.
+    pub files: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

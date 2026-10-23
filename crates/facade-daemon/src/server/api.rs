@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use facade_core::api::*;
 use facade_core::manifest::{AppManifest, EnvEntry, Manifest, NodeDecl};
-use facade_core::proto::{AgentRequest, AppState, Listener};
+use facade_core::proto::{AgentRequest, AppState, Listener, StorageReport};
 use facade_core::{AppSpec, PortMap, validate_name};
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -573,6 +573,11 @@ pub fn app_view(
     } else if !server.hub.is_connected(&spec.node) {
         state = AppState::Unknown;
     }
+    let disk = live
+        .nodes
+        .get(&spec.node)
+        .and_then(|n| n.storage.as_ref())
+        .map(|s| app_disk(s, &spec));
     AppView {
         state,
         message,
@@ -581,7 +586,29 @@ pub fn app_view(
         commit,
         owner,
         access,
+        disk,
         spec,
+    }
+}
+
+/// The app's share of its node's last storage report.
+pub fn app_disk(storage: &StorageReport, spec: &AppSpec) -> AppDiskView {
+    let own = storage.apps.iter().find(|a| a.app == spec.name);
+    let volumes = spec
+        .volumes
+        .iter()
+        .filter_map(|d| {
+            let name = spec.volume_name(d);
+            storage.volumes.iter().find(|v| v.name == name)?.size
+        })
+        .sum();
+    AppDiskView {
+        at: storage.at,
+        images: own.map_or(0, |a| a.images),
+        rollback_images: own.map_or(0, |a| a.rollback_images),
+        written: own.map_or(0, |a| a.written),
+        files: own.map_or(0, |a| a.files),
+        volumes,
     }
 }
 

@@ -9,7 +9,7 @@ use leptos_router::components::A;
 use super::overview::NodeCard;
 use crate::api;
 use crate::components::{CopyField, ErrorNote, Loading, Modal, UsageCharts};
-use crate::util::{ago, bytes, me, polled, run, toasts};
+use crate::util::{ago, bytes, me, percent, polled, run, toasts};
 
 /// The usage charts of one node, picked among them when there are several.
 #[component]
@@ -225,10 +225,16 @@ pub fn Nodes() -> impl IntoView {
                             let local = node.local;
                             let connected = node.connected;
                             let storage = node.storage.clone();
+                            let node_name = node.name.clone();
+                            let orphaned = Signal::derive(move || volumes.data.with(|v| {
+                                v.iter().flatten()
+                                    .filter(|v| v.node == node_name && !v.declared)
+                                    .fold((0, 0), |(n, size), v| (n + 1, size + v.size.unwrap_or(0)))
+                            }));
                             view! {
                                 <div class="node-wrap">
                                     <NodeCard node=node/>
-                                    {storage.map(|s| view! { <StorageLine storage=s/> })}
+                                    {storage.map(|s| view! { <StorageBreakdown storage=s orphaned/> })}
                                     <div class="card-actions">
                                         <Show when=move || connected && me.is_admin()>
                                             <button class="link-button" title="Remove dangling images and build cache unused for a week"
@@ -284,7 +290,7 @@ pub fn Nodes() -> impl IntoView {
                         on_pick=move |n| ports_node.set(Some(n))/>
                 </Show>
             </Show>
-            <section>
+            <section id="volumes">
                 <h2 class="section-title">"Volumes"</h2>
                 <Show when=move || volumes.data.with(|v| v.as_ref().is_some_and(|v| !v.is_empty()))
                     fallback=|| view! { <p class="muted small">"No volumes yet. Apps get one when their settings list it (databases have one)."</p> }>
@@ -492,9 +498,21 @@ fn Ports(
     }
 }
 
-/// Docker's share of the node's disk, and the last cleanup.
+/// What takes the node's disk, as one bar: Docker's parts, facade's files, the
+/// rest of the system, and what is free. Then orphaned volumes and the last cleanup.
 #[component]
-fn StorageLine(storage: StorageReport) -> impl IntoView {
+fn StorageBreakdown(storage: StorageReport, #[prop(into)] orphaned: Signal<(usize, u64)>) -> impl IntoView {
+    let total = storage.disk_total;
+    let share = move |n: u64| percent(n, total);
+    let parts = [
+        ("Images", storage.images, "disk-1", "Apps' images, and those kept for rollbacks"),
+        ("Build cache", storage.build_cache, "disk-2", "Reused by the next builds; cleanups trim it"),
+        ("Volumes", storage.volumes_size, "disk-3", "Apps' data"),
+        ("Containers", storage.containers, "disk-4", "Written inside containers, outside volumes: lost on redeploy"),
+        ("façade", storage.facade_files, "disk-5", "Static sites, certificates, build folders; on the server, its database, uploads and backups"),
+        ("Other", storage.other(), "disk-6", "The system, other programs, logs"),
+    ];
+    let free = total.saturating_sub(storage.disk_used);
     let cleanup = storage.last_cleanup.as_ref().map(|c| {
         format!(
             "{}cleaned {}, freed {}",
@@ -503,12 +521,45 @@ fn StorageLine(storage: StorageReport) -> impl IntoView {
             bytes(c.freed)
         )
     });
+    let reclaimable = storage.build_cache_reclaimable;
     view! {
-        <div class="storage-line small muted">
-            {format!("Images {} · build cache {}", bytes(storage.images), bytes(storage.build_cache))}
-            {(storage.build_cache_reclaimable > 0).then(|| format!(" ({} unused)", bytes(storage.build_cache_reclaimable)))}
-            {(!storage.volumes.is_empty()).then(|| format!(" · {} volume{}", storage.volumes.len(), if storage.volumes.len() == 1 { "" } else { "s" }))}
-            {cleanup.map(|c| view! { <br/>{c} })}
+        <div class="storage-line small">
+            {(total > 0).then(|| view! {
+                <div class="disk-bar" role="img"
+                    aria-label=format!("{} of {} used", bytes(storage.disk_used), bytes(total))>
+                    {parts.iter().filter(|p| p.1 > 0).map(|&(label, size, class, _)| view! {
+                        <div class=format!("disk-seg {class}")
+                            style=format!("width: {:.2}%", share(size))
+                            title=format!("{label}: {} ({:.0} %)", bytes(size), share(size))></div>
+                    }).collect_view()}
+                </div>
+            })}
+            <ul class="disk-legend">
+                {parts.iter().map(|&(label, size, class, hint)| view! {
+                    <li title=hint>
+                        <span class=format!("disk-swatch {class}") aria-hidden="true"></span>
+                        <span class="disk-name">{label}</span>
+                        <span class="disk-size">{bytes(size)}</span>
+                    </li>
+                }).collect_view()}
+                <li title="Space left on the node's disk">
+                    <span class="disk-swatch disk-free" aria-hidden="true"></span>
+                    <span class="disk-name">"Free"</span>
+                    <span class="disk-size">{bytes(free)}</span>
+                </li>
+            </ul>
+            <div class="muted">
+                {(reclaimable > 0).then(|| format!("{} of build cache unused for now. ", bytes(reclaimable)))}
+                {move || {
+                    let (count, size) = orphaned.get();
+                    (count > 0).then(|| view! {
+                        <a href="#volumes" class="disk-orphans">
+                            {format!("{count} orphaned volume{} ({}) no app declares. ", if count == 1 { "" } else { "s" }, bytes(size))}
+                        </a>
+                    })
+                }}
+                {cleanup}
+            </div>
         </div>
     }
 }

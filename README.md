@@ -297,7 +297,7 @@ template in `lang::generated_dockerfile`.
 | `facade stack service update shop api --domain … --port 8080` | a stack service's settings |
 | `facade git key` / `git token` / `git ls` | access to private repositories |
 | `facade registry login ghcr.io --user …` / `registry ls` / `registry rm` | private container registries |
-| `facade volume ls` / `export` / `import` / `rm` / `node prune` | volumes and disk space |
+| `facade volume ls` / `export` / `import` / `rm` / `node disk` / `node prune` | volumes and disk space |
 | `facade backup ls` / `run` / `get` / `restore` / `server` | backups |
 | `facade node ports <node>` | what listens on a node, and who holds each port |
 | `facade user add/ls/set/rm` / `app owner` / `app grant` / `whoami` | accounts and who manages what |
@@ -532,8 +532,13 @@ Builds leave cache behind and every deploy leaves an image. Each node cleans up 
 own: every 6 hours it removes dangling images and build cache unused for a week, and
 when its disk is 85 % full it also drops build cache unused for a day and the images
 kept for rollbacks (the two previous builds of each app), and at 90 % the whole build
-cache. `facade node prune <node> [--aggressive]` (or the Nodes page) does it now; the
-Nodes page shows images, build cache and volumes per node.
+cache. `facade node prune <node> [--aggressive]` (or the Nodes page) does it now.
+
+`facade node disk <node>` (or the Nodes page) breaks the disk down: images, build
+cache, volumes, what containers wrote, facade's own files, and the rest of the system;
+then each app's share. An app's Overview tab (and `facade app show`) shows its own.
+What an app writes inside its container, outside volumes, is lost on redeploy: past
+100 MB it raises an alert. Volumes no app declares any more are flagged as orphaned.
 
 ### Domains and HTTPS
 
@@ -663,7 +668,7 @@ facade alerts test
 
 A message is posted when a problem lasts a minute (node offline, app crashed or failed
 to deploy, disk ≥ 90 %, memory ≥ 95 %, app at its memory/CPU limit, entry point unable
-to bind its port, failed backup) and again when it clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
+to bind its port, failed backup, app writing over 100 MB inside its container) and again when it clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
 repeatable; copy ids with Discord's developer mode); resolutions tag nobody.
 `--no-mentions` turns tagging off. The webhook is stored encrypted on the server.
 

@@ -682,6 +682,8 @@ enum NodeCommand {
     Remove { name: String },
     /// CPU / memory / disk history (last hour).
     Metrics { name: String },
+    /// What takes the node's disk: Docker, facade, the rest, and each app.
+    Disk { name: String },
     /// Set the public IP domains of this node's apps point to (`auto` to detect it).
     Ip { name: String, ip: String },
     /// Every listening port on the node, and which program or app holds it.
@@ -3018,6 +3020,24 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
                 }),
             );
         }
+        NodeCommand::Disk { name } => {
+            let nodes: Vec<NodeView> = api.get("/api/nodes").await?;
+            let node = nodes
+                .into_iter()
+                .find(|n| n.name == name)
+                .with_context(|| format!("no node {name}"))?;
+            let mut apps: Vec<AppView> = api.get("/api/apps").await?;
+            apps.retain(|a| a.spec.node == name);
+            let mut volumes: Vec<VolumeView> = api.get("/api/volumes").await?;
+            volumes.retain(|v| v.node == name);
+            if json {
+                return print_json(&serde_json::json!({
+                    "storage": node.storage,
+                    "apps": apps.iter().map(|a| (&a.spec.name, &a.disk)).collect::<BTreeMap<_, _>>(),
+                }));
+            }
+            print_disk(&node, &apps, &volumes)?;
+        }
         NodeCommand::Metrics { name } => {
             let metrics: Vec<NodeMetric> = api.get(&format!("/api/nodes/{name}/metrics")).await?;
             if json {
@@ -3041,6 +3061,122 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn print_disk(node: &NodeView, apps: &[AppView], volumes: &[VolumeView]) -> anyhow::Result<()> {
+    let Some(s) = &node.storage else {
+        bail!(
+            "no storage report from {} yet (agents send one when they start, then every 15 minutes)",
+            node.name
+        );
+    };
+    let percent = |n: u64| (n * 100).checked_div(s.disk_total).unwrap_or(0);
+    println!(
+        "{}: {} used of {} ({} %), measured {}",
+        node.name,
+        bytes(s.disk_used),
+        bytes(s.disk_total),
+        percent(s.disk_used),
+        output::ago(s.at)
+    );
+    let orphaned: Vec<&VolumeView> = volumes.iter().filter(|v| !v.declared).collect();
+    let orphaned_size: u64 = orphaned.iter().filter_map(|v| v.size).sum();
+    let rows = [
+        (
+            "images",
+            s.images,
+            "apps' images, and those kept for rollbacks".to_string(),
+        ),
+        (
+            "build cache",
+            s.build_cache,
+            format!("{} unused for now", bytes(s.build_cache_reclaimable)),
+        ),
+        (
+            "volumes",
+            s.volumes_size,
+            if orphaned.is_empty() {
+                "apps' data".to_string()
+            } else {
+                format!(
+                    "{} orphaned ({}): facade volume ls",
+                    orphaned.len(),
+                    bytes(orphaned_size)
+                )
+            },
+        ),
+        (
+            "containers",
+            s.containers,
+            "written inside containers, lost on redeploy".to_string(),
+        ),
+        (
+            "facade",
+            s.facade_files,
+            "static sites, certificates, builds; database, uploads, backups".to_string(),
+        ),
+        (
+            "other",
+            s.other(),
+            "the system, other programs, logs".to_string(),
+        ),
+        (
+            "free",
+            s.disk_total.saturating_sub(s.disk_used),
+            String::new(),
+        ),
+    ];
+    table(
+        &["", "SIZE", "%", ""],
+        rows.into_iter().map(|(what, size, note)| {
+            vec![
+                what.to_string(),
+                bytes(size),
+                format!("{} %", percent(size)),
+                note,
+            ]
+        }),
+    );
+    if let Some(c) = &s.last_cleanup {
+        println!(
+            "last {}cleanup {}, freed {} (facade node prune {} [--aggressive])",
+            if c.aggressive { "deep " } else { "" },
+            output::ago(c.at),
+            bytes(c.freed),
+            node.name
+        );
+    }
+    let mut apps: Vec<(&AppView, &AppDiskView)> = apps
+        .iter()
+        .filter_map(|a| Some((a, a.disk.as_ref()?)))
+        .collect();
+    if apps.is_empty() {
+        return Ok(());
+    }
+    apps.sort_by_key(|(_, d)| std::cmp::Reverse(d.total()));
+    println!();
+    table(
+        &["APP", "TOTAL", "IMAGES", "VOLUMES", "WRITTEN", "FILES"],
+        apps.iter().map(|(a, d)| {
+            vec![
+                a.spec.name.clone(),
+                bytes(d.total()),
+                if d.rollback_images > 0 {
+                    format!("{} (+{} rollback)", bytes(d.images), d.rollback_images)
+                } else {
+                    bytes(d.images)
+                },
+                bytes(d.volumes),
+                if d.written >= WRITTEN_WARNING {
+                    format!("{} (use a volume)", bytes(d.written))
+                } else {
+                    bytes(d.written)
+                },
+                bytes(d.files),
+            ]
+        }),
+    );
     Ok(())
 }
 
@@ -3936,5 +4072,26 @@ fn print_app_detail(view: &AppView) {
             bytes(s.mem_used),
             s.restarts
         );
+    }
+    if let Some(d) = view.disk.as_ref().filter(|d| d.total() > 0) {
+        let mut parts = vec![format!("{} images", bytes(d.images))];
+        if d.rollback_images > 0 {
+            parts[0] += &format!(" (with {} for rollbacks)", d.rollback_images);
+        }
+        if d.volumes > 0 {
+            parts.push(format!("{} volumes", bytes(d.volumes)));
+        }
+        if d.files > 0 {
+            parts.push(format!("{} files", bytes(d.files)));
+        }
+        if d.written > 0 {
+            parts.push(format!("{} written in the container", bytes(d.written)));
+        }
+        println!("disk:      {} ({})", bytes(d.total()), parts.join(", "));
+        if d.written >= WRITTEN_WARNING {
+            println!(
+                "           what the container writes is lost on redeploy: keep it in a volume (--volume name:/path)"
+            );
+        }
     }
 }

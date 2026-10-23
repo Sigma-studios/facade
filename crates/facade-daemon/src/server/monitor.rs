@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use facade_core::api::{AlertView, AppMetric, Mention, NotifySettings, NotifyUpdate};
+use facade_core::api::{
+    AlertView, AppMetric, Mention, NotifySettings, NotifyUpdate, WRITTEN_WARNING,
+};
 use facade_core::proto::AppState;
 use parking_lot::RwLock;
 use serde_json::json;
@@ -256,6 +258,23 @@ fn conditions(server: &Server) -> HashMap<String, String> {
                     "app {} has been at its CPU limit for {} minutes",
                     spec.name,
                     CPU_PINNED_FOR / 60
+                ),
+            );
+        }
+        if let Some(disk) = live
+            .nodes
+            .get(&spec.node)
+            .and_then(|n| n.storage.as_ref())
+            .and_then(|s| s.apps.iter().find(|a| a.app == spec.name))
+            && disk.written >= WRITTEN_WARNING
+        {
+            out.insert(
+                format!("app:{}:written", spec.name),
+                format!(
+                    "app {} wrote {} MB inside its container, which a redeploy throws away: \
+                     keep that data in a volume",
+                    spec.name,
+                    disk.written / (1024 * 1024)
                 ),
             );
         }
