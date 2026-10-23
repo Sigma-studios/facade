@@ -849,6 +849,9 @@ fn ServiceForm(
     }));
     let memory = opt(settings.limits.memory_mb.map(|m| m.to_string()));
     let cpus = opt(settings.limits.cpus.map(|c| c.to_string()));
+    let pids = opt(settings.limits.pids.map(|p| p.to_string()));
+    let stop_timeout = opt(settings.stop_timeout_secs.map(|t| t.to_string()));
+    let stop_signal = opt(settings.stop_signal.clone());
     let depends_on = RwSignal::new(settings.depends_on.clone().unwrap_or_default());
     let database = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
@@ -922,6 +925,15 @@ fn ServiceForm(
         },
         "no limit",
     );
+    let ph_stop_timeout = hint(
+        &|a| {
+            a.stop_timeout_secs
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+        },
+        "10",
+    );
+    let ph_stop_signal = hint(&|a| a.stop_signal.clone().unwrap_or_default(), "SIGTERM");
     let ph_source = StoredValue::new(
         current
             .as_ref()
@@ -1030,7 +1042,22 @@ fn ServiceForm(
                 cpus: text(cpus)
                     .map(|c| c.parse().map_err(|_| "CPUs must be a number".to_string()))
                     .transpose()?,
+                pids: text(pids)
+                    .map(|p| {
+                        p.parse()
+                            .map_err(|_| "processes must be a whole number".to_string())
+                    })
+                    .transpose()?,
             };
+            if let Some(t) = text(stop_timeout) {
+                out.stop_timeout_secs = Some(
+                    t.parse()
+                        .map_err(|_| "the stop timeout must be a number of seconds".to_string())?,
+                );
+            }
+            if let Some(signal) = text(stop_signal) {
+                out.stop_signal = Some(signal.to_uppercase());
+            }
             Ok((out, db_env))
         })();
         let (settings, db_env) = match result {
@@ -1166,6 +1193,17 @@ fn ServiceForm(
                 <small>"Run in the container; exit 0 means ready. Services depending on this one start after it passes."</small>
             </label>
             <div class="form-row">
+                <label class="field">
+                    <span>"Stop timeout (seconds)"</span>
+                    <input type="text" inputmode="numeric" bind:value=stop_timeout placeholder=ph_stop_timeout/>
+                    <small>"Time to shut down cleanly before being killed."</small>
+                </label>
+                <label class="field">
+                    <span>"Stop signal"</span>
+                    <input type="text" bind:value=stop_signal placeholder=ph_stop_signal autocomplete="off"/>
+                </label>
+            </div>
+            <div class="form-row">
                 <label class="field grow">
                     <span>"Volumes"</span>
                     <textarea rows="1" class="mono" bind:value=volumes placeholder=ph_volumes></textarea>
@@ -1201,6 +1239,7 @@ fn ServiceForm(
             <div class="form-row">
                 <label class="field"><span>"Memory (MB)"</span><input type="text" inputmode="numeric" bind:value=memory placeholder=ph_memory/></label>
                 <label class="field"><span>"CPUs"</span><input type="text" inputmode="decimal" bind:value=cpus placeholder="no limit"/></label>
+                <label class="field"><span>"Processes"</span><input type="text" inputmode="numeric" bind:value=pids placeholder="4096"/></label>
             </div>
             <ErrorNote error=error/>
             <div class="form-actions">

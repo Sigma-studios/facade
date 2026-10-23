@@ -4,16 +4,17 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
 use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::models::{
-    ContainerCreateBody, EndpointSettings, HealthConfig, HostConfig, HostConfigLogConfig, Mount,
-    MountType, NetworkConnectRequest, NetworkCreateRequest, NetworkDisconnectRequest,
-    NetworkingConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum, VolumeCreateRequest,
+    ContainerCreateBody, EndpointSettings, HealthConfig, HostConfig, HostConfigCgroupnsModeEnum,
+    HostConfigLogConfig, Mount, MountType, NetworkConnectRequest, NetworkCreateRequest,
+    NetworkDisconnectRequest, NetworkingConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum,
+    VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, ListContainersOptions,
@@ -22,7 +23,7 @@ use bollard::query_parameters::{
     StopContainerOptions, WaitContainerOptions,
 };
 use facade_core::proto::{AppState, AppStats, JoinToken, VolumeUsage, Workload};
-use facade_core::{Build, Protocol, Source};
+use facade_core::{Build, DEFAULT_PIDS, MAX_STOP_TIMEOUT, Protocol, Source};
 use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -32,6 +33,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::DeployLog;
 use super::build;
+use super::cgroups;
+use super::sized::SizedVolume;
 use super::volumes;
 use crate::gitauth::Access;
 use crate::lang;
@@ -41,6 +44,8 @@ const LABEL_RUN: &str = "facade.run";
 const LABEL_NODE: &str = "facade.node";
 const LABEL_VOLUME: &str = "facade.volume";
 const LABEL_STACK: &str = "facade.stack";
+/// On the containers of apps that divide their own cgroup.
+pub const LABEL_CGROUPS: &str = "facade.cgroups";
 
 #[derive(Clone)]
 pub struct Runtime(Arc<Inner>);
@@ -82,6 +87,8 @@ pub fn run_key(w: &Workload, image: &str) -> String {
     let spec = facade_core::AppSpec {
         domains: vec![],
         redirects: vec![],
+        // Backup commands are the server's business: changing them restarts nothing.
+        backup: None,
         ..w.spec.clone()
     };
     short_hash(&(&spec, &w.env, w.revision, &w.commit, image))
@@ -202,6 +209,16 @@ impl Runtime {
         &self.0.docker
     }
 
+    /// A client waiting as long as a container may take to stop: Docker answers a
+    /// stop or a restart once the container is down.
+    fn docker_for_stops(&self) -> Docker {
+        let mut docker = self.0.docker.clone();
+        docker.set_timeout(std::time::Duration::from_secs(
+            u64::from(MAX_STOP_TIMEOUT) + 60,
+        ));
+        docker
+    }
+
     fn static_dir(&self, app: &str) -> PathBuf {
         self.0.dir.join("static").join(app)
     }
@@ -279,6 +296,10 @@ impl Runtime {
                     self.release(w, &image, log).await?;
                 }
                 log.line("configuration changed, replacing container");
+                if running {
+                    // Gives the app its stop timeout to shut down cleanly first.
+                    self.stop(app).await?;
+                }
                 self.docker()
                     .remove_container(
                         &name,
@@ -297,12 +318,24 @@ impl Runtime {
             Err(e) => return Err(e.into()),
         }
 
+        if w.spec.delegate_cgroups
+            && let Some(why) = cgroups::unsupported()
+        {
+            bail!("{app} asks for its cgroups, but {why}");
+        }
         if log.is_deployment() {
             self.wait_for_ports(w, log).await?;
         }
         self.create(w, &image, &run_key).await?;
         self.start(&name).await?;
         log.line(format!("started {name} from {image}"));
+        if w.spec.delegate_cgroups {
+            // The agent's watch does it too; this way the deploy log says so.
+            match cgroups::delegate(self, &name).await {
+                Ok(_) => log.line("delegated its cgroups (/sys/fs/cgroup is writable)"),
+                Err(e) => log.line(format!("could not delegate its cgroups yet: {e:#}")),
+            }
+        }
         if log.is_deployment() {
             self.wait_ready(&name, log).await?;
         }
@@ -725,8 +758,13 @@ impl Runtime {
             }),
             memory: spec.limits.memory_mb.map(|mb| (mb * 1024 * 1024) as i64),
             nano_cpus: spec.limits.cpus.map(|c| (c * 1e9) as i64),
-            pids_limit: Some(4096),
+            pids_limit: Some(i64::from(spec.limits.pids.unwrap_or(DEFAULT_PIDS))),
             security_opt: Some(vec!["no-new-privileges".into()]),
+            // What makes the container's /sys/fs/cgroup its own cgroup only.
+            cgroupns_mode: w
+                .spec
+                .delegate_cgroups
+                .then_some(HostConfigCgroupnsModeEnum::PRIVATE),
             init: Some(true),
             mounts: Some(mounts),
             log_config: Some(HostConfigLogConfig {
@@ -753,12 +791,20 @@ impl Runtime {
             healthcheck,
             env: Some(w.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
             cmd: (!spec.command.is_empty()).then(|| spec.command.clone()),
+            stop_signal: spec.stop_signal.clone(),
+            stop_timeout: spec.stop_timeout_secs.map(i64::from),
             exposed_ports: Some(exposed),
-            labels: Some(HashMap::from([
-                (LABEL_APP.to_string(), app.clone()),
-                (LABEL_RUN.to_string(), run_key.to_string()),
-                (LABEL_NODE.to_string(), self.0.token.node.clone()),
-            ])),
+            labels: Some({
+                let mut labels = HashMap::from([
+                    (LABEL_APP.to_string(), app.clone()),
+                    (LABEL_RUN.to_string(), run_key.to_string()),
+                    (LABEL_NODE.to_string(), self.0.token.node.clone()),
+                ]);
+                if spec.delegate_cgroups {
+                    labels.insert(LABEL_CGROUPS.to_string(), "delegated".into());
+                }
+                labels
+            }),
             host_config: Some(host_config),
             networking_config: networking,
             ..Default::default()
@@ -929,7 +975,7 @@ impl Runtime {
     }
 
     /// The directory holding a facade volume's files on this machine.
-    async fn volume_dir(&self, name: &str) -> anyhow::Result<PathBuf> {
+    pub async fn volume_dir(&self, name: &str) -> anyhow::Result<PathBuf> {
         let info = match self.docker().inspect_volume(name).await {
             Ok(info) => info,
             Err(e) if is_not_found(&e) => {
@@ -940,7 +986,14 @@ impl Runtime {
         if info.labels.get(LABEL_NODE) != Some(&self.0.token.node) {
             bail!("{name} is not a facade volume of this node");
         }
-        let dir = PathBuf::from(info.mountpoint);
+        // A volume with a size binds a directory of its own filesystem; Docker
+        // only mounts it there while a container uses it.
+        let dir = match info.options.get("device") {
+            Some(device) if info.options.get("o").is_some_and(|o| o == "bind") => {
+                PathBuf::from(device)
+            }
+            _ => PathBuf::from(info.mountpoint),
+        };
         if !dir.is_dir() {
             bail!(
                 "volume {name} is at {}, which this agent cannot reach (is it running as root, next to Docker?)",
@@ -1110,25 +1163,80 @@ impl Runtime {
         volume: &facade_core::Volume,
     ) -> anyhow::Result<String> {
         let name = spec.volume_name(volume);
-        if self.docker().inspect_volume(&name).await.is_err() {
-            let mut labels = HashMap::from([
-                (LABEL_APP.to_string(), spec.name.clone()),
-                (LABEL_NODE.to_string(), self.0.token.node.clone()),
-                (LABEL_VOLUME.to_string(), volume.name.clone()),
-            ]);
-            if let Some(stack) = &spec.stack {
-                labels.insert(LABEL_STACK.to_string(), stack.stack.clone());
+        let sized = SizedVolume::new(&self.0.dir, &name);
+        let existing = self.docker().inspect_volume(&name).await.ok();
+        let Some(size_mb) = volume.size_mb else {
+            // No size asked: a volume keeps what it has.
+            if existing.is_none() {
+                self.create_volume(spec, volume, &name, None).await?;
             }
-            self.docker()
-                .create_volume(VolumeCreateRequest {
-                    name: Some(name.clone()),
-                    labels: Some(labels),
-                    ..Default::default()
-                })
-                .await
-                .with_context(|| format!("creating volume {name}"))?;
+            return Ok(name);
+        };
+        sized.ensure(size_mb).await?;
+        let data = sized.data();
+        match existing {
+            Some(v) if v.options.get("device") == Some(&data.to_string_lossy().to_string()) => {
+                std::fs::create_dir_all(&data)?;
+            }
+            Some(v) => {
+                // A volume without a size until now: its data moves into the new
+                // filesystem. Its container is stopped (or not created yet).
+                if !data.exists() {
+                    super::sized::copy_into(Path::new(&v.mountpoint), &data).await?;
+                }
+                self.docker()
+                    .remove_volume(&name, None::<RemoveVolumeOptions>)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "moving {name} to a filesystem of its own (its data is copied): \
+                             another container still uses it, stop it first"
+                        )
+                    })?;
+                tracing::info!("moved volume {name} to a filesystem of its own");
+                self.create_volume(spec, volume, &name, Some(&data)).await?;
+            }
+            None => {
+                std::fs::create_dir_all(&data)?;
+                self.create_volume(spec, volume, &name, Some(&data)).await?;
+            }
         }
         Ok(name)
+    }
+
+    /// A facade volume; with `bind`, one binding that directory.
+    async fn create_volume(
+        &self,
+        spec: &facade_core::AppSpec,
+        volume: &facade_core::Volume,
+        name: &str,
+        bind: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        let mut labels = HashMap::from([
+            (LABEL_APP.to_string(), spec.name.clone()),
+            (LABEL_NODE.to_string(), self.0.token.node.clone()),
+            (LABEL_VOLUME.to_string(), volume.name.clone()),
+        ]);
+        if let Some(stack) = &spec.stack {
+            labels.insert(LABEL_STACK.to_string(), stack.stack.clone());
+        }
+        let driver_opts = bind.map(|dir| {
+            HashMap::from([
+                ("type".to_string(), "none".to_string()),
+                ("o".to_string(), "bind".to_string()),
+                ("device".to_string(), dir.to_string_lossy().to_string()),
+            ])
+        });
+        self.docker()
+            .create_volume(VolumeCreateRequest {
+                name: Some(name.to_string()),
+                driver_opts,
+                labels: Some(labels),
+                ..Default::default()
+            })
+            .await
+            .with_context(|| format!("creating volume {name}"))?;
+        Ok(())
     }
 
     /// The network a stack's services share.
@@ -1201,13 +1309,11 @@ impl Runtime {
 
     async fn stop(&self, app: &str) -> anyhow::Result<()> {
         match self
-            .docker()
+            .docker_for_stops()
             .stop_container(
                 &container(app),
-                Some(StopContainerOptions {
-                    t: Some(10),
-                    ..Default::default()
-                }),
+                // Without `t`, Docker waits the container's own stop timeout.
+                None::<StopContainerOptions>,
             )
             .await
         {
@@ -1221,14 +1327,8 @@ impl Runtime {
         if self.static_dir(app).exists() {
             return Ok(());
         }
-        self.docker()
-            .restart_container(
-                &container(app),
-                Some(RestartContainerOptions {
-                    t: Some(10),
-                    ..Default::default()
-                }),
-            )
+        self.docker_for_stops()
+            .restart_container(&container(app), None::<RestartContainerOptions>)
             .await
             .with_context(|| format!("restarting {app}"))
     }
@@ -1236,6 +1336,7 @@ impl Runtime {
     /// Removes the app's container, network and images; its volumes too when
     /// `volumes` is set (otherwise its data stays for a later app of that name).
     pub async fn remove(&self, app: &str, volumes: bool) -> anyhow::Result<()> {
+        self.stop(app).await?;
         for name in [container(app), format!("{}-release", container(app))] {
             match self
                 .docker()
@@ -1319,6 +1420,7 @@ impl Runtime {
                         .clone(),
                     volume: v.labels.get(LABEL_VOLUME)?.clone(),
                     in_use: used.contains(&v.name),
+                    limit: SizedVolume::new(&self.0.dir, &v.name).limit(),
                     name: v.name,
                     // Measured below, off the async threads.
                     size: dir.is_dir().then_some(0),
@@ -1342,6 +1444,60 @@ impl Runtime {
         Ok(volumes)
     }
 
+    /// Runs `command` with `sh -c` in the app's running container and waits for it
+    /// (at most `timeout`). Fails on a non-zero exit, with the end of its output.
+    pub async fn exec(
+        &self,
+        app: &str,
+        command: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let exec = self
+            .docker()
+            .create_exec(
+                &container(app),
+                bollard::models::ExecConfig {
+                    cmd: Some(vec!["sh".into(), "-c".into(), command.to_string()]),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| format!("running `{command}` in {app} (is it running?)"))?;
+        let mut output = String::new();
+        let run = async {
+            if let bollard::exec::StartExecResults::Attached {
+                output: mut out, ..
+            } = self.docker().start_exec(&exec.id, None).await?
+            {
+                while let Some(chunk) = out.next().await {
+                    output.push_str(&String::from_utf8_lossy(&chunk?.into_bytes()));
+                    // Only the end matters, for the error message.
+                    if output.len() > 8192 {
+                        output.drain(..output.len() - 4096);
+                    }
+                }
+            }
+            anyhow::Ok(())
+        };
+        tokio::time::timeout(timeout, run)
+            .await
+            .map_err(|_| anyhow!("`{command}` did not finish within {}s", timeout.as_secs()))??;
+        let code = self
+            .docker()
+            .inspect_exec(&exec.id)
+            .await?
+            .exit_code
+            .unwrap_or(-1);
+        if code != 0 {
+            let tail: Vec<&str> = output.trim().lines().rev().take(10).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            bail!("`{command}` exited with code {code}: {}", tail.join("\n"));
+        }
+        Ok(())
+    }
+
     /// Deletes a facade volume of this node.
     pub async fn remove_volume(&self, name: &str) -> anyhow::Result<()> {
         let volume = self
@@ -1356,6 +1512,7 @@ impl Runtime {
             .remove_volume(name, None::<RemoveVolumeOptions>)
             .await
             .with_context(|| format!("deleting {name} (is a container still using it?)"))?;
+        SizedVolume::new(&self.0.dir, name).remove().await?;
         tracing::info!("deleted volume {name}");
         Ok(())
     }
@@ -1391,6 +1548,37 @@ impl Runtime {
                     .await;
             }
         }
+    }
+
+    /// The label of this node's containers, as a Docker filter.
+    pub fn node_filter(&self) -> String {
+        format!("{LABEL_NODE}={}", self.0.token.node)
+    }
+
+    /// Running containers of this node that divide their own cgroup.
+    pub async fn delegating_containers(&self) -> Vec<String> {
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![self.node_filter(), LABEL_CGROUPS.to_string()],
+        )]);
+        let Ok(containers) = self
+            .docker()
+            .list_containers(Some(ListContainersOptions {
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+        else {
+            return vec![];
+        };
+        containers
+            .into_iter()
+            .filter_map(|c| {
+                c.names?
+                    .first()
+                    .map(|n| n.trim_start_matches('/').to_string())
+            })
+            .collect()
     }
 
     /// The image each facade container of this node runs, by app.

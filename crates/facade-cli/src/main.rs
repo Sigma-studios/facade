@@ -335,8 +335,8 @@ struct ServiceArgs {
     /// Publish raw ports on the node's public address (repeatable).
     #[arg(long = "publish", short = 'p')]
     ports: Vec<PortMap>,
-    /// Stack volume to mount: name:/path (repeatable; shared by the services
-    /// naming it).
+    /// Stack volume to mount: name:/path, or name:/path:20G with a size
+    /// (repeatable; shared by the services naming it).
     #[arg(long = "volume", short = 'v')]
     volumes: Vec<Volume>,
     /// Services to start (and replace) before this one (repeatable).
@@ -347,6 +347,16 @@ struct ServiceArgs {
     memory: Option<u64>,
     #[arg(long)]
     cpus: Option<f64>,
+    /// Most processes and threads at once (0 restores the default, 4096).
+    #[arg(long)]
+    pids: Option<u32>,
+    /// Seconds the service gets to shut down when stopped or replaced (0 restores
+    /// the default, 10).
+    #[arg(long)]
+    stop_timeout: Option<u32>,
+    /// Signal asking the service to stop, e.g. SIGINT ("" restores the image's).
+    #[arg(long)]
+    stop_signal: Option<String>,
     /// How to tell the service is ready, run with `sh -c` in its container; the
     /// services depending on it start once it passes ("" uses the default).
     #[arg(long, allow_hyphen_values = true)]
@@ -422,10 +432,29 @@ impl ServiceArgs {
         if let Some(cpus) = self.cpus {
             spec.limits.cpus = (cpus != 0.0).then_some(cpus);
         }
+        if let Some(pids) = self.pids {
+            spec.limits.pids = (pids != 0).then_some(pids);
+        }
+        if let Some(secs) = self.stop_timeout {
+            spec.stop_timeout_secs = (secs != 0).then_some(secs);
+        }
+        if let Some(signal) = &self.stop_signal {
+            spec.stop_signal = stop_signal(signal);
+        }
         if let Some(health) = &self.health {
             spec.healthcheck = health_check(health);
         }
         Ok(())
+    }
+}
+
+/// `--stop-signal sigint`: `SIGINT`, or the image's own for "".
+fn stop_signal(signal: &str) -> Option<String> {
+    let signal = signal.trim().to_ascii_uppercase();
+    match signal.as_str() {
+        "" => None,
+        s if s.starts_with("SIG") || s.parse::<u8>().is_ok() => Some(signal),
+        _ => Some(format!("SIG{signal}")),
     }
 }
 
@@ -783,6 +812,29 @@ struct SpecArgs {
     /// CPU limit in cores (0 removes it).
     #[arg(long)]
     cpus: Option<f64>,
+    /// Most processes and threads at once (0 restores the default, 4096). Each
+    /// thread counts: a JVM or a process supervisor needs more.
+    #[arg(long)]
+    pids: Option<u32>,
+    /// Seconds the app gets to shut down cleanly when stopped, restarted or
+    /// replaced by a deploy, before it is killed (0 restores the default, 10).
+    #[arg(long)]
+    stop_timeout: Option<u32>,
+    /// Signal asking the app to stop, e.g. SIGINT ("" restores the image's).
+    #[arg(long)]
+    stop_signal: Option<String>,
+    /// Let the app divide its limits between its own processes: /sys/fs/cgroup
+    /// becomes writable in its container (cgroup v2 nodes).
+    #[arg(long)]
+    delegate_cgroups: Option<bool>,
+    /// Run in the container before its volumes are backed up, so what is on disk
+    /// is whole, e.g. "rcon-cli save-off && rcon-cli save-all flush" ("" removes it).
+    #[arg(long, allow_hyphen_values = true)]
+    backup_before: Option<String>,
+    /// Run in the container after its volumes are backed up, e.g. "rcon-cli
+    /// save-on" ("" removes it).
+    #[arg(long, allow_hyphen_values = true)]
+    backup_after: Option<String>,
     /// Replace the image's command, e.g. "./worker --queue emails" ("" restores it).
     #[arg(long, allow_hyphen_values = true)]
     command: Option<String>,
@@ -790,7 +842,8 @@ struct SpecArgs {
     /// (with `sh -c`), e.g. "./migrate up". A failure stops the deploy ("" removes it).
     #[arg(long, allow_hyphen_values = true)]
     release: Option<String>,
-    /// Keep data in a volume: name:/path (repeatable; replaces the list).
+    /// Keep data in a volume: name:/path, or name:/path:20G for one that holds at
+    /// most that much, on a filesystem of its own (repeatable; replaces the list).
     #[arg(long = "volume", short = 'v')]
     volumes: Vec<Volume>,
     #[arg(long, conflicts_with = "volumes")]
@@ -954,6 +1007,31 @@ impl SpecArgs {
         }
         if let Some(cpus) = self.cpus {
             spec.limits.cpus = (cpus != 0.0).then_some(cpus);
+        }
+        if let Some(pids) = self.pids {
+            spec.limits.pids = (pids != 0).then_some(pids);
+        }
+        if let Some(secs) = self.stop_timeout {
+            spec.stop_timeout_secs = (secs != 0).then_some(secs);
+        }
+        if let Some(signal) = &self.stop_signal {
+            spec.stop_signal = stop_signal(signal);
+        }
+        if let Some(delegate) = self.delegate_cgroups {
+            spec.delegate_cgroups = delegate;
+        }
+        let hook = |c: &String| Some(c.trim().to_string()).filter(|c| !c.is_empty());
+        if self.backup_before.is_some() || self.backup_after.is_some() {
+            let backup = spec.backup.get_or_insert_with(Default::default);
+            if let Some(before) = &self.backup_before {
+                backup.before = hook(before);
+            }
+            if let Some(after) = &self.backup_after {
+                backup.after = hook(after);
+            }
+            if backup.before.is_none() && backup.after.is_none() {
+                spec.backup = None;
+            }
         }
         if let Some(command) = &self.command {
             spec.command = facade_core::split_command(command)?;
@@ -1658,7 +1736,14 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                         v.node.clone(),
                         v.name.clone(),
                         v.app.clone(),
-                        v.size.map(bytes).unwrap_or_else(|| "?".into()),
+                        match (v.size, v.limit) {
+                            (size, Some(limit)) => format!(
+                                "{} of {}",
+                                size.map(bytes).unwrap_or_else(|| "?".into()),
+                                bytes(limit)
+                            ),
+                            (size, None) => size.map(bytes).unwrap_or_else(|| "?".into()),
+                        },
                         if !v.declared {
                             "orphaned (no app declares it)".into()
                         } else if v.in_use {
@@ -2841,6 +2926,7 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 tls_ports: vec![],
                 host_network: false,
                 limits: Limits::default(),
+                delegate_cgroups: false,
                 enabled: true,
                 command: vec![],
                 release_command: None,
@@ -2848,6 +2934,9 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 links: vec![],
                 stack: None,
                 healthcheck: None,
+                stop_timeout_secs: None,
+                stop_signal: None,
+                backup: None,
             };
             args.apply(&mut spec, None)?;
             if spec.command.is_empty() && !suggested_command.is_empty() {
@@ -3587,6 +3676,27 @@ fn print_app_detail(view: &AppView) {
     }
     if let Some(cpus) = spec.limits.cpus {
         println!("cpus:      {cpus} max");
+    }
+    if let Some(pids) = spec.limits.pids {
+        println!("pids:      {pids} max");
+    }
+    if spec.delegate_cgroups {
+        println!("cgroups:   delegated (/sys/fs/cgroup is writable)");
+    }
+    if let Some(b) = &spec.backup {
+        if let Some(before) = &b.before {
+            println!("before backups: {before}");
+        }
+        if let Some(after) = &b.after {
+            println!("after backups:  {after}");
+        }
+    }
+    if spec.stop_timeout_secs.is_some() || spec.stop_signal.is_some() {
+        println!(
+            "stop:      {}, {}s to shut down",
+            spec.stop_signal.as_deref().unwrap_or("image's signal"),
+            spec.stop_wait_secs()
+        );
     }
     if let Some(s) = &view.stats {
         println!(

@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 use crate::spec::AppSpec;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 4: workloads carry stop settings, a process limit, cgroup delegation and volume
+/// sizes, and agents run commands in containers (backup hooks).
+pub const PROTOCOL_VERSION: u32 = 4;
 /// The oldest agent protocol the server still talks to. Agents in between are
 /// sent the server's binary and update themselves.
 pub const MIN_AGENT_PROTOCOL: u32 = 3;
@@ -228,6 +230,13 @@ pub enum AgentRequest {
         tail: u32,
         follow: bool,
     },
+    /// Run `command` with `sh -c` in the app's running container. The answer comes
+    /// once it exits; a non-zero exit is an error carrying its output.
+    Exec {
+        app: String,
+        command: String,
+        timeout_secs: u32,
+    },
 }
 
 /// Stacks deploy in two phases: every service is built first (nothing changes if
@@ -398,6 +407,9 @@ pub struct VolumeUsage {
     pub app: String,
     pub volume: String,
     pub size: Option<u64>,
+    /// Bytes it may hold, for volumes with a size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
     /// Mounted by a container right now.
     pub in_use: bool,
 }

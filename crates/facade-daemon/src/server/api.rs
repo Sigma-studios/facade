@@ -2217,6 +2217,7 @@ async fn list_volumes(State(server): S, user: User) -> ApiResult<Json<Vec<Volume
                 app: v.app.clone(),
                 volume: v.volume.clone(),
                 size: v.size,
+                limit: v.limit,
                 in_use: v.in_use,
                 declared,
                 last_backup: None,
