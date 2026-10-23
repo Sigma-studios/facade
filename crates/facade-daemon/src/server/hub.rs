@@ -544,7 +544,7 @@ async fn send_artifact(
 fn on_event(server: &Server, node: &str, event: AgentEvent) {
     let result = match event {
         AgentEvent::Report(report) => {
-            server.record_report(node, report);
+            server.record_report(node, *report);
             Ok(())
         }
         AgentEvent::AppState {

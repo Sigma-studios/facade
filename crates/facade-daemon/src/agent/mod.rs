@@ -69,7 +69,10 @@ pub async fn run_standalone(
         }
     };
     info!(node = %token.node, server = %token.server, "agent starting");
-    Agent::new(token, data_dir, ingress).await?.run().await;
+    Agent::new(token, data_dir.clone(), data_dir, ingress)
+        .await?
+        .run()
+        .await;
     Ok(())
 }
 
@@ -99,6 +102,8 @@ pub struct Agent {
     /// Latest storage report, and whether the server still has to get it.
     storage: Mutex<(Option<StorageReport>, bool)>,
     last_cleanup: Mutex<Option<Cleanup>>,
+    /// Everything facade keeps on this machine, measured for the storage report.
+    files_dir: PathBuf,
 }
 
 struct Cancellable {
@@ -109,9 +114,11 @@ struct Cancellable {
 }
 
 impl Agent {
+    /// `files_dir` holds `data_dir` and anything else facade keeps on the machine.
     pub async fn new(
         token: JoinToken,
         data_dir: PathBuf,
+        files_dir: PathBuf,
         ingress: IngressMode,
     ) -> anyhow::Result<Arc<Self>> {
         let link = routes::Link::new(ingress, &data_dir)?;
@@ -132,6 +139,7 @@ impl Agent {
             cancellable: Default::default(),
             storage: Default::default(),
             last_cleanup: Default::default(),
+            files_dir,
         }))
     }
 
@@ -608,7 +616,7 @@ impl Agent {
             };
             if tx
                 .send(AgentMsg::Event {
-                    event: AgentEvent::Report(report),
+                    event: AgentEvent::Report(Box::new(report)),
                 })
                 .await
                 .is_err()

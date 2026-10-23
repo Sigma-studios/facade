@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AppView, BackupReport, BackupRequest, BackupView, CommitView, DeployRequest, DeploymentStatus,
-    DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, SetOwner, UpdateCheck,
-    UserView, VolumeView,
+    AppDiskView, AppView, BackupReport, BackupRequest, BackupView, CommitView, DeployRequest,
+    DeploymentStatus, DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, SetOwner,
+    UpdateCheck, UserView, VolumeView, WRITTEN_WARNING,
 };
 use facade_core::proto::AppState;
 use facade_core::{Build, Source};
@@ -361,6 +361,7 @@ fn OverviewTab(
 ) -> impl IntoView {
     let spec = move || app.get().map(|a| a.spec);
     let stats = move || app.get().and_then(|a| a.stats);
+    let disk = move || app.get().and_then(|a| a.disk);
     let cpu_max = Signal::derive(move || spec().and_then(|s| s.limits.cpus).map(|c| c * 100.0));
     let mem_max = Signal::derive(move || {
         spec()
@@ -375,8 +376,11 @@ fn OverviewTab(
     });
 
     view! {
-        <Show when=move || !is_static() fallback=|| view! {
-            <p class="muted">"Static sites are served by the agent directly; they have no container to measure."</p>
+        <Show when=move || !is_static() fallback=move || view! {
+            <p class="muted">
+                "Static sites are served by the agent directly; they have no container to measure."
+                {move || disk().filter(|d| d.files > 0).map(|d| format!(" Its files take {}.", bytes(d.files)))}
+            </p>
         }>
             <div class="tiles">
                 <div class="tile">
@@ -393,6 +397,26 @@ fn OverviewTab(
                     <span class="tile-label">"Restarts"</span>
                     <span class="tile-value">{move || stats().map(|s| s.restarts.to_string()).unwrap_or_else(|| "—".into())}</span>
                     <span class="tile-sub">"since the container was created"</span>
+                </div>
+                <div class="tile" title=move || disk().map(disk_detail).unwrap_or_default()>
+                    <span class="tile-label">"Disk"</span>
+                    <span class="tile-value">{move || disk().map(|d| bytes(d.total())).unwrap_or_else(|| "—".into())}</span>
+                    {move || disk().map(|d| if d.written >= WRITTEN_WARNING {
+                        view! {
+                            <span class="tile-sub tile-warn">
+                                <span aria-hidden="true">"⚠ "</span>
+                                {format!("{} written in the container: lost on redeploy, keep it in a volume", bytes(d.written))}
+                            </span>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <span class="tile-sub">{if d.volumes > 0 {
+                                format!("image {} · volumes {}", bytes(d.images), bytes(d.volumes))
+                            } else {
+                                format!("image {}", bytes(d.images))
+                            }}</span>
+                        }.into_any()
+                    })}
                 </div>
                 <div class="tile">
                     <span class="tile-label">"Network"</span>
@@ -569,6 +593,26 @@ pub fn CommitRow(c: CommitView) -> impl IntoView {
             <span class="muted small">{format!("{} · {}", c.author, ago(c.time))}</span>
         </li>
     }
+}
+
+/// Every part of an app's disk use, for the tile's tooltip.
+fn disk_detail(d: AppDiskView) -> String {
+    let mut lines = vec![format!(
+        "Images: {}{}",
+        bytes(d.images),
+        if d.rollback_images > 0 {
+            format!(" (with {} kept for rollbacks)", d.rollback_images)
+        } else {
+            String::new()
+        }
+    )];
+    lines.push(format!("Volumes: {}", bytes(d.volumes)));
+    lines.push(format!("Written in the container: {}", bytes(d.written)));
+    if d.files > 0 {
+        lines.push(format!("Static files: {}", bytes(d.files)));
+    }
+    lines.push(format!("Measured {}", ago(d.at)));
+    lines.join("\n")
 }
 
 // ---------------------------------------------------------------- logs

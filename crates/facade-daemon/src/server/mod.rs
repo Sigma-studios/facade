@@ -579,6 +579,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(release::check_regularly(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
+    let files_dir = server.cfg.data_dir.clone();
     let ingress = match server.cfg.ingress {
         crate::config::IngressSetting::Embedded => crate::agent::IngressMode::Embedded {
             http: Some(server.cfg.http_listen),
@@ -590,8 +591,13 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     };
     tokio::spawn(async move {
         loop {
-            match crate::agent::Agent::new(local_token.clone(), agent_dir.clone(), ingress.clone())
-                .await
+            match crate::agent::Agent::new(
+                local_token.clone(),
+                agent_dir.clone(),
+                files_dir.clone(),
+                ingress.clone(),
+            )
+            .await
             {
                 Ok(agent) => return agent.run().await,
                 Err(e) => {
