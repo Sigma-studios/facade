@@ -843,6 +843,29 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .disk-tip-size { color: var(--text-primary); font-variant-numeric: tabular-nums; }
 .disk-tip-hint { margin-top: 2px; color: var(--text-secondary); }
 .disk-swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+.cell-tip-host { cursor: default; border-bottom: 1px dotted var(--border-strong); }
+.cell-tip-host:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.cell-tip {
+  position: fixed;
+  z-index: 20;
+  transform: translateX(-100%);
+  max-width: 300px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  text-align: left;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.cell-tip dl { display: grid; grid-template-columns: auto auto; gap: 1px 12px; margin: 0 0 4px; }
+.cell-tip dt { color: var(--text-secondary); }
+.cell-tip dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.cell-tip-warn { color: var(--critical-text); margin-bottom: 4px; }
+.notify-status { margin: 4px 0 12px; }
+.notify-error { color: var(--critical-text); }
 .disk-orphans { color: var(--text-secondary); text-decoration: underline; }
 .disk-1 { background: var(--series-1); }
 .disk-2 { background: var(--series-2); }

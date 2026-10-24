@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use facade_core::api::{
-    AlertView, AppMetric, Mention, NotifySettings, NotifyUpdate, WRITTEN_WARNING,
+    AlertView, AppMetric, Mention, NotifyError, NotifySettings, NotifyUpdate, WRITTEN_WARNING,
 };
 use facade_core::proto::AppState;
 use parking_lot::RwLock;
@@ -78,7 +78,7 @@ pub async fn run(server: Arc<Server>) -> anyhow::Result<()> {
             .map(|a| Note::problem(&a.message))
             .chain(cleared.iter().map(|a| Note::resolved(&a.message)))
             .collect();
-        if let Err(e) = server.notifier.send(&notes).await {
+        if let Err(e) = server.notifier.send(&server.store, &notes).await {
             warn!("sending alerts to Discord: {e:#}");
         }
     }
@@ -335,7 +335,18 @@ pub struct Notifier {
     target: RwLock<Target>,
     /// Shown under each message, to tell several servers apart.
     origin: String,
+    /// How the last messages went, to show that alerts do reach Discord.
+    delivery: RwLock<Delivery>,
 }
+
+/// Kept in the database, so a restart (every update) does not forget it.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Delivery {
+    sent: Option<u64>,
+    failed: Option<NotifyError>,
+}
+
+const KV_DELIVERY: &str = "notify.delivery";
 
 impl Notifier {
     pub fn new(origin: String) -> anyhow::Result<Self> {
@@ -345,6 +356,7 @@ impl Notifier {
                 .build()?,
             target: Default::default(),
             origin,
+            delivery: Default::default(),
         })
     }
 
@@ -361,6 +373,9 @@ impl Notifier {
             None => vec![],
         };
         *self.target.write() = Target { webhook, mentions };
+        if let Some(json) = store.kv_get(KV_DELIVERY)? {
+            *self.delivery.write() = serde_json::from_str(&json).unwrap_or_default();
+        }
         Ok(())
     }
 
@@ -371,6 +386,7 @@ impl Notifier {
         update: NotifyUpdate,
     ) -> Result<(), String> {
         let mut target = self.target.read().clone();
+        let before = target.webhook.clone();
         if let Some(webhook) = update.discord_webhook {
             let webhook = webhook.trim().to_string();
             if webhook.is_empty() {
@@ -398,6 +414,11 @@ impl Notifier {
             store.kv_put(KV_MENTIONS, &serde_json::to_string(&mentions)?)
         };
         save().map_err(|e| format!("{e:#}"))?;
+        if target.webhook != before {
+            // Another channel: what reached the old one says nothing about it.
+            *self.delivery.write() = Delivery::default();
+            let _ = store.kv_delete(KV_DELIVERY);
+        }
         *self.target.write() = target;
         Ok(())
     }
@@ -411,6 +432,8 @@ impl Notifier {
                 format!("{}••••••", &w[..cut])
             }),
             mentions: target.mentions.iter().map(|m| m.to_string()).collect(),
+            last_sent: self.delivery.read().sent,
+            last_error: self.delivery.read().failed.clone(),
         }
     }
 
@@ -418,7 +441,34 @@ impl Notifier {
         self.target.read().webhook.is_some()
     }
 
-    pub async fn send(&self, notes: &[Note]) -> anyhow::Result<()> {
+    /// Posts `notes` (nothing to post is not a delivery), and records how it went.
+    pub async fn send(&self, store: &Store, notes: &[Note]) -> anyhow::Result<()> {
+        if notes.is_empty() || !self.is_configured() {
+            return Ok(());
+        }
+        let result = self.deliver(notes).await;
+        let mut delivery = self.delivery.write();
+        match &result {
+            Ok(()) => {
+                delivery.sent = Some(facade_core::now());
+                delivery.failed = None;
+            }
+            Err(e) => {
+                delivery.failed = Some(NotifyError {
+                    at: facade_core::now(),
+                    error: format!("{e:#}"),
+                })
+            }
+        }
+        if let Ok(json) = serde_json::to_string(&*delivery)
+            && let Err(e) = store.kv_put(KV_DELIVERY, &json)
+        {
+            warn!("saving the alert delivery: {e:#}");
+        }
+        result
+    }
+
+    async fn deliver(&self, notes: &[Note]) -> anyhow::Result<()> {
         let target = self.target.read().clone();
         let Some(webhook) = &target.webhook else {
             return Ok(());
@@ -496,11 +546,11 @@ impl Notifier {
 
     /// Sends a test message (pinging like a problem would), failing loudly when
     /// nothing is configured.
-    pub async fn test(&self) -> anyhow::Result<()> {
+    pub async fn test(&self, store: &Store) -> anyhow::Result<()> {
         if !self.is_configured() {
             bail!("no Discord webhook set (facade alerts config --webhook <url>)");
         }
-        self.send(&[Note::test()])
+        self.send(store, &[Note::test()])
             .await
             .context("sending test message")
     }

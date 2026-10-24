@@ -1473,6 +1473,18 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                     settings.mentions.join(" ")
                 }
             );
+            if settings.discord_webhook.is_some() {
+                println!(
+                    "last message:    {}",
+                    settings
+                        .last_sent
+                        .map(output::ago)
+                        .unwrap_or_else(|| "none since the server started".into())
+                );
+                if let Some(e) = &settings.last_error {
+                    println!("last FAILURE:    {} ({})", e.error, output::ago(e.at));
+                }
+            }
         }
         Command::Alerts { action: None } => {
             let alerts: Vec<AlertView> = api.get("/api/alerts").await?;
