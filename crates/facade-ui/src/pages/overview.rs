@@ -291,29 +291,47 @@ pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
 /// cut it off.
 #[component]
 fn DiskCell(disk: AppDiskView) -> impl IntoView {
-    let anchor = RwSignal::new(None::<(f64, f64)>);
+    // Where the tip goes, as CSS for a fixed box: its right edge under the cell's
+    // (so it takes the room on the left, never squeezed), below the cell, or
+    // above it near the bottom of the window.
+    let anchor = RwSignal::new(None::<String>);
     let show = move |ev: web_sys::Event| {
         use wasm_bindgen::JsCast;
-        if let Some(target) = ev.current_target() {
-            let rect = target
-                .unchecked_into::<web_sys::Element>()
-                .get_bounding_client_rect();
-            anchor.set(Some((rect.right(), rect.bottom())));
-        }
-    };
-    let warn = disk.written >= WRITTEN_WARNING;
-    let mut lines = vec![(
-        "Image",
-        if disk.rollback_images > 0 {
+        let Some(target) = ev.current_target() else {
+            return;
+        };
+        let rect = target
+            .unchecked_into::<web_sys::Element>()
+            .get_bounding_client_rect();
+        let Some(page) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+        else {
+            return;
+        };
+        let (width, height) = (page.client_width() as f64, page.client_height() as f64);
+        let right = (width - rect.right()).max(8.0);
+        anchor.set(Some(if rect.bottom() + 160.0 > height {
             format!(
-                "{} (+{} for rollbacks)",
-                bytes(disk.images),
-                disk.rollback_images
+                "right: {right:.0}px; bottom: {:.0}px",
+                height - rect.top() + 4.0
             )
         } else {
-            bytes(disk.images)
-        },
-    )];
+            format!("right: {right:.0}px; top: {:.0}px", rect.bottom() + 4.0)
+        }));
+    };
+    let warn = disk.written >= WRITTEN_WARNING;
+    let mut lines = vec![("Image", bytes(disk.images))];
+    if disk.rollback_images > 0 {
+        lines.push((
+            "Kept for rollbacks",
+            format!(
+                "{} image{}, included",
+                disk.rollback_images,
+                if disk.rollback_images == 1 { "" } else { "s" }
+            ),
+        ));
+    }
     if disk.volumes > 0 {
         lines.push(("Volumes", bytes(disk.volumes)));
     }
@@ -330,9 +348,8 @@ fn DiskCell(disk: AppDiskView) -> impl IntoView {
             {warn.then(|| view! { <span class="meter-warn" title="written inside the container: lost on redeploy">"⚠ "</span> })}
             {bytes(disk.total())}
         </span>
-        {move || anchor.get().map(|(right, bottom)| view! {
-            <div class="cell-tip" role="tooltip"
-                style=format!("left: {right:.0}px; top: {:.0}px", bottom + 4.0)>
+        {move || anchor.get().map(|place| view! {
+            <div class="cell-tip" role="tooltip" style=place>
                 <dl>
                     {lines.iter().map(|(k, v)| view! { <dt>{*k}</dt><dd>{v.clone()}</dd> }).collect_view()}
                 </dl>
