@@ -817,40 +817,32 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
   background: var(--surface-1);
   line-height: 1.5;
 }
-.disk-bar {
-  display: flex;
-  gap: 2px;
-  height: 10px;
-  margin: 2px 0 8px;
-  border-radius: 4px;
-  overflow: hidden;
-  background: var(--surface-2);
-}
+/* A taller hover zone than the bar, without moving it. */
+.disk-wrap { position: relative; padding: 4px 0; margin: -4px 0; cursor: default; }
+.disk-track { display: flex; gap: 2px; }
 .disk-seg { height: 100%; min-width: 3px; transition: opacity 0.15s ease; }
 .disk-seg.dim { opacity: 0.3; }
-.disk-legend {
-  list-style: none;
-  margin: 0 0 6px;
-  padding: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px 4px;
+.disk-seg.disk-free { flex: 1; background: transparent; }
+.disk-tip {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  z-index: 10;
+  /* No wider than the bar: the tip then stays over it wherever the pointer is. */
+  width: max-content;
+  max-width: 100%;
+  min-width: min(160px, 100%);
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  line-height: 1.45;
 }
-.disk-key {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 1px 6px 1px 4px;
-  border-radius: 4px;
-  color: var(--text-secondary);
-  cursor: default;
-}
-.disk-key.on { background: var(--surface-2); color: var(--text-primary); }
-.disk-key.dim { opacity: 0.6; }
-.disk-key:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.disk-tip-head { display: flex; align-items: center; gap: 6px; color: var(--text-primary); }
+.disk-tip-size { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.disk-tip-hint { margin-top: 2px; color: var(--text-secondary); }
 .disk-swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
-/* Three lines whatever is shown, so hovering never moves the page. */
-.disk-detail { height: 4.5em; overflow: hidden; line-height: 1.5; color: var(--text-secondary); }
 .disk-orphans { color: var(--text-secondary); text-decoration: underline; }
 .disk-1 { background: var(--series-1); }
 .disk-2 { background: var(--series-2); }
