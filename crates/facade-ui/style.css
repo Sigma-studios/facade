@@ -820,25 +820,37 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .disk-bar {
   display: flex;
   gap: 2px;
-  height: 8px;
-  margin: 2px 0 10px;
+  height: 10px;
+  margin: 2px 0 8px;
   border-radius: 4px;
   overflow: hidden;
   background: var(--surface-2);
 }
-.disk-seg { height: 100%; min-width: 2px; }
+.disk-seg { height: 100%; min-width: 3px; transition: opacity 0.15s ease; }
+.disk-seg.dim { opacity: 0.3; }
 .disk-legend {
   list-style: none;
   margin: 0 0 6px;
   padding: 0;
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 3px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 4px;
 }
-.disk-legend li { display: flex; align-items: center; gap: 6px; cursor: default; }
+.disk-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 6px 1px 4px;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: default;
+}
+.disk-key.on { background: var(--surface-2); color: var(--text-primary); }
+.disk-key.dim { opacity: 0.6; }
+.disk-key:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .disk-swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
-.disk-name { color: var(--text-secondary); }
-.disk-size { margin-left: auto; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+/* Three lines whatever is shown, so hovering never moves the page. */
+.disk-detail { height: 4.5em; overflow: hidden; line-height: 1.5; color: var(--text-secondary); }
 .disk-orphans { color: var(--text-secondary); text-decoration: underline; }
 .disk-1 { background: var(--series-1); }
 .disk-2 { background: var(--series-2); }

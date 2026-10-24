@@ -1,9 +1,10 @@
 use std::time::Duration;
 
-use facade_core::api::{AlertView, AppView, NodeView, StatusView, UsagePoint};
+use facade_core::api::{AlertView, AppView, NodeView, StatusView, UsagePoint, VolumeView};
 use leptos::prelude::*;
 use leptos_router::components::A;
 
+use super::nodes::{NodeDisk, orphaned_on};
 use crate::api;
 use crate::components::{ErrorNote, Loading, Meter, OnlineBadge, StateBadge, Trend};
 use crate::util::{ago, bytes, cpus, me, percent, polled};
@@ -13,6 +14,9 @@ pub fn Overview() -> impl IntoView {
     let me = me();
     let status = polled(Some(Duration::from_secs(5)), || async {
         api::get::<StatusView>("/api/status").await
+    });
+    let volumes = polled(Some(Duration::from_secs(30)), || async {
+        api::get::<Vec<VolumeView>>("/api/volumes").await
     });
     let alerts = polled(Some(Duration::from_secs(15)), || async {
         api::get::<Vec<AlertView>>("/api/alerts").await
@@ -68,7 +72,24 @@ pub fn Overview() -> impl IntoView {
                         <For
                             each=move || status.data.get().map(|s| s.nodes).unwrap_or_default()
                             key=|n| (n.name.clone(), n.ingress_errors.clone())
-                            children=move |node| view! { <NodeCard node trends=true/> }
+                            children=move |node| {
+                                // The card stays; its disk part follows the status.
+                                let name = node.name.clone();
+                                let storage = Signal::derive({
+                                    let name = name.clone();
+                                    move || status.data.with(|s| {
+                                        s.as_ref()?.nodes.iter().find(|n| n.name == name)?.storage.clone()
+                                    })
+                                });
+                                let orphaned = orphaned_on(volumes, name.clone());
+                                let connected = node.connected;
+                                view! {
+                                    <div class="node-wrap">
+                                        <NodeCard node trends=true/>
+                                        <NodeDisk name connected storage orphaned/>
+                                    </div>
+                                }
+                            }
                         />
                     </div>
                 </section>
