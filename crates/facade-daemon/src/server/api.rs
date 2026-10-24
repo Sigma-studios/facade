@@ -1783,7 +1783,8 @@ fn build_vars(server: &Server, app: &str) -> Option<Vec<(String, String)>> {
 /// start; a push then carries the change, and the node rebuilds when it converges.
 async fn rebuild_at_current_commit(server: &Server, app: &str) -> Option<DeploymentView> {
     let row = server.store.get_app(app).ok()??;
-    let built = matches!(&row.spec.source, facade_core::Source::Git { build, .. } if build.runs_build());
+    let built =
+        matches!(&row.spec.source, facade_core::Source::Git { build, .. } if build.runs_build());
     if row.revision == 0 || row.spec.stack.is_some() || !built {
         return None;
     }

@@ -7,6 +7,7 @@
 //!   for rollbacks; at 90 %, the whole build cache.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,9 @@ const REPORT_EVERY: Duration = Duration::from_secs(15 * 60);
 /// Between two cleanups forced by a full disk, so one that frees nothing does not
 /// run in a loop.
 const PRESSURE_PAUSE: Duration = Duration::from_secs(30 * 60);
+/// Measuring Docker's folders walks every layer: not for every report a deploy
+/// triggers, but for each periodic one.
+const DOCKER_MEASURE_EVERY: Duration = Duration::from_secs(10 * 60);
 const PRESSURE: f64 = 85.0;
 const CRITICAL: f64 = 90.0;
 
@@ -126,6 +130,7 @@ pub async fn cleanup(agent: &Agent, aggressive: bool) {
         if aggressive { " (aggressive)" } else { "" },
         freed / 1_000_000
     );
+    *agent.docker_size.lock() = None;
     *agent.last_cleanup.lock() = Some(Cleanup {
         at: facade_core::now(),
         freed,
@@ -149,6 +154,62 @@ fn parse_size(s: &str) -> u64 {
     (n * factor) as u64
 }
 
+/// What Docker's folders take on disk, volumes aside (reported apart): images,
+/// build cache, containers and their logs. Docker's own figures for images and
+/// build cache share layers (with containerd's image store, most of them), so
+/// they cannot be added up. `None` where the folders are out of reach (Docker
+/// Desktop keeps them in a VM).
+async fn docker_on_disk(agent: &Agent) -> Option<u64> {
+    let cached = *agent.docker_size.lock();
+    if let Some((at, size)) = cached
+        && at.elapsed() < DOCKER_MEASURE_EVERY
+    {
+        return Some(size);
+    }
+    let root = PathBuf::from(agent.runtime.docker().info().await.ok()?.docker_root_dir?);
+    if !root.is_dir() {
+        return None;
+    }
+    // The volumes are reported apart (`docker system df -v` walks them).
+    let mut size = du(&root)
+        .await?
+        .saturating_sub(du(&root.join("volumes")).await.unwrap_or(0));
+    let containerd = Path::new("/var/lib/containerd");
+    if containerd.is_dir() {
+        size += du(containerd).await.unwrap_or(0);
+    }
+    *agent.docker_size.lock() = Some((Instant::now(), size));
+    Some(size)
+}
+
+/// What `dir` takes on disk, on its own filesystem (`du -skx`), at idle priority.
+async fn du(dir: &Path) -> Option<u64> {
+    let du = ["du", "-skx"];
+    let low = Command::new("ionice")
+        .args(["-c3", "nice", "-n19"])
+        .args(du)
+        .arg(dir)
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let out = match low {
+        Ok(out) => out,
+        // No ionice: du at normal priority.
+        Err(_) => Command::new(du[0])
+            .args(&du[1..])
+            .arg(dir)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .ok()?,
+    };
+    // Files of running containers come and go during the walk; du then exits
+    // with an error but still prints its total.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kib: u64 = text.split_whitespace().next()?.parse().ok()?;
+    Some(kib * 1024)
+}
+
 /// Sizes from `docker system df`, this node's volumes, each app's share, and
 /// facade's own files.
 pub async fn refresh_report(agent: &Agent) {
@@ -158,12 +219,14 @@ pub async fn refresh_report(agent: &Agent) {
         vec![agent.runtime.sized_volumes_dir()],
     )
     .await;
+    let docker_on_disk = docker_on_disk(agent).await;
     let mut report = StorageReport {
         at: facade_core::now(),
         last_cleanup: agent.last_cleanup.lock().clone(),
         disk_used,
         disk_total,
         facade_files,
+        docker_on_disk,
         ..Default::default()
     };
     if let Ok(out) = Command::new("docker")

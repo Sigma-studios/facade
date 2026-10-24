@@ -501,17 +501,49 @@ fn Ports(
 /// What takes the node's disk, as one bar: Docker's parts, facade's files, the
 /// rest of the system, and what is free. Then orphaned volumes and the last cleanup.
 #[component]
-fn StorageBreakdown(storage: StorageReport, #[prop(into)] orphaned: Signal<(usize, u64)>) -> impl IntoView {
+fn StorageBreakdown(
+    storage: StorageReport,
+    #[prop(into)] orphaned: Signal<(usize, u64)>,
+) -> impl IntoView {
     let total = storage.disk_total;
     let share = move |n: u64| percent(n, total);
-    let parts = [
-        ("Images", storage.images, "disk-1", "Apps' images, and those kept for rollbacks"),
-        ("Build cache", storage.build_cache, "disk-2", "Reused by the next builds; cleanups trim it"),
-        ("Volumes", storage.volumes_size, "disk-3", "Apps' data"),
-        ("Containers", storage.containers, "disk-4", "Written inside containers, outside volumes: lost on redeploy"),
-        ("façade", storage.facade_files, "disk-5", "Static sites, certificates, build folders; on the server, its database, uploads and backups"),
-        ("Other", storage.other(), "disk-6", "The system, other programs, logs"),
-    ];
+    // Measured, images and build cache are one part: Docker's figures for each
+    // share layers, so they would add up to more than the disk holds.
+    let docker_parts = match storage.images_and_cache() {
+        Some(both) => vec![(
+            "Images & build cache",
+            both,
+            "disk-1",
+            format!(
+                "Measured on disk, with containers' logs. Docker counts {} of images and {} of build cache, which share layers.",
+                bytes(storage.images),
+                bytes(storage.build_cache)
+            ),
+        )],
+        None => vec![
+            (
+                "Images",
+                storage.images,
+                "disk-1",
+                "Apps' images, and those kept for rollbacks".to_string(),
+            ),
+            (
+                "Build cache",
+                storage.build_cache,
+                "disk-2",
+                "Reused by the next builds; cleanups trim it".to_string(),
+            ),
+        ],
+    };
+    let parts: Vec<(&str, u64, &str, String)> = docker_parts
+        .into_iter()
+        .chain([
+            ("Volumes", storage.volumes_size, "disk-3", "Apps' data".to_string()),
+            ("Containers", storage.containers, "disk-4", "Written inside containers, outside volumes: lost on redeploy".to_string()),
+            ("façade", storage.facade_files, "disk-5", "Static sites, certificates, build folders; on the server, its database, uploads and backups".to_string()),
+            ("Other", storage.other(), "disk-6", "The system and other programs".to_string()),
+        ])
+        .collect();
     let free = total.saturating_sub(storage.disk_used);
     let cleanup = storage.last_cleanup.as_ref().map(|c| {
         format!(
@@ -535,11 +567,11 @@ fn StorageBreakdown(storage: StorageReport, #[prop(into)] orphaned: Signal<(usiz
                 </div>
             })}
             <ul class="disk-legend">
-                {parts.iter().map(|&(label, size, class, hint)| view! {
-                    <li title=hint>
+                {parts.iter().map(|(label, size, class, hint)| view! {
+                    <li title=hint.clone()>
                         <span class=format!("disk-swatch {class}") aria-hidden="true"></span>
-                        <span class="disk-name">{label}</span>
-                        <span class="disk-size">{bytes(size)}</span>
+                        <span class="disk-name">{*label}</span>
+                        <span class="disk-size">{bytes(*size)}</span>
                     </li>
                 }).collect_view()}
                 <li title="Space left on the node's disk">
