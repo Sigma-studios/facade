@@ -9,7 +9,7 @@ use leptos_router::components::A;
 use super::overview::NodeCard;
 use crate::api;
 use crate::components::{CopyField, ErrorNote, Loading, Modal, UsageCharts};
-use crate::util::{ago, bytes, me, percent, polled, run, toasts};
+use crate::util::{Polled, ago, bytes, me, percent, polled, run, toasts};
 
 /// The usage charts of one node, picked among them when there are several.
 #[component]
@@ -157,14 +157,6 @@ pub fn Nodes() -> impl IntoView {
             },
         );
     };
-    let prune = move |name: String, aggressive: bool| {
-        let path = format!("/api/nodes/{name}/prune?aggressive={aggressive}");
-        run(
-            format!("Cleaning up {name}; the figures update in a minute"),
-            async move { api::act(&path).await },
-            move || {},
-        );
-    };
     let volumes = polled(Some(Duration::from_secs(30)), || async {
         api::get::<Vec<VolumeView>>("/api/volumes").await
     });
@@ -219,35 +211,16 @@ pub fn Nodes() -> impl IntoView {
                             let name2 = node.name.clone();
                             let name3 = node.name.clone();
                             let name4 = node.name.clone();
-                            let name5 = node.name.clone();
                             let name6 = node.name.clone();
                             let current_ip = node.public_ip.clone().unwrap_or_default();
                             let local = node.local;
                             let connected = node.connected;
                             let storage = node.storage.clone();
-                            let node_name = node.name.clone();
-                            let orphaned = Signal::derive(move || volumes.data.with(|v| {
-                                v.iter().flatten()
-                                    .filter(|v| v.node == node_name && !v.declared)
-                                    .fold((0, 0), |(n, size), v| (n + 1, size + v.size.unwrap_or(0)))
-                            }));
+                            let orphaned = orphaned_on(volumes, node.name.clone());
                             view! {
                                 <div class="node-wrap">
                                     <NodeCard node=node/>
-                                    {storage.map(|s| view! { <StorageBreakdown storage=s orphaned/> })}
-                                    <div class="card-actions">
-                                        <Show when=move || connected && me.is_admin()>
-                                            <button class="link-button" title="Remove dangling images and build cache unused for a week"
-                                                on:click={
-                                                    let name = name4.clone();
-                                                    move |_| prune(name.clone(), false)
-                                                }>"Clean up"</button>
-                                            <button class="link-button" title="Also drop the whole build cache (next builds start from scratch) and the images kept for rollbacks"
-                                                on:click={
-                                                    let name = name5.clone();
-                                                    move |_| prune(name.clone(), true)
-                                                }>"Deep clean"</button>
-                                        </Show>
+                                    <NodeDisk name=name4.clone() connected storage=Signal::derive(move || storage.clone()) orphaned>
                                         <Show when=move || me.is_admin()>
                                             <button class="link-button" on:click={
                                                 let name = name3.clone();
@@ -273,7 +246,7 @@ pub fn Nodes() -> impl IntoView {
                                                 }
                                             }>"Remove"</button>
                                         </Show>
-                                    </div>
+                                    </NodeDisk>
                                 </div>
                             }
                         }
@@ -498,99 +471,208 @@ fn Ports(
     }
 }
 
-/// What takes the node's disk, as one bar: Docker's parts, facade's files, the
-/// rest of the system, and what is free. Then orphaned volumes and the last cleanup.
+/// A node's disk as one coloured bar, and its cleanup buttons: the same on the
+/// overview and the Nodes page. Hovering (or focusing) a part, or its name, says
+/// what it holds and how much it takes. `children` adds buttons to the row.
 #[component]
-fn StorageBreakdown(
-    storage: StorageReport,
+pub fn NodeDisk(
+    name: String,
+    connected: bool,
+    #[prop(into)] storage: Signal<Option<StorageReport>>,
     #[prop(into)] orphaned: Signal<(usize, u64)>,
+    #[prop(optional)] children: Option<Children>,
 ) -> impl IntoView {
-    let total = storage.disk_total;
-    let share = move |n: u64| percent(n, total);
+    let me = me();
+    let name = StoredValue::new(name);
+    view! {
+        {move || storage.get().map(|s| view! { <DiskBreakdown storage=s orphaned/> })}
+        <div class="card-actions">
+            <Show when=move || connected && me.is_admin()>
+                <button class="link-button" title="Remove dangling images and build cache unused for a week"
+                    on:click=move |_| prune(&name.get_value(), false)>"Clean up"</button>
+                <button class="link-button" title="Also drop the whole build cache (next builds start from scratch) and the images kept for rollbacks"
+                    on:click=move |_| prune(&name.get_value(), true)>"Deep clean"</button>
+            </Show>
+            {children.map(|c| c())}
+        </div>
+    }
+}
+
+/// How many volumes on `node` no app declares, and their size.
+pub fn orphaned_on(volumes: Polled<Vec<VolumeView>>, node: String) -> Signal<(usize, u64)> {
+    Signal::derive(move || {
+        volumes.data.with(|v| {
+            v.iter()
+                .flatten()
+                .filter(|v| v.node == node && !v.declared)
+                .fold((0, 0), |(n, size), v| (n + 1, size + v.size.unwrap_or(0)))
+        })
+    })
+}
+
+fn prune(name: &str, aggressive: bool) {
+    let path = format!("/api/nodes/{name}/prune?aggressive={aggressive}");
+    run(
+        format!("Cleaning up {name}; the figures update in a minute"),
+        async move { api::act(&path).await },
+        move || {},
+    );
+}
+
+/// One part of the disk: its name, size, colour class and what it holds.
+#[derive(Clone)]
+struct DiskPart {
+    label: &'static str,
+    size: u64,
+    class: &'static str,
+    hint: String,
+}
+
+fn disk_parts(storage: &StorageReport) -> Vec<DiskPart> {
+    let part = |label, size, class, hint: &str| DiskPart {
+        label,
+        size,
+        class,
+        hint: hint.to_string(),
+    };
     // Measured, images and build cache are one part: Docker's figures for each
     // share layers, so they would add up to more than the disk holds.
-    let docker_parts = match storage.images_and_cache() {
-        Some(both) => vec![(
+    let mut parts = match storage.images_and_cache() {
+        Some(both) => vec![part(
             "Images & build cache",
             both,
             "disk-1",
-            format!(
-                "Measured on disk, with containers' logs. Docker counts {} of images and {} of build cache, which share layers.",
+            &format!(
+                "Docker counts {} of images and {} of build cache; they share layers.",
                 bytes(storage.images),
                 bytes(storage.build_cache)
             ),
         )],
         None => vec![
-            (
+            part(
                 "Images",
                 storage.images,
                 "disk-1",
-                "Apps' images, and those kept for rollbacks".to_string(),
+                "Apps' images, and those kept for rollbacks.",
             ),
-            (
+            part(
                 "Build cache",
                 storage.build_cache,
                 "disk-2",
-                "Reused by the next builds; cleanups trim it".to_string(),
+                "Reused by the next builds; cleanups trim it.",
             ),
         ],
     };
-    let parts: Vec<(&str, u64, &str, String)> = docker_parts
-        .into_iter()
-        .chain([
-            ("Volumes", storage.volumes_size, "disk-3", "Apps' data".to_string()),
-            ("Containers", storage.containers, "disk-4", "Written inside containers, outside volumes: lost on redeploy".to_string()),
-            ("façade", storage.facade_files, "disk-5", "Static sites, certificates, build folders; on the server, its database, uploads and backups".to_string()),
-            ("Other", storage.other(), "disk-6", "The system and other programs".to_string()),
-        ])
-        .collect();
-    let free = total.saturating_sub(storage.disk_used);
+    parts.extend([
+        part("Volumes", storage.volumes_size, "disk-3", "Apps' data."),
+        part(
+            "Containers",
+            storage.containers,
+            "disk-4",
+            "Written inside containers: lost on redeploy.",
+        ),
+        part(
+            "façade",
+            storage.facade_files,
+            "disk-5",
+            "Static sites, certificates, builds; the server's database, uploads, backups.",
+        ),
+        part(
+            "Other",
+            storage.other(),
+            "disk-6",
+            "The system and other programs.",
+        ),
+        part(
+            "Free",
+            storage.disk_total.saturating_sub(storage.disk_used),
+            "disk-free",
+            "Space left on the node's disk.",
+        ),
+    ]);
+    parts
+}
+
+#[component]
+fn DiskBreakdown(storage: StorageReport, orphaned: Signal<(usize, u64)>) -> impl IntoView {
+    let total = storage.disk_total;
+    let parts = StoredValue::new(disk_parts(&storage));
+    let active = RwSignal::new(None::<usize>);
+    let class_of = move |i: usize, base: &str| match active.get() {
+        Some(a) if a != i => format!("{base} dim"),
+        Some(_) => format!("{base} on"),
+        None => base.to_string(),
+    };
+    let summary = format!("{} used of {}. ", bytes(storage.disk_used), bytes(total));
+    let reclaimable = storage.build_cache_reclaimable;
     let cleanup = storage.last_cleanup.as_ref().map(|c| {
         format!(
-            "{}cleaned {}, freed {}",
-            if c.aggressive { "deep-" } else { "" },
+            "{}leaned {}, freed {}.",
+            if c.aggressive { "Deep-c" } else { "C" },
             ago(c.at),
             bytes(c.freed)
         )
     });
-    let reclaimable = storage.build_cache_reclaimable;
+    let used = storage.disk_used;
     view! {
         <div class="storage-line small">
             {(total > 0).then(|| view! {
-                <div class="disk-bar" role="img"
-                    aria-label=format!("{} of {} used", bytes(storage.disk_used), bytes(total))>
-                    {parts.iter().filter(|p| p.1 > 0).map(|&(label, size, class, _)| view! {
-                        <div class=format!("disk-seg {class}")
-                            style=format!("width: {:.2}%", share(size))
-                            title=format!("{label}: {} ({:.0} %)", bytes(size), share(size))></div>
-                    }).collect_view()}
+                <div class="disk-bar" role="img" aria-label=format!("{} of {} used", bytes(used), bytes(total))
+                    on:mouseleave=move |_| active.set(None)>
+                    {parts.with_value(|parts| parts.iter().enumerate()
+                        .filter(|(_, p)| p.size > 0 && p.class != "disk-free")
+                        .map(|(i, p)| {
+                            let base = format!("disk-seg {}", p.class);
+                            view! {
+                                <div class=move || class_of(i, &base)
+                                    style=format!("width: {:.2}%", percent(p.size, total))
+                                    on:mouseenter=move |_| active.set(Some(i))></div>
+                            }
+                        })
+                        .collect_view())}
                 </div>
             })}
             <ul class="disk-legend">
-                {parts.iter().map(|(label, size, class, hint)| view! {
-                    <li title=hint.clone()>
-                        <span class=format!("disk-swatch {class}") aria-hidden="true"></span>
-                        <span class="disk-name">{*label}</span>
-                        <span class="disk-size">{bytes(*size)}</span>
-                    </li>
-                }).collect_view()}
-                <li title="Space left on the node's disk">
-                    <span class="disk-swatch disk-free" aria-hidden="true"></span>
-                    <span class="disk-name">"Free"</span>
-                    <span class="disk-size">{bytes(free)}</span>
-                </li>
+                {parts.with_value(|parts| parts.iter().enumerate().map(|(i, p)| {
+                    let base = "disk-key".to_string();
+                    view! {
+                        <li tabindex="0" class=move || class_of(i, &base)
+                            on:mouseenter=move |_| active.set(Some(i))
+                            on:mouseleave=move |_| active.set(None)
+                            on:focus=move |_| active.set(Some(i))
+                            on:blur=move |_| active.set(None)>
+                            <span class=format!("disk-swatch {}", p.class) aria-hidden="true"></span>
+                            {p.label}
+                        </li>
+                    }
+                }).collect_view())}
             </ul>
-            <div class="muted">
-                {(reclaimable > 0).then(|| format!("{} of build cache unused for now. ", bytes(reclaimable)))}
-                {move || {
-                    let (count, size) = orphaned.get();
-                    (count > 0).then(|| view! {
-                        <a href="#volumes" class="disk-orphans">
-                            {format!("{count} orphaned volume{} ({}) no app declares. ", if count == 1 { "" } else { "s" }, bytes(size))}
-                        </a>
-                    })
+            <div class="disk-detail" aria-live="polite">
+                {move || match active.get() {
+                    Some(i) => parts.with_value(|parts| {
+                        let p = &parts[i];
+                        view! {
+                            <strong>{format!("{}: {}", p.label, bytes(p.size))}</strong>
+                            {format!(" · {:.0} % · {}", percent(p.size, total), p.hint)}
+                        }
+                    }).into_any(),
+                    None => view! {
+                        <span class="muted">
+                            {summary.clone()}
+                            {(reclaimable > 0).then(|| format!("{} of build cache unused for now. ", bytes(reclaimable)))}
+                            {move || {
+                                let (count, size) = orphaned.get();
+                                (count > 0).then(|| view! {
+                                    <a href="/nodes#volumes" class="disk-orphans">
+                                        {format!("{count} orphaned volume{} ({}) no app declares.", if count == 1 { "" } else { "s" }, bytes(size))}
+                                    </a>
+                                    " "
+                                })
+                            }}
+                            {cleanup.clone()}
+                        </span>
+                    }.into_any(),
                 }}
-                {cleanup}
             </div>
         </div>
     }
