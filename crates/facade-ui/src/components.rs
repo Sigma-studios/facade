@@ -1,8 +1,8 @@
 use facade_core::api::UsagePoint;
-use facade_core::proto::AppState;
+use facade_core::proto::{AppState, StorageReport};
 use leptos::prelude::*;
 
-use crate::util::{bytes, copy_to_clipboard, cpus, toasts};
+use crate::util::{bytes, copy_to_clipboard, cpus, percent, toasts};
 
 /// App state as icon + label; the colour only reinforces it.
 #[component]
@@ -654,6 +654,180 @@ pub fn AmountSlider(
                     }.into_any()
                 }
             }}
+        </div>
+    }
+}
+
+/// One part of a node's disk: its name, size, colour class and what it holds.
+#[derive(Clone, PartialEq)]
+struct DiskPart {
+    label: &'static str,
+    size: u64,
+    class: &'static str,
+    hint: String,
+}
+
+fn disk_parts(storage: &StorageReport) -> Vec<DiskPart> {
+    let part = |label, size, class, hint: &str| DiskPart {
+        label,
+        size,
+        class,
+        hint: hint.to_string(),
+    };
+    // Measured, images and build cache are one part: Docker's figures for each
+    // share layers, so they would add up to more than the disk holds.
+    let mut parts = match storage.images_and_cache() {
+        Some(both) => vec![part(
+            "Images & build cache",
+            both,
+            "disk-1",
+            &format!(
+                "Docker counts {} of images and {} of build cache; they share layers.",
+                bytes(storage.images),
+                bytes(storage.build_cache)
+            ),
+        )],
+        None => vec![
+            part(
+                "Images",
+                storage.images,
+                "disk-1",
+                "Apps' images, and those kept for rollbacks.",
+            ),
+            part(
+                "Build cache",
+                storage.build_cache,
+                "disk-2",
+                "Reused by the next builds; cleanups trim it.",
+            ),
+        ],
+    };
+    parts.extend([
+        part("Volumes", storage.volumes_size, "disk-3", "Apps' data."),
+        part(
+            "Containers",
+            storage.containers,
+            "disk-4",
+            "Written inside containers: lost on redeploy.",
+        ),
+        part(
+            "façade",
+            storage.facade_files,
+            "disk-5",
+            "Static sites, certificates, builds; the server's database, uploads, backups.",
+        ),
+        part(
+            "Other",
+            storage.other(),
+            "disk-6",
+            "The system and other programs.",
+        ),
+        part(
+            "Free",
+            storage.disk_total.saturating_sub(storage.disk_used),
+            "disk-free",
+            "Space left on the node's disk.",
+        ),
+    ]);
+    parts
+}
+
+/// A node's disk meter. Once the node has reported what takes the space, the bar
+/// is split into one coloured part each (free space last), and hovering a part
+/// shows an infotip saying what it holds; until then, a plain meter.
+#[component]
+pub fn DiskMeter(
+    #[prop(into)] storage: Signal<Option<StorageReport>>,
+    #[prop(into)] used: Signal<u64>,
+    total: u64,
+) -> impl IntoView {
+    let share = move || percent(used.get(), total);
+    let high = move || share() >= 90.0;
+    let parts =
+        Memo::new(move |_| storage.with(|s| s.as_ref().map(disk_parts).unwrap_or_default()));
+    // The part under the pointer, and where the pointer is along the bar (0 to 1).
+    let active = RwSignal::new(None::<usize>);
+    let at = RwSignal::new(0.0_f64);
+    let on_move = move |ev: leptos::ev::MouseEvent| {
+        use wasm_bindgen::JsCast;
+        let Some(target) = ev.current_target() else {
+            return;
+        };
+        let rect = target
+            .unchecked_into::<web_sys::Element>()
+            .get_bounding_client_rect();
+        if rect.width() > 0.0 {
+            at.set(((ev.client_x() as f64 - rect.left()) / rect.width()).clamp(0.0, 1.0));
+        }
+    };
+    let described = move || {
+        parts.with(|parts| {
+            parts
+                .iter()
+                .map(|p| format!("{} {}", p.label, bytes(p.size)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    };
+    let bar = move || {
+        let parts = parts.get();
+        if parts.is_empty() {
+            return view! {
+                <div class=move || if high() { "meter-fill meter-fill-high" } else { "meter-fill" }
+                    style=move || format!("width: {:.1}%", share().clamp(0.0, 100.0))></div>
+            }
+            .into_any();
+        }
+        parts
+            .into_iter()
+            .enumerate()
+            .filter(|(_, p)| p.size > 0)
+            .map(|(i, p)| {
+                let class = format!("disk-seg {}", p.class);
+                view! {
+                    <div class=move || if active.get().is_some_and(|a| a != i) { format!("{class} dim") } else { class.clone() }
+                        style=format!("width: {:.2}%", percent(p.size, total))
+                        on:mouseenter=move |_| active.set(Some(i))></div>
+                }
+            })
+            .collect_view()
+            .into_any()
+    };
+    let tip = move || {
+        let p = parts.with(|parts| active.get().and_then(|i| parts.get(i).cloned()))?;
+        // Follows the pointer, shifted so it never leaves the bar's width.
+        let x = at.get() * 100.0;
+        Some(view! {
+            <div class="disk-tip" role="tooltip"
+                style=format!("left: {x:.1}%; transform: translateX(-{x:.1}%)")>
+                <div class="disk-tip-head">
+                    <span class=format!("disk-swatch {}", p.class) aria-hidden="true"></span>
+                    <strong>{p.label}</strong>
+                </div>
+                <div class="disk-tip-size">{format!("{} · {:.0} %", bytes(p.size), percent(p.size, total))}</div>
+                <div class="disk-tip-hint">{p.hint}</div>
+            </div>
+        })
+    };
+    view! {
+        <div class="meter">
+            <div class="meter-head">
+                <span class="meter-label">"Disk"</span>
+                <span class="meter-value">
+                    <Show when=high>
+                        <span class="meter-warn" title="above 90 %">"⚠ "</span>
+                    </Show>
+                    {move || format!("{} / {}", bytes(used.get()), bytes(total))}
+                </span>
+            </div>
+            <div class="disk-wrap" on:mousemove=on_move on:mouseleave=move |_| active.set(None)>
+                <div class="meter-track disk-track" role="meter" aria-label=move || format!("Disk: {}", described())
+                    aria-valuenow=move || format!("{:.0}", share())
+                    aria-valuemin="0" aria-valuemax="100">
+                    {bar}
+                </div>
+                {tip}
+            </div>
         </div>
     }
 }

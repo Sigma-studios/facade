@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use facade_core::api::{AlertView, AppView, NodeView, StatusView, UsagePoint, VolumeView};
+use facade_core::proto::StorageReport;
 use leptos::prelude::*;
 use leptos_router::components::A;
 
 use super::nodes::{NodeDisk, orphaned_on};
 use crate::api;
-use crate::components::{ErrorNote, Loading, Meter, OnlineBadge, StateBadge, Trend};
+use crate::components::{DiskMeter, ErrorNote, Loading, Meter, OnlineBadge, StateBadge, Trend};
 use crate::util::{ago, bytes, cpus, me, percent, polled};
 
 #[component]
@@ -85,7 +86,7 @@ pub fn Overview() -> impl IntoView {
                                 let connected = node.connected;
                                 view! {
                                     <div class="node-wrap">
-                                        <NodeCard node trends=true/>
+                                        <NodeCard node trends=true storage/>
                                         <NodeDisk name connected storage orphaned/>
                                     </div>
                                 }
@@ -111,7 +112,17 @@ pub fn Overview() -> impl IntoView {
 
 #[component]
 /// `trends` adds each meter's last hour beside it.
-pub fn NodeCard(node: NodeView, #[prop(optional)] trends: bool) -> impl IntoView {
+pub fn NodeCard(
+    node: NodeView,
+    #[prop(optional)] trends: bool,
+    /// What takes the disk, followed as reports arrive; else the node's own.
+    #[prop(optional, into)]
+    storage: Option<Signal<Option<StorageReport>>>,
+) -> impl IntoView {
+    let storage = storage.unwrap_or_else({
+        let storage = node.storage.clone();
+        move || Signal::derive(move || storage.clone())
+    });
     let stats = node.stats.clone();
     let online = node.connected;
     view! {
@@ -178,8 +189,7 @@ pub fn NodeCard(node: NodeView, #[prop(optional)] trends: bool) -> impl IntoView
                                     format=Callback::new(move |v: f64| bytes((v / 100.0 * mem_total as f64) as u64))/>
                             </div>
                             <div class="meter-row">
-                                <Meter label="Disk" percent=Signal::derive(move || percent(disk_now(), disk_total))
-                                    detail=Signal::derive(move || format!("{} / {}", bytes(disk_now()), bytes(disk_total)))/>
+                                <DiskMeter storage used=Signal::derive(disk_now) total=disk_total/>
                                 <Trend label="Disk" points=disk span=span gap=40
                                     format=Callback::new(move |v: f64| bytes((v / 100.0 * disk_total as f64) as u64))/>
                             </div>
@@ -192,8 +202,7 @@ pub fn NodeCard(node: NodeView, #[prop(optional)] trends: bool) -> impl IntoView
                             detail=format!("{:.0} % of {} cores", s.cpu_percent, s.cpus)/>
                         <Meter label="Memory" percent=percent(s.mem_used, s.mem_total)
                             detail=format!("{} / {}", bytes(s.mem_used), bytes(s.mem_total))/>
-                        <Meter label="Disk" percent=percent(s.disk_used, s.disk_total)
-                            detail=format!("{} / {}", bytes(s.disk_used), bytes(s.disk_total))/>
+                        <DiskMeter storage used=s.disk_used total=s.disk_total/>
                     </div>
                 }.into_any(),
                 None => view! {

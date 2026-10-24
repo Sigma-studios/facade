@@ -9,7 +9,7 @@ use leptos_router::components::A;
 use super::overview::NodeCard;
 use crate::api;
 use crate::components::{CopyField, ErrorNote, Loading, Modal, UsageCharts};
-use crate::util::{Polled, ago, bytes, me, percent, polled, run, toasts};
+use crate::util::{Polled, ago, bytes, me, polled, run, toasts};
 
 /// The usage charts of one node, picked among them when there are several.
 #[component]
@@ -215,12 +215,15 @@ pub fn Nodes() -> impl IntoView {
                             let current_ip = node.public_ip.clone().unwrap_or_default();
                             let local = node.local;
                             let connected = node.connected;
-                            let storage = node.storage.clone();
+                            let storage = {
+                                let storage = node.storage.clone();
+                                Signal::derive(move || storage.clone())
+                            };
                             let orphaned = orphaned_on(volumes, node.name.clone());
                             view! {
                                 <div class="node-wrap">
-                                    <NodeCard node=node/>
-                                    <NodeDisk name=name4.clone() connected storage=Signal::derive(move || storage.clone()) orphaned>
+                                    <NodeCard node=node storage=storage/>
+                                    <NodeDisk name=name4.clone() connected storage orphaned>
                                         <Show when=move || me.is_admin()>
                                             <button class="link-button" on:click={
                                                 let name = name3.clone();
@@ -471,9 +474,9 @@ fn Ports(
     }
 }
 
-/// A node's disk as one coloured bar, and its cleanup buttons: the same on the
-/// overview and the Nodes page. Hovering (or focusing) a part, or its name, says
-/// what it holds and how much it takes. `children` adds buttons to the row.
+/// Under a node's card: what the disk meter does not say (unused build cache,
+/// orphaned volumes, the last cleanup), and the cleanup buttons. The same on the
+/// overview and the Nodes page; `children` adds buttons to the row.
 #[component]
 pub fn NodeDisk(
     name: String,
@@ -484,8 +487,40 @@ pub fn NodeDisk(
 ) -> impl IntoView {
     let me = me();
     let name = StoredValue::new(name);
+    let notes = move || {
+        let s = storage.get()?;
+        let reclaimable = (s.build_cache_reclaimable > 0).then(|| {
+            format!(
+                "{} of build cache unused for now. ",
+                bytes(s.build_cache_reclaimable)
+            )
+        });
+        let cleanup = s.last_cleanup.as_ref().map(|c| {
+            format!(
+                "{}leaned {}, freed {}.",
+                if c.aggressive { "Deep-c" } else { "C" },
+                ago(c.at),
+                bytes(c.freed)
+            )
+        });
+        Some(view! {
+            <div class="storage-line small muted">
+                {reclaimable}
+                {move || {
+                    let (count, size) = orphaned.get();
+                    (count > 0).then(|| view! {
+                        <a href="/nodes#volumes" class="disk-orphans">
+                            {format!("{count} orphaned volume{} ({}) no app declares.", if count == 1 { "" } else { "s" }, bytes(size))}
+                        </a>
+                        " "
+                    })
+                }}
+                {cleanup}
+            </div>
+        })
+    };
     view! {
-        {move || storage.get().map(|s| view! { <DiskBreakdown storage=s orphaned/> })}
+        {notes}
         <div class="card-actions">
             <Show when=move || connected && me.is_admin()>
                 <button class="link-button" title="Remove dangling images and build cache unused for a week"
@@ -517,163 +552,4 @@ fn prune(name: &str, aggressive: bool) {
         async move { api::act(&path).await },
         move || {},
     );
-}
-
-/// One part of the disk: its name, size, colour class and what it holds.
-#[derive(Clone)]
-struct DiskPart {
-    label: &'static str,
-    size: u64,
-    class: &'static str,
-    hint: String,
-}
-
-fn disk_parts(storage: &StorageReport) -> Vec<DiskPart> {
-    let part = |label, size, class, hint: &str| DiskPart {
-        label,
-        size,
-        class,
-        hint: hint.to_string(),
-    };
-    // Measured, images and build cache are one part: Docker's figures for each
-    // share layers, so they would add up to more than the disk holds.
-    let mut parts = match storage.images_and_cache() {
-        Some(both) => vec![part(
-            "Images & build cache",
-            both,
-            "disk-1",
-            &format!(
-                "Docker counts {} of images and {} of build cache; they share layers.",
-                bytes(storage.images),
-                bytes(storage.build_cache)
-            ),
-        )],
-        None => vec![
-            part(
-                "Images",
-                storage.images,
-                "disk-1",
-                "Apps' images, and those kept for rollbacks.",
-            ),
-            part(
-                "Build cache",
-                storage.build_cache,
-                "disk-2",
-                "Reused by the next builds; cleanups trim it.",
-            ),
-        ],
-    };
-    parts.extend([
-        part("Volumes", storage.volumes_size, "disk-3", "Apps' data."),
-        part(
-            "Containers",
-            storage.containers,
-            "disk-4",
-            "Written inside containers: lost on redeploy.",
-        ),
-        part(
-            "façade",
-            storage.facade_files,
-            "disk-5",
-            "Static sites, certificates, builds; the server's database, uploads, backups.",
-        ),
-        part(
-            "Other",
-            storage.other(),
-            "disk-6",
-            "The system and other programs.",
-        ),
-        part(
-            "Free",
-            storage.disk_total.saturating_sub(storage.disk_used),
-            "disk-free",
-            "Space left on the node's disk.",
-        ),
-    ]);
-    parts
-}
-
-#[component]
-fn DiskBreakdown(storage: StorageReport, orphaned: Signal<(usize, u64)>) -> impl IntoView {
-    let total = storage.disk_total;
-    let parts = StoredValue::new(disk_parts(&storage));
-    let active = RwSignal::new(None::<usize>);
-    let class_of = move |i: usize, base: &str| match active.get() {
-        Some(a) if a != i => format!("{base} dim"),
-        Some(_) => format!("{base} on"),
-        None => base.to_string(),
-    };
-    let summary = format!("{} used of {}. ", bytes(storage.disk_used), bytes(total));
-    let reclaimable = storage.build_cache_reclaimable;
-    let cleanup = storage.last_cleanup.as_ref().map(|c| {
-        format!(
-            "{}leaned {}, freed {}.",
-            if c.aggressive { "Deep-c" } else { "C" },
-            ago(c.at),
-            bytes(c.freed)
-        )
-    });
-    let used = storage.disk_used;
-    view! {
-        <div class="storage-line small">
-            {(total > 0).then(|| view! {
-                <div class="disk-bar" role="img" aria-label=format!("{} of {} used", bytes(used), bytes(total))
-                    on:mouseleave=move |_| active.set(None)>
-                    {parts.with_value(|parts| parts.iter().enumerate()
-                        .filter(|(_, p)| p.size > 0 && p.class != "disk-free")
-                        .map(|(i, p)| {
-                            let base = format!("disk-seg {}", p.class);
-                            view! {
-                                <div class=move || class_of(i, &base)
-                                    style=format!("width: {:.2}%", percent(p.size, total))
-                                    on:mouseenter=move |_| active.set(Some(i))></div>
-                            }
-                        })
-                        .collect_view())}
-                </div>
-            })}
-            <ul class="disk-legend">
-                {parts.with_value(|parts| parts.iter().enumerate().map(|(i, p)| {
-                    let base = "disk-key".to_string();
-                    view! {
-                        <li tabindex="0" class=move || class_of(i, &base)
-                            on:mouseenter=move |_| active.set(Some(i))
-                            on:mouseleave=move |_| active.set(None)
-                            on:focus=move |_| active.set(Some(i))
-                            on:blur=move |_| active.set(None)>
-                            <span class=format!("disk-swatch {}", p.class) aria-hidden="true"></span>
-                            {p.label}
-                        </li>
-                    }
-                }).collect_view())}
-            </ul>
-            <div class="disk-detail" aria-live="polite">
-                {move || match active.get() {
-                    Some(i) => parts.with_value(|parts| {
-                        let p = &parts[i];
-                        view! {
-                            <strong>{format!("{}: {}", p.label, bytes(p.size))}</strong>
-                            {format!(" · {:.0} % · {}", percent(p.size, total), p.hint)}
-                        }
-                    }).into_any(),
-                    None => view! {
-                        <span class="muted">
-                            {summary.clone()}
-                            {(reclaimable > 0).then(|| format!("{} of build cache unused for now. ", bytes(reclaimable)))}
-                            {move || {
-                                let (count, size) = orphaned.get();
-                                (count > 0).then(|| view! {
-                                    <a href="/nodes#volumes" class="disk-orphans">
-                                        {format!("{count} orphaned volume{} ({}) no app declares.", if count == 1 { "" } else { "s" }, bytes(size))}
-                                    </a>
-                                    " "
-                                })
-                            }}
-                            {cleanup.clone()}
-                        </span>
-                    }.into_any(),
-                }}
-            </div>
-        </div>
-    }
 }
