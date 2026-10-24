@@ -431,6 +431,12 @@ pub struct StorageReport {
     /// are volume data, left to `volumes_size`.
     #[serde(default)]
     pub facade_files: u64,
+    /// Docker's folders on disk, volumes aside: images, build cache, containers
+    /// and their logs, measured. `images` and `build_cache` are Docker's own
+    /// figures, which share layers and overlap; this is what they take together.
+    /// `None` when the agent cannot reach the folders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_on_disk: Option<u64>,
     /// The node's filesystem when the report was made, so the parts add up.
     #[serde(default)]
     pub disk_used: u64,
@@ -444,12 +450,21 @@ pub struct StorageReport {
 }
 
 impl StorageReport {
-    /// Used space neither Docker nor facade accounts for: the system, other
-    /// programs, logs.
+    /// Used space neither Docker nor facade accounts for: the system and other
+    /// programs.
     pub fn other(&self) -> u64 {
-        self.disk_used.saturating_sub(
-            self.images + self.build_cache + self.containers + self.volumes_size + self.facade_files,
-        )
+        let docker = self
+            .docker_on_disk
+            .unwrap_or(self.images + self.build_cache + self.containers);
+        self.disk_used
+            .saturating_sub(docker + self.volumes_size + self.facade_files)
+    }
+
+    /// Images and build cache together, as measured on disk: Docker's figures
+    /// for each overlap.
+    pub fn images_and_cache(&self) -> Option<u64> {
+        self.docker_on_disk
+            .map(|d| d.saturating_sub(self.containers))
     }
 }
 
@@ -564,4 +579,32 @@ pub struct NewVolume {
     /// The stack it belongs to, for the volumes a stack's services share.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn measured_docker_keeps_parts_within_the_disk() {
+        // Docker's figures overlap: 20 + 19 GB on a disk with 32.7 GB used.
+        let mut report = StorageReport {
+            images: 20 * GB,
+            build_cache: 19 * GB,
+            containers: GB / 2,
+            volumes_size: GB,
+            facade_files: GB / 4,
+            disk_used: 32 * GB,
+            disk_total: 72 * GB,
+            ..Default::default()
+        };
+        assert_eq!(report.other(), 0);
+        assert_eq!(report.images_and_cache(), None);
+
+        report.docker_on_disk = Some(27 * GB);
+        assert_eq!(report.images_and_cache(), Some(27 * GB - GB / 2));
+        assert_eq!(report.other(), 32 * GB - 27 * GB - GB - GB / 4);
+    }
 }

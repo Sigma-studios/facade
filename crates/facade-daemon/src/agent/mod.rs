@@ -102,6 +102,8 @@ pub struct Agent {
     /// Latest storage report, and whether the server still has to get it.
     storage: Mutex<(Option<StorageReport>, bool)>,
     last_cleanup: Mutex<Option<Cleanup>>,
+    /// Docker's folders on disk, measured at most every 10 minutes: when, and how much.
+    docker_size: Mutex<Option<(std::time::Instant, u64)>>,
     /// Everything facade keeps on this machine, measured for the storage report.
     files_dir: PathBuf,
 }
@@ -139,6 +141,7 @@ impl Agent {
             cancellable: Default::default(),
             storage: Default::default(),
             last_cleanup: Default::default(),
+            docker_size: Default::default(),
             files_dir,
         }))
     }

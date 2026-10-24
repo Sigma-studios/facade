@@ -3082,17 +3082,33 @@ fn print_disk(node: &NodeView, apps: &[AppView], volumes: &[VolumeView]) -> anyh
     );
     let orphaned: Vec<&VolumeView> = volumes.iter().filter(|v| !v.declared).collect();
     let orphaned_size: u64 = orphaned.iter().filter_map(|v| v.size).sum();
-    let rows = [
-        (
-            "images",
-            s.images,
-            "apps' images, and those kept for rollbacks".to_string(),
-        ),
-        (
-            "build cache",
-            s.build_cache,
-            format!("{} unused for now", bytes(s.build_cache_reclaimable)),
-        ),
+    // Measured, images and build cache are one row: Docker's figures for each
+    // share layers.
+    let docker_rows = match s.images_and_cache() {
+        Some(both) => vec![(
+            "images+cache",
+            both,
+            format!(
+                "measured; Docker counts {} images and {} build cache ({} unused), sharing layers",
+                bytes(s.images),
+                bytes(s.build_cache),
+                bytes(s.build_cache_reclaimable)
+            ),
+        )],
+        None => vec![
+            (
+                "images",
+                s.images,
+                "apps' images, and those kept for rollbacks".to_string(),
+            ),
+            (
+                "build cache",
+                s.build_cache,
+                format!("{} unused for now", bytes(s.build_cache_reclaimable)),
+            ),
+        ],
+    };
+    let rows = docker_rows.into_iter().chain([
         (
             "volumes",
             s.volumes_size,
@@ -3119,17 +3135,17 @@ fn print_disk(node: &NodeView, apps: &[AppView], volumes: &[VolumeView]) -> anyh
         (
             "other",
             s.other(),
-            "the system, other programs, logs".to_string(),
+            "the system and other programs".to_string(),
         ),
         (
             "free",
             s.disk_total.saturating_sub(s.disk_used),
             String::new(),
         ),
-    ];
+    ]);
     table(
         &["", "SIZE", "%", ""],
-        rows.into_iter().map(|(what, size, note)| {
+        rows.map(|(what, size, note)| {
             vec![
                 what.to_string(),
                 bytes(size),
