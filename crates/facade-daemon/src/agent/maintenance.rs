@@ -166,14 +166,19 @@ async fn docker_on_disk(agent: &Agent) -> Option<u64> {
     {
         return Some(size);
     }
-    let root = PathBuf::from(agent.runtime.docker().info().await.ok()?.docker_root_dir?);
+    let root = docker_root().await;
     if !root.is_dir() {
         return None;
     }
     // The volumes are reported apart (`docker system df -v` walks them).
-    let mut size = du(&root)
-        .await?
-        .saturating_sub(du(&root.join("volumes")).await.unwrap_or(0));
+    let total = match du(&root).await {
+        Ok(size) => size,
+        Err(e) => {
+            warn!("measuring Docker's folder {}: {e}", root.display());
+            return None;
+        }
+    };
+    let mut size = total.saturating_sub(du(&root.join("volumes")).await.unwrap_or(0));
     let containerd = Path::new("/var/lib/containerd");
     if containerd.is_dir() {
         size += du(containerd).await.unwrap_or(0);
@@ -182,8 +187,27 @@ async fn docker_on_disk(agent: &Agent) -> Option<u64> {
     Some(size)
 }
 
+/// Where Docker keeps its data, as its CLI says (the API's `info` does not parse
+/// on every Docker version); `/var/lib/docker` otherwise.
+async fn docker_root() -> PathBuf {
+    let out = Command::new("docker")
+        .args(["info", "--format", "{{.DockerRootDir}}"])
+        .kill_on_drop(true)
+        .output()
+        .await;
+    if let Ok(out) = out
+        && out.status.success()
+    {
+        let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !root.is_empty() {
+            return root.into();
+        }
+    }
+    PathBuf::from("/var/lib/docker")
+}
+
 /// What `dir` takes on disk, on its own filesystem (`du -skx`), at idle priority.
-async fn du(dir: &Path) -> Option<u64> {
+async fn du(dir: &Path) -> Result<u64, String> {
     let du = ["du", "-skx"];
     let low = Command::new("ionice")
         .args(["-c3", "nice", "-n19"])
@@ -201,13 +225,22 @@ async fn du(dir: &Path) -> Option<u64> {
             .kill_on_drop(true)
             .output()
             .await
-            .ok()?,
+            .map_err(|e| format!("running du: {e}"))?,
     };
     // Files of running containers come and go during the walk; du then exits
     // with an error but still prints its total.
     let text = String::from_utf8_lossy(&out.stdout);
-    let kib: u64 = text.split_whitespace().next()?.parse().ok()?;
-    Some(kib * 1024)
+    let kib: u64 = text
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| {
+            format!(
+                "du printed no total ({})",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+        })?;
+    Ok(kib * 1024)
 }
 
 /// Sizes from `docker system df`, this node's volumes, each app's share, and
