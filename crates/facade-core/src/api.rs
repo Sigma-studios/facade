@@ -608,6 +608,19 @@ pub struct NotifySettings {
     pub discord_webhook: Option<String>,
     /// Tagged on problems (not on resolutions): `@here`, `@everyone`, `user:<id>`, `role:<id>`.
     pub mentions: Vec<String>,
+    /// When a message last reached Discord, since the server started or the
+    /// webhook changed.
+    #[serde(default)]
+    pub last_sent: Option<u64>,
+    /// The last delivery that failed, and why; cleared by the next success.
+    #[serde(default)]
+    pub last_error: Option<NotifyError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotifyError {
+    pub at: u64,
+    pub error: String,
 }
 
 /// Fields left out are unchanged; an empty webhook removes it.

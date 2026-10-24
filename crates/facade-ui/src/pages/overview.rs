@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use facade_core::api::{AlertView, AppView, NodeView, StatusView, UsagePoint, VolumeView};
+use facade_core::api::{
+    AlertView, AppDiskView, AppView, NodeView, StatusView, UsagePoint, VolumeView, WRITTEN_WARNING,
+};
 use facade_core::proto::StorageReport;
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -240,13 +242,14 @@ pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
                             <th>"Node"</th>
                             <th class="num">"CPU"</th>
                             <th class="num">"Memory"</th>
+                            <th class="num">"Disk"</th>
                             <th>"Domains"</th>
                         </tr>
                     </thead>
                     <tbody>
                         <For
                             each=move || apps.get()
-                            key=|a| (a.spec.name.clone(), a.state, a.stats.as_ref().map(|s| (s.mem_used, s.cpu_percent.to_bits())), a.spec.domains.clone(), a.owner.clone())
+                            key=|a| (a.spec.name.clone(), a.state, a.stats.as_ref().map(|s| (s.mem_used, s.cpu_percent.to_bits())), a.spec.domains.clone(), a.owner.clone(), a.disk.as_ref().map(|d| (d.total(), d.written)))
                             children=move |app| {
                                 let href = format!("/apps/{}", app.spec.name);
                                 let stats = app.stats.clone().filter(|s| s.mem_used > 0);
@@ -264,6 +267,7 @@ pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
                                         <td class="muted">{app.spec.node.clone()}</td>
                                         <td class="num">{stats.as_ref().map(|s| format!("{:.1} %", s.cpu_percent))}</td>
                                         <td class="num">{stats.as_ref().map(|s| bytes(s.mem_used))}</td>
+                                        <td class="num">{app.disk.clone().filter(|d| d.total() > 0).map(|disk| view! { <DiskCell disk/> })}</td>
                                         <td>
                                             <div class="domains">
                                                 {app.spec.domains.iter().map(|d| view! {
@@ -279,5 +283,64 @@ pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
                 </table>
             </div>
         </Show>
+    }
+}
+
+/// An app's disk use in a table: the total, and on hover (or focus) what it is
+/// made of. The tip is placed on the page, so the table's scrolling box does not
+/// cut it off.
+#[component]
+fn DiskCell(disk: AppDiskView) -> impl IntoView {
+    let anchor = RwSignal::new(None::<(f64, f64)>);
+    let show = move |ev: web_sys::Event| {
+        use wasm_bindgen::JsCast;
+        if let Some(target) = ev.current_target() {
+            let rect = target
+                .unchecked_into::<web_sys::Element>()
+                .get_bounding_client_rect();
+            anchor.set(Some((rect.right(), rect.bottom())));
+        }
+    };
+    let warn = disk.written >= WRITTEN_WARNING;
+    let mut lines = vec![(
+        "Image",
+        if disk.rollback_images > 0 {
+            format!(
+                "{} (+{} for rollbacks)",
+                bytes(disk.images),
+                disk.rollback_images
+            )
+        } else {
+            bytes(disk.images)
+        },
+    )];
+    if disk.volumes > 0 {
+        lines.push(("Volumes", bytes(disk.volumes)));
+    }
+    if disk.files > 0 {
+        lines.push(("Static files", bytes(disk.files)));
+    }
+    lines.push(("Written in the container", bytes(disk.written)));
+    view! {
+        <span class="cell-tip-host" tabindex="0"
+            on:mouseenter=move |ev| show(ev.into())
+            on:focus=move |ev| show(ev.into())
+            on:mouseleave=move |_| anchor.set(None)
+            on:blur=move |_| anchor.set(None)>
+            {warn.then(|| view! { <span class="meter-warn" title="written inside the container: lost on redeploy">"⚠ "</span> })}
+            {bytes(disk.total())}
+        </span>
+        {move || anchor.get().map(|(right, bottom)| view! {
+            <div class="cell-tip" role="tooltip"
+                style=format!("left: {right:.0}px; top: {:.0}px", bottom + 4.0)>
+                <dl>
+                    {lines.iter().map(|(k, v)| view! { <dt>{*k}</dt><dd>{v.clone()}</dd> }).collect_view()}
+                </dl>
+                {warn.then(|| view! {
+                    <div class="cell-tip-warn">"Written inside the container is lost on redeploy: keep it in a volume."</div>
+                })}
+                <div class="muted">{format!("Measured {}", ago(disk.at))}</div>
+            </div>
+        })}
     }
 }

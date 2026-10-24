@@ -677,7 +677,7 @@ async fn test_alert(State(server): S, user: User) -> ApiResult<StatusCode> {
     }
     server
         .notifier
-        .test()
+        .test(&server.store)
         .await
         .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)

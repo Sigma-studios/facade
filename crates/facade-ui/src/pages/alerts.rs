@@ -112,6 +112,7 @@ fn DiscordSettings() -> impl IntoView {
                 Ok(()) => toasts().ok("Test message sent. Check your Discord channel."),
                 Err(e) => toasts().err(e),
             }
+            settings.reload();
         });
     };
     let configured = move || {
@@ -119,46 +120,111 @@ fn DiscordSettings() -> impl IntoView {
             .data
             .with(|s| s.as_ref().is_some_and(|s| s.discord_webhook.is_some()))
     };
+    // Once a webhook is set, the form only opens to change it.
+    let editing = RwSignal::new(false);
+    let status = move || {
+        settings
+            .data
+            .get()
+            .filter(|s| s.discord_webhook.is_some())
+            .map(|s| {
+                let failing = s
+                    .last_error
+                    .as_ref()
+                    .is_some_and(|e| s.last_sent.is_none_or(|ok| e.at > ok));
+                let tags = if s.mentions.is_empty() {
+                    "Problems tag nobody.".to_string()
+                } else {
+                    format!("Problems tag {}.", s.mentions.join(" "))
+                };
+                view! {
+                    <dl class="kv notify-status">
+                        <dt>"Webhook"</dt>
+                        <dd><code>{s.discord_webhook.clone().unwrap_or_default()}</code></dd>
+                        <dt>"Tags"</dt>
+                        <dd>{tags}</dd>
+                        <dt>"Last message"</dt>
+                        <dd>{match s.last_sent {
+                            Some(at) => format!("delivered {}", ago(at)),
+                            None => "none since the server started: send a test to check".into(),
+                        }}</dd>
+                        {failing.then(|| s.last_error.clone()).flatten().map(|e| view! {
+                            <dt>"Last failure"</dt>
+                            <dd class="notify-error">
+                                <span aria-hidden="true">"⚠ "</span>
+                                {format!("{} ({})", e.error, ago(e.at))}
+                            </dd>
+                        })}
+                    </dl>
+                }
+            })
+    };
+    let badge = move || {
+        settings.data.with(|s| match s {
+            None => view! { <span></span> }.into_any(),
+            Some(s) if s.discord_webhook.is_none() => view! {
+                <span class="badge badge-muted"><span class="badge-icon" aria-hidden="true">"○"</span>"off"</span>
+            }.into_any(),
+            Some(s) if s.last_error.as_ref().is_some_and(|e| s.last_sent.is_none_or(|ok| e.at > ok)) => view! {
+                <span class="badge badge-critical"><span class="badge-icon" aria-hidden="true">"⚠"</span>"failing"</span>
+            }.into_any(),
+            Some(_) => view! {
+                <span class="badge badge-good"><span class="badge-icon" aria-hidden="true">"●"</span>"on"</span>
+            }.into_any(),
+        })
+    };
 
     view! {
         <section class="card form">
-            <h2 class="section-title">"Discord notifications"</h2>
-            <p class="muted small">
-                "Problems and their resolutions are posted to a channel. Create a webhook in the channel's "
-                "settings: Integrations → Webhooks → New Webhook → Copy URL."
-            </p>
-            <form class="form" on:submit=save>
-                <label class="field">
-                    <span>"Webhook URL"</span>
-                    <input type="password" bind:value=webhook autocomplete="off"
-                        placeholder=move || settings.data.get()
-                            .and_then(|s| s.discord_webhook)
-                            .unwrap_or_else(|| "https://discord.com/api/webhooks/…".into())/>
-                    <small>{move || if configured() {
-                        "Set. Leave empty to keep the current one."
-                    } else {
-                        "Not set: alerts are only written to the server log."
-                    }}</small>
-                </label>
-                <label class="field">
-                    <span>"Tag on problems"</span>
-                    <input type="text" bind:value=mentions placeholder="@here user:123456789 role:987654321"/>
-                    <small>
-                        "@here, @everyone, user:<id> or role:<id>, separated by spaces. Resolutions never tag. "
-                        "Copy ids with Discord's developer mode (right-click → Copy ID)."
-                    </small>
-                </label>
-                <ErrorNote error=error/>
+            <div class="section-head">
+                <h2 class="section-title">"Discord notifications"</h2>
+                {badge}
+            </div>
+            <Show when=configured fallback=|| view! {
+                <p class="muted small">
+                    "Not set: alerts are only written to the server log. Post problems and their resolutions to a channel: "
+                    "create a webhook in the channel's settings (Integrations → Webhooks → New Webhook → Copy URL) and paste it below."
+                </p>
+            }>
+                <p class="muted small">"Problems and their resolutions are posted to your Discord channel."</p>
+                {status}
+            </Show>
+            <Show when=move || !configured() || editing.get()>
+                <form class="form" on:submit=move |ev| { save(ev); editing.set(false); }>
+                    <label class="field">
+                        <span>{move || if configured() { "New webhook URL" } else { "Webhook URL" }}</span>
+                        <input type="password" bind:value=webhook autocomplete="off"
+                            placeholder="https://discord.com/api/webhooks/…"/>
+                        <Show when=configured>
+                            <small>"Leave empty to keep the current one."</small>
+                        </Show>
+                    </label>
+                    <label class="field">
+                        <span>"Tag on problems"</span>
+                        <input type="text" bind:value=mentions placeholder="@here user:123456789 role:987654321"/>
+                        <small>
+                            "@here, @everyone, user:<id> or role:<id>, separated by spaces. Resolutions never tag. "
+                            "Copy ids with Discord's developer mode (right-click → Copy ID)."
+                        </small>
+                    </label>
+                    <ErrorNote error=error/>
+                    <div class="form-actions">
+                        <Show when=configured>
+                            <button type="button" class="button" on:click=move |_| editing.set(false)>"Cancel"</button>
+                        </Show>
+                        <button type="submit" class="button button-primary">"Save"</button>
+                    </div>
+                </form>
+            </Show>
+            <Show when=move || configured() && !editing.get()>
                 <div class="form-actions">
-                    <Show when=configured>
-                        <button type="button" class="button button-danger-quiet" on:click=remove_webhook>
-                            "Remove webhook"
-                        </button>
-                        <button type="button" class="button" on:click=test>"Send test"</button>
-                    </Show>
-                    <button type="submit" class="button button-primary">"Save"</button>
+                    <button type="button" class="button button-danger-quiet" on:click=remove_webhook>
+                        "Remove webhook"
+                    </button>
+                    <button type="button" class="button" on:click=move |_| editing.set(true)>"Change"</button>
+                    <button type="button" class="button button-primary" on:click=test>"Send test"</button>
                 </div>
-            </form>
+            </Show>
         </section>
     }
 }
