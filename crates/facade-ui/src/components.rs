@@ -831,3 +831,98 @@ pub fn DiskMeter(
         </div>
     }
 }
+
+/// What a table cell sorts by. Missing values go last whichever the direction.
+pub enum SortKey {
+    Text(String),
+    Num(f64),
+    Missing,
+}
+
+impl SortKey {
+    pub fn text(s: impl AsRef<str>) -> Self {
+        match s.as_ref() {
+            "" => SortKey::Missing,
+            s => SortKey::Text(s.to_lowercase()),
+        }
+    }
+
+    pub fn num(n: Option<impl Into<f64>>) -> Self {
+        n.map_or(SortKey::Missing, |n| SortKey::Num(n.into()))
+    }
+}
+
+/// A table's sort: the column and whether it goes down. Unsorted keeps the
+/// order the server sent.
+#[derive(Clone, Copy)]
+pub struct Sort(RwSignal<Option<(usize, bool)>>);
+
+impl Sort {
+    pub fn new() -> Self {
+        Sort(RwSignal::new(None))
+    }
+
+    /// Each click on a column: its first direction, the other one, then unsorted.
+    fn click(self, col: usize, desc_first: bool) {
+        self.0.update(|s| {
+            *s = match *s {
+                Some((c, desc)) if c == col && desc == desc_first => Some((col, !desc)),
+                Some((c, _)) if c == col => None,
+                _ => Some((col, desc_first)),
+            }
+        });
+    }
+
+    /// Sorts `rows` by `key(column, row)`; stable, so ties keep the server's order.
+    pub fn apply<T>(self, rows: &mut [T], key: impl Fn(usize, &T) -> SortKey) {
+        use std::cmp::Ordering;
+        let Some((col, desc)) = self.0.get() else {
+            return;
+        };
+        rows.sort_by(|a, b| {
+            let by = match (key(col, a), key(col, b)) {
+                (SortKey::Missing, SortKey::Missing) => return Ordering::Equal,
+                (SortKey::Missing, _) => return Ordering::Greater,
+                (_, SortKey::Missing) => return Ordering::Less,
+                (SortKey::Num(a), SortKey::Num(b)) => a.total_cmp(&b),
+                (SortKey::Text(a), SortKey::Text(b)) => a.cmp(&b),
+                (SortKey::Num(_), SortKey::Text(_)) => Ordering::Less,
+                (SortKey::Text(_), SortKey::Num(_)) => Ordering::Greater,
+            };
+            if desc { by.reverse() } else { by }
+        });
+    }
+}
+
+/// A column header that sorts its table. `desc` makes the first click put the
+/// largest (or newest) first, as wanted for amounts and times.
+#[component]
+pub fn SortTh(
+    sort: Sort,
+    col: usize,
+    label: &'static str,
+    #[prop(optional)] num: bool,
+    #[prop(optional)] desc: bool,
+) -> impl IntoView {
+    let state = move || sort.0.get().filter(|(c, _)| *c == col).map(|(_, d)| d);
+    view! {
+        <th class=num.then_some("num")
+            aria-sort=move || match state() {
+                Some(true) => "descending",
+                Some(false) => "ascending",
+                None => "none",
+            }>
+            <button type="button" class="th-sort" class:th-sorted=move || state().is_some()
+                on:click=move |_| sort.click(col, desc)>
+                {label}
+                <span class="th-sort-icon" aria-hidden="true">
+                    {move || match state() {
+                        Some(true) => "▼",
+                        Some(false) => "▲",
+                        None => "↕",
+                    }}
+                </span>
+            </button>
+        </th>
+    }
+}
