@@ -9,7 +9,9 @@ use leptos_router::components::A;
 
 use super::nodes::{NodeDisk, orphaned_on};
 use crate::api;
-use crate::components::{DiskMeter, ErrorNote, Loading, Meter, OnlineBadge, StateBadge, Trend};
+use crate::components::{
+    DiskMeter, ErrorNote, Loading, Meter, OnlineBadge, Sort, SortKey, SortTh, StateBadge, Trend,
+};
 use crate::util::{ago, bytes, cpus, me, percent, polled};
 
 #[component]
@@ -223,6 +225,7 @@ pub fn NodeCard(
 #[component]
 pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
     let me = me();
+    let sort = Sort::new();
     view! {
         <Show
             when=move || apps.with(|a| !a.is_empty())
@@ -237,18 +240,22 @@ pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
                 <table class="table">
                     <thead>
                         <tr>
-                            <th>"App"</th>
-                            <th>"State"</th>
-                            <th>"Node"</th>
-                            <th class="num">"CPU"</th>
-                            <th class="num">"Memory"</th>
-                            <th class="num">"Disk"</th>
-                            <th>"Domains"</th>
+                            <SortTh sort col=0 label="App"/>
+                            <SortTh sort col=1 label="State"/>
+                            <SortTh sort col=2 label="Node"/>
+                            <SortTh sort col=3 label="CPU" num=true desc=true/>
+                            <SortTh sort col=4 label="Memory" num=true desc=true/>
+                            <SortTh sort col=5 label="Disk" num=true desc=true/>
+                            <SortTh sort col=6 label="Domains"/>
                         </tr>
                     </thead>
                     <tbody>
                         <For
-                            each=move || apps.get()
+                            each=move || {
+                                let mut apps = apps.get();
+                                sort.apply(&mut apps, app_key);
+                                apps
+                            }
                             key=|a| (a.spec.name.clone(), a.state, a.stats.as_ref().map(|s| (s.mem_used, s.cpu_percent.to_bits())), a.spec.domains.clone(), a.owner.clone(), a.disk.as_ref().map(|d| (d.total(), d.written)))
                             children=move |app| {
                                 let href = format!("/apps/{}", app.spec.name);
@@ -283,6 +290,25 @@ pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
                 </table>
             </div>
         </Show>
+    }
+}
+
+/// What each [`AppsTable`] column sorts by; usage that shows blank is missing.
+fn app_key(col: usize, app: &AppView) -> SortKey {
+    let stats = app.stats.as_ref().filter(|s| s.mem_used > 0);
+    match col {
+        0 => SortKey::text(&app.spec.name),
+        1 => SortKey::text(app.state.to_string()),
+        2 => SortKey::text(&app.spec.node),
+        3 => SortKey::num(stats.map(|s| s.cpu_percent)),
+        4 => SortKey::num(stats.map(|s| s.mem_used as f64)),
+        5 => SortKey::num(
+            app.disk
+                .as_ref()
+                .map(|d| d.total() as f64)
+                .filter(|t| *t > 0.0),
+        ),
+        _ => SortKey::text(app.spec.domains.first().map_or("", String::as_str)),
     }
 }
 
