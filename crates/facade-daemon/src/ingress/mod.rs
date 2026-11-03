@@ -695,6 +695,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn upgrades_are_spliced_through_and_outlive_retiring() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The app: answers the upgrade (checking the proxy kept its headers),
+        // then echoes whatever comes, as a WebSocket server would frames.
+        let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = app.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                sock.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            assert!(head.contains("upgrade: websocket"), "{head}");
+            assert!(head.contains("connection: upgrade"), "{head}");
+            assert!(head.contains("host: ws.example.com"), "{head}");
+            sock.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\n\
+                  Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => sock.write_all(&buf[..n]).await.unwrap(),
+                }
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("facade-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ingress = Ingress::new(&dir).unwrap();
+        let mut table = Table::default();
+        table.routes.insert(
+            "ws.example.com".into(),
+            Route::Port {
+                app: "ws".into(),
+                port: app_port,
+            },
+        );
+        ingress.set_table(table);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop_tx, stop) = watch::channel(false);
+        tokio::spawn(ingress.clone().serve(listener, false, stop));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /signal HTTP/1.1\r\nHost: ws.example.com\r\n\
+                  Upgrade: websocket\r\nConnection: Upgrade\r\n\
+                  Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            client.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(
+            head.to_ascii_lowercase().contains("upgrade: websocket"),
+            "{head}"
+        );
+
+        async fn echo(client: &mut tokio::net::TcpStream, msg: &[u8]) {
+            client.write_all(msg).await.unwrap();
+            let mut got = vec![0u8; msg.len()];
+            tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut got))
+                .await
+                .expect("echoed in time")
+                .unwrap();
+            assert_eq!(got, msg);
+        }
+        echo(&mut client, b"hello").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            ingress.active_connections(),
+            1,
+            "the spliced connection counts"
+        );
+
+        // A newer entry point took over: the WebSocket carries on.
+        ingress.retire();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        echo(&mut client, b"still here").await;
+        assert_eq!(ingress.active_connections(), 1);
+
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(ingress.active_connections(), 0, "counted until it ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn hosts() {
         assert_eq!(
