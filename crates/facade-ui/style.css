@@ -246,11 +246,13 @@ p { margin: 0 0 12px; }
 /* ---------------------------------------------------------------- meters & tiles */
 
 .meters { display: flex; flex-direction: column; gap: 12px; }
-.meter-row { display: grid; grid-template-columns: minmax(0, 1fr) 88px; gap: 14px; align-items: end; }
 .trend { position: relative; height: 28px; cursor: crosshair; }
 .trend svg { width: 100%; height: 100%; display: block; overflow: visible; }
 .trend-base { stroke: var(--border); stroke-width: 1; }
 .trend-line { fill: none; stroke: var(--series-1); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.trend-area { fill: var(--series-1-area); }
+.trend-high .trend-line { stroke: var(--critical); }
+.trend-high .trend-area { fill: var(--critical-soft); }
 .meter-head { display: flex; justify-content: space-between; gap: 10px; white-space: nowrap; font-size: 12.5px; margin-bottom: 5px; }
 .meter-label { color: var(--text-secondary); font-weight: 500; }
 .meter-value { color: var(--text-primary); font-variant-numeric: tabular-nums; }
@@ -297,8 +299,6 @@ p { margin: 0 0 12px; }
 .spark-key-avg, .spark-key-peak { display: inline-block; width: 14px; height: 0; border-top: 2px solid var(--series-1); margin-left: 4px; }
 .spark-key-peak { border-top: 1px dashed var(--series-1); opacity: 0.6; }
 .spark-axis { display: flex; justify-content: space-between; margin-top: 4px; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
-.node-usage { margin-top: 28px; }
-.node-usage > .segmented { margin-bottom: 12px; }
 .charts-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
 .spark-cross { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .spark-dot { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
@@ -362,7 +362,7 @@ p { margin: 0 0 12px; }
 /* Rows that lead where their main link does (see `follow_row`). */
 .table .row-link { cursor: pointer; }
 .table tr.row-link:focus-within, .table tbody.row-link:focus-within tr { background: var(--surface-2); }
-.table-filter { width: 260px; max-width: 100%; padding: 5px 10px; }
+.table-filter, .toolbar input.table-filter { width: 260px; max-width: 100%; padding: 5px 10px; }
 input[type="search"] {
   font: inherit;
   color: var(--text-primary);
@@ -801,7 +801,8 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 
 /* ---------------------------------------------------------------- nodes */
 
-/* The overview's nodes, one row each. Not clipped by the wrapper, so the meters'
+/* The overview's nodes, one row each: CPU and memory as last-hour charts (the
+   figures on hover), the disk as its bar. Not clipped by the wrapper, so the
    tips can rise above it; narrow, each node becomes a block. */
 .nodes-section { container: nodes / inline-size; }
 .nodes-table-wrap { overflow: visible; }
@@ -809,40 +810,48 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .nodes-table th:last-child { border-top-right-radius: var(--radius); }
 .nodes-table tbody:last-child tr:last-child td:first-child { border-bottom-left-radius: var(--radius); }
 .nodes-table tbody:last-child tr:last-child td:last-child { border-bottom-right-radius: var(--radius); }
-.nodes-table td { border-bottom: 0; vertical-align: top; padding: 12px 16px; }
+.nodes-table td { border-bottom: 0; vertical-align: middle; padding: 12px 16px; }
 .nodes-table tbody + tbody > tr:first-child > td { border-top: 1px solid var(--border); }
 .table tbody.row-group:hover tr { background: var(--surface-2); }
-.nodes-table th:first-child, .nodes-table .node-cell { width: 22%; }
-.nodes-table .node-meter { min-width: 0; width: 26%; }
-/* The column header names each meter. */
-.nodes-table .meter-label { display: none; }
-.nodes-table .meter-head { justify-content: flex-end; }
-.nodes-table .meter-row { grid-template-columns: minmax(0, 1fr) 64px; gap: 10px; }
+.nodes-table th:first-child, .nodes-table .node-cell { width: 25%; }
+.nodes-table .node-chart, .nodes-table .node-disk { min-width: 0; width: 25%; }
+.nodes-table .trend { height: 40px; }
+.nodes-table .disk-wrap { margin-top: 6px; }
+.meter-caption { margin-top: 6px; font-size: 12.5px; color: var(--text-secondary); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .node-cell-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
 .nodes-table .node-silent { vertical-align: middle; }
-.nodes-table .node-sub td { padding-top: 0; }
-.nodes-table .node-sub .note { margin-bottom: 0; }
 @container nodes (max-width: 720px) {
   .nodes-table, .nodes-table tbody, .nodes-table tr, .nodes-table td { display: block; }
-  .nodes-table .node-cell, .nodes-table .node-meter { width: auto; }
+  .nodes-table .node-cell, .nodes-table .node-chart, .nodes-table .node-disk { width: auto; }
   .nodes-table tbody + tbody > tr:first-child > td { border-top: 0; }
   .nodes-table tbody + tbody { border-top: 1px solid var(--border); }
   .nodes-table thead { display: none; }
   .nodes-table td { padding: 6px 16px; }
+  /* The column names, which the hidden header no longer gives. */
+  .nodes-table td[data-label] { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 12px; align-items: center; }
+  .nodes-table td[data-label]::before { content: attr(data-label); font-size: 12.5px; color: var(--text-secondary); }
+  .nodes-table .trend { height: 32px; }
   .nodes-table tr:first-child td:first-child { padding-top: 14px; }
   .nodes-table tbody > tr:last-child > td:last-child { padding-bottom: 14px; }
-  .nodes-table .node-sub td { padding-top: 6px; }
-  .nodes-table .meter-label { display: inline; }
-  .nodes-table .meter-head { justify-content: space-between; }
-  .nodes-table .meter-row { grid-template-columns: minmax(0, 1fr) 88px; }
   .nodes-table tbody:last-child tr:last-child td { border-radius: 0 0 var(--radius) var(--radius); }
 }
 
-/* The Nodes page: one node, picked at the top. */
+/* The Nodes page: one node, picked at the top, in one card: what it is, then a
+   row per resource with its bar for now beside its chart over a period. */
 .node-picker { width: auto; min-width: 140px; font-weight: 600; padding: 5px 10px; }
-.node-title { font-size: 17px; font-weight: 650; }
-.node-meters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 28px; }
-@media (max-width: 900px) { .node-meters { grid-template-columns: 1fr; } }
+.node-title { font-size: 20px; font-weight: 650; }
+.node-metrics { display: flex; flex-direction: column; gap: 14px; margin-top: 4px; }
+.node-title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 2px; }
+.metric-row { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(0, 2.2fr); gap: 12px 28px; align-items: center; }
+.metric-row + .metric-row { border-top: 1px solid var(--border); padding-top: 14px; }
+.spark-bare { border: 0; padding: 0; background: none; }
+.spark-bare .spark-plot, .spark-bare .spark-empty { height: 72px; }
+/* The scale above the plot, clear of the line. */
+.spark-bare .spark-plot { margin-top: 16px; }
+.spark-bare .spark-scale { top: -16px; }
+.node-notes { margin: 14px 0 0; line-height: 1.5; }
+.node-card .card-head { flex-wrap: wrap; }
+@media (max-width: 900px) { .metric-row { grid-template-columns: 1fr; } }
 .card-actions { flex-wrap: wrap; }
 
 /* ---------------------------------------------------------------- filters */
@@ -947,13 +956,6 @@ select.filter-select { width: auto; appearance: none; -webkit-appearance: none; 
 .private-repo { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
 .private-repo p { margin: 0; }
 .private-repo .copy-field { align-self: stretch; }
-.storage-line {
-  padding: 8px 20px;
-  border: 1px solid var(--border);
-  border-top: 0;
-  background: var(--surface-1);
-  line-height: 1.5;
-}
 /* A taller hover zone than the bar, without moving it. */
 .disk-wrap { position: relative; padding: 4px 0; margin: -4px 0; cursor: default; }
 .disk-track { display: flex; gap: 2px; }

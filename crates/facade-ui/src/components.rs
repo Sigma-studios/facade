@@ -71,9 +71,10 @@ pub fn Meter(
 const TREND_W: f64 = 120.0;
 const TREND_H: f64 = 28.0;
 
-/// A small last-hour line beside a meter, on the meter's 0–100 % scale: points
-/// are `(time, percent)`, drawn over `span`, unjoined across gaps over `gap`
-/// seconds. Hovering shows `format(percent)` and the time.
+/// A small last-hour chart filling its box, on a 0–100 % scale: points are
+/// `(time, percent)`, drawn over `span`, unjoined across gaps over `gap`
+/// seconds. Hovering shows `format(percent)` there and now; screen readers get
+/// the latest. Critical from 90 %, as a [`Meter`].
 #[component]
 pub fn Trend(
     label: &'static str,
@@ -89,22 +90,40 @@ pub fn Trend(
         (at.saturating_sub(start) as f64 / width * TREND_W).clamp(0.0, TREND_W)
     };
     let y_of = |v: f64| TREND_H - 1.5 - v.clamp(0.0, 100.0) / 100.0 * (TREND_H - 3.0);
-    let line = move || {
+    // Runs of points close enough in time to be joined.
+    let runs = move || {
         points.with(|p| {
-            let mut d = String::new();
-            let mut last: Option<u64> = None;
+            let mut runs: Vec<Vec<(u64, f64)>> = Vec::new();
             for &(at, v) in p {
-                let join = last.is_some_and(|l| at.saturating_sub(l) <= gap);
-                d.push_str(&format!(
-                    "{}{:.1},{:.1} ",
-                    if join { "L" } else { "M" },
-                    x_of(at),
-                    y_of(v)
-                ));
-                last = Some(at);
+                match runs.last_mut() {
+                    Some(run) if run.last().is_some_and(|l| at.saturating_sub(l.0) <= gap) => {
+                        run.push((at, v))
+                    }
+                    _ => runs.push(vec![(at, v)]),
+                }
             }
-            d
+            runs
         })
+    };
+    let path = move |close: bool| {
+        let mut d = String::new();
+        for run in runs() {
+            for (i, &(at, v)) in run.iter().enumerate() {
+                let (x, y) = (x_of(at), y_of(v));
+                d.push_str(&format!("{}{x:.1},{y:.1} ", if i == 0 { "M" } else { "L" }));
+            }
+            if close {
+                let (first, last) = (x_of(run[0].0), x_of(run[run.len() - 1].0));
+                d.push_str(&format!("L{last:.1},{TREND_H} L{first:.1},{TREND_H} Z "));
+            }
+        }
+        d
+    };
+    let latest = move || points.with(|p| p.last().copied());
+    let high = move || latest().is_some_and(|(_, v)| v >= 90.0);
+    let described = move || match latest() {
+        Some((_, v)) => format!("{label}, last hour; now {}", format.run(v)),
+        None => format!("{label}: no samples in the last hour yet"),
     };
     let on_move = move |ev: leptos::ev::MouseEvent| {
         use wasm_bindgen::JsCast;
@@ -125,12 +144,13 @@ pub fn Trend(
     };
 
     view! {
-        <div class="trend" on:mousemove=on_move on:mouseleave=move |_| hover.set(None)>
+        <div class="trend" class:trend-high=high on:mousemove=on_move on:mouseleave=move |_| hover.set(None)>
             <svg viewBox=format!("0 0 {TREND_W} {TREND_H}") preserveAspectRatio="none"
-                role="img" aria-label=format!("{label}, last hour")>
+                role="img" aria-label=described>
                 <line class="trend-base" x1="0" x2=TREND_W y1=TREND_H y2=TREND_H
                     vector-effect="non-scaling-stroke"/>
-                <path class="trend-line" d=line vector-effect="non-scaling-stroke"/>
+                <path class="trend-area" d=move || path(true)/>
+                <path class="trend-line" d=move || path(false) vector-effect="non-scaling-stroke"/>
                 {move || hover.get().map(|(at, v)| {
                     let x = x_of(at);
                     view! {
@@ -143,10 +163,14 @@ pub fn Trend(
             </svg>
             {move || hover.get().map(|(at, v)| {
                 let left = (x_of(at) / TREND_W * 100.0).clamp(20.0, 80.0);
+                let now = latest()
+                    .filter(|l| l.0 != at)
+                    .map(|(_, v)| format!("now {}", format.run(v)));
                 view! {
                     <div class="spark-tip" style=format!("left: {left:.1}%")>
                         <strong>{format.run(v)}</strong>
                         <span>{crate::util::clock(at)}</span>
+                        {now.map(|n| view! { <span>{n}</span> })}
                     </div>
                 }
             })}
@@ -169,6 +193,8 @@ pub struct Sample {
 /// further apart than `gap` seconds are not joined (the app was not running). A
 /// faint line shows the peaks when they differ from the averages. `max` fixes the
 /// top of the scale (a memory limit, a CPU limit); the data can raise it.
+/// `bare`: only the plot, for a row that already names it and gives its value
+/// (with the time axis below if `axis`).
 #[component]
 pub fn Sparkline(
     title: &'static str,
@@ -177,6 +203,8 @@ pub fn Sparkline(
     #[prop(into)] gap: Signal<u64>,
     #[prop(into)] max: Signal<Option<f64>>,
     format: fn(f64) -> String,
+    #[prop(optional)] bare: bool,
+    #[prop(optional)] axis: bool,
 ) -> impl IntoView {
     let hover = RwSignal::new(None::<usize>);
     let scale = move || {
@@ -264,19 +292,21 @@ pub fn Sparkline(
     };
 
     view! {
-        <figure class="spark">
-            <figcaption class="spark-head">
-                <span class="spark-title">
-                    {title}
-                    <Show when=has_peaks>
-                        <span class="spark-key">
-                            <span class="spark-key-avg"></span>"average"
-                            <span class="spark-key-peak"></span>"peak"
-                        </span>
-                    </Show>
-                </span>
-                <span class="spark-now">{move || current().unwrap_or_else(|| "—".into())}</span>
-            </figcaption>
+        <figure class="spark" class:spark-bare=bare>
+            {(!bare).then(|| view! {
+                <figcaption class="spark-head">
+                    <span class="spark-title">
+                        {title}
+                        <Show when=has_peaks>
+                            <span class="spark-key">
+                                <span class="spark-key-avg"></span>"average"
+                                <span class="spark-key-peak"></span>"peak"
+                            </span>
+                        </Show>
+                    </span>
+                    <span class="spark-now">{move || current().unwrap_or_else(|| "—".into())}</span>
+                </figcaption>
+            })}
             <Show
                 when=move || points.with(|p| !p.is_empty())
                 fallback=|| view! { <div class="spark-empty">"No samples over this period yet"</div> }
@@ -316,10 +346,12 @@ pub fn Sparkline(
                     })}
                     <div class="spark-scale">{move || format(scale())}</div>
                 </div>
-                <div class="spark-axis">
-                    <span>{move || stamp(span.get().0)}</span>
-                    <span>"now"</span>
-                </div>
+                {(!bare || axis).then(|| view! {
+                    <div class="spark-axis">
+                        <span>{move || stamp(span.get().0)}</span>
+                        <span>"now"</span>
+                    </div>
+                })}
             </Show>
         </figure>
     }
@@ -375,6 +407,31 @@ impl Range {
     }
 }
 
+/// What a `…/usage` endpoint said over the chosen period, as chart series.
+#[derive(Clone, Copy)]
+pub struct UsageFeed {
+    pub cpu: Signal<Vec<Sample>>,
+    pub mem: Signal<Vec<Sample>>,
+    pub disk: Signal<Vec<Sample>>,
+    pub span: Signal<(u64, u64)>,
+    pub gap: Signal<u64>,
+}
+
+/// The period buttons above usage charts.
+#[component]
+pub fn RangePicker(range: RwSignal<Range>) -> impl IntoView {
+    view! {
+        <div class="segmented" role="radiogroup" aria-label="Period">
+            {Range::ALL.into_iter().map(|r| view! {
+                <button type="button" role="radio"
+                    class=move || if range.get() == r { "segment active" } else { "segment" }
+                    aria-checked=move || (range.get() == r).to_string()
+                    on:click=move |_| range.set(r)>{r.label()}</button>
+            }).collect_view()}
+        </div>
+    }
+}
+
 /// CPU and memory (and disk, for a node) charts over a chosen period, from a
 /// `…/usage` endpoint. The maxima fix the top of each scale (limits, totals).
 #[component]
@@ -385,6 +442,31 @@ pub fn UsageCharts(
     #[prop(optional, into)] disk_max: Option<Signal<Option<f64>>>,
 ) -> impl IntoView {
     let range = RwSignal::new(Range::Hour);
+    let UsageFeed {
+        cpu,
+        mem,
+        disk,
+        span,
+        gap,
+    } = usage_feed(url, range.into());
+
+    view! {
+        <div class="charts-head">
+            <h2 class="section-title">"Usage"</h2>
+            <RangePicker range/>
+        </div>
+        <div class="charts">
+            <Sparkline title="CPU" points=cpu span=span gap=gap max=cpu_max format=|v| format!("{v:.1} %")/>
+            <Sparkline title="Memory" points=mem span=span gap=gap max=mem_max format=|v| bytes(v as u64)/>
+            {disk_max.map(|disk_max| view! {
+                <Sparkline title="Disk" points=disk span=span gap=gap max=disk_max format=|v| bytes(v as u64)/>
+            })}
+        </div>
+    }
+}
+
+/// Polls `url` over `range`, every 15 seconds and when either changes.
+pub fn usage_feed(url: Signal<String>, range: Signal<Range>) -> UsageFeed {
     let usage = crate::util::polled(Some(std::time::Duration::from_secs(15)), move || {
         let url = url.get();
         let range = range.get();
@@ -425,26 +507,12 @@ pub fn UsageCharts(
         (now.saturating_sub(range.get().secs()), now)
     });
     let gap = Signal::derive(move || range.get().step() * 5 / 2);
-
-    view! {
-        <div class="charts-head">
-            <h2 class="section-title">"Usage"</h2>
-            <div class="segmented" role="radiogroup" aria-label="Period">
-                {Range::ALL.into_iter().map(|r| view! {
-                    <button type="button" role="radio"
-                        class=move || if range.get() == r { "segment active" } else { "segment" }
-                        aria-checked=move || (range.get() == r).to_string()
-                        on:click=move |_| range.set(r)>{r.label()}</button>
-                }).collect_view()}
-            </div>
-        </div>
-        <div class="charts">
-            <Sparkline title="CPU" points=cpu span=span gap=gap max=cpu_max format=|v| format!("{v:.1} %")/>
-            <Sparkline title="Memory" points=mem span=span gap=gap max=mem_max format=|v| bytes(v as u64)/>
-            {disk_max.map(|disk_max| view! {
-                <Sparkline title="Disk" points=disk span=span gap=gap max=disk_max format=|v| bytes(v as u64)/>
-            })}
-        </div>
+    UsageFeed {
+        cpu,
+        mem,
+        disk,
+        span,
+        gap,
     }
 }
 
@@ -757,12 +825,14 @@ fn backups_hint(storage: &StorageReport) -> String {
 
 /// A node's disk meter. Once the node has reported what takes the space, the bar
 /// is split into one coloured part each (free space last), and hovering a part
-/// shows an infotip saying what it holds; until then, a plain meter.
+/// shows an infotip saying what it holds; until then, a plain meter. `caption`:
+/// no label, the figures under the bar (in a table whose column names it).
 #[component]
 pub fn DiskMeter(
     #[prop(into)] storage: Signal<Option<StorageReport>>,
     #[prop(into)] used: Signal<u64>,
     total: u64,
+    #[prop(optional)] caption: bool,
 ) -> impl IntoView {
     let share = move || percent(used.get(), total);
     let high = move || share() >= 90.0;
@@ -832,25 +902,32 @@ pub fn DiskMeter(
             </div>
         })
     };
+    let figures = move || {
+        view! {
+            <Show when=high>
+                <span class="meter-warn" title="above 90 %">"⚠ "</span>
+            </Show>
+            {move || format!("{} / {}", bytes(used.get()), bytes(total))}
+        }
+    };
     view! {
         <div class="meter">
-            <div class="meter-head">
-                <span class="meter-label">"Disk"</span>
-                <span class="meter-value">
-                    <Show when=high>
-                        <span class="meter-warn" title="above 90 %">"⚠ "</span>
-                    </Show>
-                    {move || format!("{} / {}", bytes(used.get()), bytes(total))}
-                </span>
-            </div>
+            {(!caption).then(|| view! {
+                <div class="meter-head">
+                    <span class="meter-label">"Disk"</span>
+                    <span class="meter-value">{figures()}</span>
+                </div>
+            })}
             <div class="disk-wrap" on:mousemove=on_move on:mouseleave=move |_| active.set(None)>
-                <div class="meter-track disk-track" role="meter" aria-label=move || format!("Disk: {}", described())
+                <div class="meter-track disk-track" role="meter"
+                    aria-label=move || format!("Disk, {} / {}: {}", bytes(used.get()), bytes(total), described())
                     aria-valuenow=move || format!("{:.0}", share())
                     aria-valuemin="0" aria-valuemax="100">
                     {bar}
                 </div>
                 {tip}
             </div>
+            {caption.then(|| view! { <div class="meter-caption">{figures()}</div> })}
         </div>
     }
 }

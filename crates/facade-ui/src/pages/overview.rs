@@ -1,17 +1,16 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AlertView, AppDiskView, AppView, NodeView, StatusView, UsagePoint, VolumeView, WRITTEN_WARNING,
+    AlertView, AppDiskView, AppView, NodeView, StatusView, UsagePoint, WRITTEN_WARNING,
 };
 use leptos::prelude::*;
 use leptos_router::components::A;
 
-use super::nodes::{
-    IngressNote, StorageNotes, node_meters, not_reporting, orphaned_on, storage_notes_shown,
-};
+use super::nodes::not_reporting;
 use crate::api;
 use crate::components::{
-    ErrorNote, Loading, Meter, OnlineBadge, Sort, SortKey, SortTh, StateBadge, follow_row,
+    DiskMeter, ErrorNote, Loading, Meter, OnlineBadge, Sort, SortKey, SortTh, StateBadge, Trend,
+    follow_row,
 };
 use crate::util::{Polled, ago, bytes, cpus, me, percent, polled};
 
@@ -20,9 +19,6 @@ pub fn Overview() -> impl IntoView {
     let me = me();
     let status = polled(Some(Duration::from_secs(5)), || async {
         api::get::<StatusView>("/api/status").await
-    });
-    let volumes = polled(Some(Duration::from_secs(30)), || async {
-        api::get::<Vec<VolumeView>>("/api/volumes").await
     });
     let alerts = polled(Some(Duration::from_secs(15)), || async {
         api::get::<Vec<AlertView>>("/api/alerts").await
@@ -74,7 +70,7 @@ pub fn Overview() -> impl IntoView {
             <Show when=move || status.loaded() fallback=Loading>
                 <section class="nodes-section">
                     <h2 class="section-title">"Nodes"</h2>
-                    <NodesTable status volumes/>
+                    <NodesTable status/>
                 </section>
                 <section>
                     <div class="section-head">
@@ -92,11 +88,11 @@ pub fn Overview() -> impl IntoView {
     }
 }
 
-/// Every node on one row each: its meters with their last hour, then what its
-/// disk holds and why its apps cannot be reached, if they cannot. A row leads to
-/// the node's page.
+/// Every node on one row each: its CPU and memory over the last hour (the
+/// figures on hover), its disk, and badges for what needs looking at. A row
+/// leads to the node's page, which has the details.
 #[component]
-fn NodesTable(status: Polled<StatusView>, volumes: Polled<Vec<VolumeView>>) -> impl IntoView {
+fn NodesTable(status: Polled<StatusView>) -> impl IntoView {
     view! {
         <div class="table-wrap nodes-table-wrap">
             <table class="table nodes-table">
@@ -106,22 +102,17 @@ fn NodesTable(status: Polled<StatusView>, volumes: Polled<Vec<VolumeView>>) -> i
                 <For
                     each=move || status.data.get().map(|s| s.nodes).unwrap_or_default()
                     key=|n| (n.name.clone(), n.connected, n.stats.as_ref().map(|s| (s.cpus, s.mem_total, s.disk_total)))
-                    children=move |node| view! { <NodeRow node status volumes/> }
+                    children=move |node| view! { <NodeRow node status/> }
                 />
             </table>
         </div>
     }
 }
 
-/// A node's rows in [`NodesTable`], grouped in a `tbody`. They are not redrawn as
-/// the status refreshes: the meters follow the node's usage feed, the rest the
-/// status.
+/// A node's row in [`NodesTable`]. It is not redrawn as the status refreshes:
+/// the charts follow the node's usage feed, the rest the status.
 #[component]
-fn NodeRow(
-    node: NodeView,
-    status: Polled<StatusView>,
-    volumes: Polled<Vec<VolumeView>>,
-) -> impl IntoView {
+fn NodeRow(node: NodeView, status: Polled<StatusView>) -> impl IntoView {
     let name = node.name.clone();
     let current = Signal::derive({
         let name = name.clone();
@@ -136,13 +127,11 @@ fn NodeRow(
         current.with(|n| {
             n.as_ref()
                 .filter(|n| n.connected)
-                .map(|n| n.ingress_errors.clone())
+                .map(|n| n.ingress_errors.join("; "))
                 .unwrap_or_default()
         })
     });
-    let orphaned = orphaned_on(volumes, name.clone());
-    let has_notes = storage_notes_shown(storage, orphaned);
-    let meters = node.stats.clone().filter(|_| node.connected).map(|s| {
+    let cells = node.stats.clone().filter(|_| node.connected).map(|s| {
         let usage = polled(Some(Duration::from_secs(15)), {
             let name = name.clone();
             move || {
@@ -152,17 +141,37 @@ fn NodeRow(
                 }
             }
         });
-        let snapshot = s.clone();
-        let now = Signal::derive(move || {
+        let (cores, mem_total, disk_total) = (s.cpus, s.mem_total, s.disk_total);
+        let series = move |f: fn(&UsagePoint, u64) -> f64, total: u64| {
+            Signal::derive(move || {
+                usage
+                    .data
+                    .with(|u| u.iter().flatten().map(|p| (p.at, f(p, total))).collect::<Vec<_>>())
+            })
+        };
+        let span = Signal::derive(|| {
+            let now = crate::util::now();
+            (now.saturating_sub(3600), now)
+        });
+        let disk_used = Signal::derive(move || {
             let latest = usage
                 .data
-                .with(|u| u.as_ref().and_then(|u| u.last().cloned()));
-            match latest {
-                Some(p) => (p.cpu, p.mem, p.disk.unwrap_or(snapshot.disk_used)),
-                None => (snapshot.cpu_percent, snapshot.mem_used, snapshot.disk_used),
-            }
+                .with(|u| u.as_ref().and_then(|u| u.last().and_then(|p| p.disk)));
+            latest.unwrap_or(s.disk_used)
         });
-        node_meters(&s, now, storage, Some(usage))
+        view! {
+            <td class="node-chart" data-label="CPU">
+                <Trend label="CPU" points=series(|p, _| f64::from(p.cpu), 0) span=span gap=40
+                    format=Callback::new(move |v: f64| format!("{v:.0} % of {cores} core{}", if cores == 1 { "" } else { "s" }))/>
+            </td>
+            <td class="node-chart" data-label="Memory">
+                <Trend label="Memory" points=series(|p, total| percent(p.mem, total), mem_total) span=span gap=40
+                    format=Callback::new(move |v: f64| format!("{} / {}", bytes((v / 100.0 * mem_total as f64) as u64), bytes(mem_total)))/>
+            </td>
+            <td class="node-disk" data-label="Disk">
+                <DiskMeter storage used=disk_used total=disk_total caption=true/>
+            </td>
+        }
     });
     let href = format!("/nodes/{name}");
     view! {
@@ -172,6 +181,13 @@ fn NodeRow(
                     <div class="node-cell-head">
                         <A href=href.clone() attr:class="strong-link row-link-main">{name.clone()}</A>
                         <OnlineBadge online=node.connected/>
+                        <Show when=move || errors.with(|e| !e.is_empty())>
+                            <span class="badge badge-critical"
+                                title=move || format!("Apps on this node are not reachable over the web: {}", errors.get())>
+                                <span class="badge-icon" aria-hidden="true">"✕"</span>
+                                "unreachable"
+                            </span>
+                        </Show>
                     </div>
                     <div class="muted small">
                         {move || current.with(|n| n.as_ref().map(|n| {
@@ -186,23 +202,11 @@ fn NodeRow(
                         }))}
                     </div>
                 </td>
-                {match meters {
-                    Some(meters) => meters.into_iter().map(|m| view! { <td class="node-meter">{m}</td> }).collect_view().into_any(),
+                {match cells {
+                    Some(cells) => cells.into_any(),
                     None => view! { <td colspan="3" class="muted small node-silent">{not_reporting(&node)}</td> }.into_any(),
                 }}
             </tr>
-            <Show when=move || errors.with(|e| !e.is_empty())>
-                <tr class="node-sub">
-                    <td colspan="4"><IngressNote errors here=false/></td>
-                </tr>
-            </Show>
-            <Show when=move || has_notes.get()>
-                <tr class="node-sub">
-                    <td colspan="4" class="small muted">
-                        <StorageNotes storage orphaned volumes_href=format!("{href}#volumes")/>
-                    </td>
-                </tr>
-            </Show>
         </tbody>
     }
 }
