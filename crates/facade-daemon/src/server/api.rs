@@ -125,6 +125,7 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/apps/{name}/metrics", get(app_metrics))
         .route("/api/apps/{name}/usage", get(app_usage))
         .route("/api/apps/{name}/deployments", get(list_deployments))
+        .route("/api/deployments", get(find_deployments))
         .route("/api/deployments/{id}", get(get_deployment))
         .route("/api/deployments/{id}/cancel", post(cancel_deployment))
         .route("/api/builds", get(builds))
@@ -2098,6 +2099,55 @@ async fn list_deployments(
 ) -> ApiResult<Json<Vec<DeploymentView>>> {
     load_app_for(&server, &user, &name)?;
     Ok(Json(server.store.list_deployments(&name, 50)?))
+}
+
+#[derive(Deserialize)]
+struct DeploymentsQuery {
+    /// Comma-separated app names; empty for all.
+    #[serde(default)]
+    app: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default = "fifty")]
+    limit: u32,
+}
+
+fn fifty() -> u32 {
+    50
+}
+
+/// Every app's deployments, newest first, filtered by app and status. Members
+/// only find (and count) those of the apps they see.
+async fn find_deployments(
+    State(server): S,
+    user: User,
+    Query(q): Query<DeploymentsQuery>,
+) -> ApiResult<Json<DeploymentsPage>> {
+    let status = match q.status.as_str() {
+        "" => None,
+        s @ ("queued" | "running" | "succeeded" | "failed" | "cancelled") => Some(s),
+        other => return Err(bad_request(format!("unknown status {other}"))),
+    };
+    let picked: Vec<String> = q
+        .app
+        .split(',')
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+        .collect();
+    let apps = if user.is_admin() {
+        (!picked.is_empty()).then_some(picked)
+    } else {
+        let seen = visible_apps(&server, &user)?
+            .into_iter()
+            .map(|row| row.spec.name)
+            .filter(|name| picked.is_empty() || picked.contains(name));
+        Some(seen.collect())
+    };
+    let (total, deployments) =
+        server
+            .store
+            .find_deployments(apps.as_deref(), status, q.limit.clamp(1, 500))?;
+    Ok(Json(DeploymentsPage { total, deployments }))
 }
 
 async fn get_deployment(

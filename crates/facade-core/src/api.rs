@@ -236,6 +236,15 @@ pub struct BuildsView {
     pub recent: Vec<DeploymentView>,
 }
 
+/// `GET /api/deployments?app=web,api&status=failed&limit=50`: the latest
+/// deployments of the apps the caller sees, and how many match. Every
+/// deployment is kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentsPage {
+    pub total: u64,
+    pub deployments: Vec<DeploymentView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueuedBuild {
     pub node: String,
