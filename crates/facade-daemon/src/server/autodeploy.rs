@@ -197,13 +197,15 @@ fn on_github(repo: &str) -> Option<RepoLocation> {
 }
 
 /// The repository whose webhook would report the target's changes, and the
-/// event it needs.
+/// event it needs. GitHub only tells about images published to ghcr.io, to the
+/// repository they are linked to (their source label, usually).
 fn hook_for(
     watched: &Watched,
     row: Option<&AutoDeployRow>,
 ) -> Option<(RepoLocation, &'static str)> {
     match watched {
         Watched::Git { repo, .. } => on_github(repo).map(|l| (l, PUSH)),
+        Watched::Image { image, .. } if ImageRef::parse(image).registry != "ghcr.io" => None,
         Watched::Image { .. } => row
             .and_then(|r| r.image_repo.as_deref())
             .filter(|r| !r.is_empty())
@@ -512,8 +514,11 @@ async fn check_app(
             let login = registry_login(server, owner, &reference)?;
             let registry = &server.auto_deploy.registry;
             let digest = registry.digest(&image, login.as_ref()).await?;
-            // Which repository it is built from can change with each image.
-            if row.image_repo.is_none() || row.seen.as_deref() != Some(digest.as_str()) {
+            // Which repository it is built from (for a webhook, so ghcr.io only)
+            // can change with each image.
+            if reference.registry == "ghcr.io"
+                && (row.image_repo.is_none() || row.seen.as_deref() != Some(digest.as_str()))
+            {
                 match registry.source(&image, login.as_ref()).await {
                     Ok(source) => {
                         let repo = source
