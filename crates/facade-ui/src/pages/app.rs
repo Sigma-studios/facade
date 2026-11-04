@@ -24,11 +24,11 @@ use crate::util::{
 
 const TABS: &[(&str, &str)] = &[
     ("overview", "Overview"),
+    ("info", "Info"),
     ("logs", "Logs"),
     ("deployments", "Deployments"),
     ("env", "Environment"),
     ("volumes", "Volumes"),
-    ("info", "Info"),
     ("settings", "Settings"),
 ];
 

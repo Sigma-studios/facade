@@ -570,6 +570,20 @@ pub struct UsagePoint {
     pub mem_peak: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<u64>,
+    /// A node's network traffic over the point's period, in bytes per second
+    /// received and sent; `None` where it is not known (the first point, a
+    /// reboot, an agent that does not count it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_rx: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_tx: Option<f64>,
+}
+
+/// Bytes per second between two readings of a counter of bytes since boot;
+/// `None` when either is missing (0) or the counter went back (a reboot).
+pub fn byte_rate(before: (u64, u64), after: (u64, u64)) -> Option<f64> {
+    let ((t0, b0), (t1, b1)) = (before, after);
+    (b0 > 0 && b1 >= b0 && t1 > t0).then(|| (b1 - b0) as f64 / (t1 - t0) as f64)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

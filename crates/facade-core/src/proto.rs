@@ -583,6 +583,12 @@ pub struct NodeStats {
     pub disk_used: u64,
     pub disk_total: u64,
     pub uptime: u64,
+    /// Bytes received and sent by the node's network interfaces since it booted
+    /// (0 from agents that do not count them).
+    #[serde(default)]
+    pub net_rx: u64,
+    #[serde(default)]
+    pub net_tx: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

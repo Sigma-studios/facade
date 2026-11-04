@@ -2057,6 +2057,8 @@ async fn app_usage(
                         mem: m.stats.mem_used,
                         mem_peak: m.stats.mem_used,
                         disk: None,
+                        net_rx: None,
+                        net_tx: None,
                     })
                     .collect()
             })
@@ -2074,15 +2076,31 @@ async fn node_usage(
         live.nodes
             .get(&name)
             .map(|n| {
+                let mut before: Option<&NodeMetric> = None;
                 n.history
                     .iter()
-                    .map(|m| UsagePoint {
-                        at: m.at,
-                        cpu: m.stats.cpu_percent,
-                        cpu_peak: m.stats.cpu_percent,
-                        mem: m.stats.mem_used,
-                        mem_peak: m.stats.mem_used,
-                        disk: Some(m.stats.disk_used),
+                    .map(|m| {
+                        // Traffic since the report before, if there is one.
+                        let rate = |pick: fn(&facade_core::proto::NodeStats) -> u64| {
+                            before.and_then(|b| {
+                                facade_core::api::byte_rate(
+                                    (b.at, pick(&b.stats)),
+                                    (m.at, pick(&m.stats)),
+                                )
+                            })
+                        };
+                        let point = UsagePoint {
+                            at: m.at,
+                            cpu: m.stats.cpu_percent,
+                            cpu_peak: m.stats.cpu_percent,
+                            mem: m.stats.mem_used,
+                            mem_peak: m.stats.mem_used,
+                            disk: Some(m.stats.disk_used),
+                            net_rx: rate(|s| s.net_rx),
+                            net_tx: rate(|s| s.net_tx),
+                        };
+                        before = Some(m);
+                        point
                     })
                     .collect()
             })

@@ -450,6 +450,8 @@ fn NodeMetrics(
         cpu,
         mem,
         disk,
+        net_in,
+        net_out,
         span,
         gap,
     } = usage_feed(
@@ -529,8 +531,34 @@ fn NodeMetrics(
                 <Sparkline title="Disk" points=disk span=span gap=gap max=Signal::stored(Some(disk_total as f64))
                     format=|v| bytes(v as u64) bare=true axis=true/>
             </section>
+            <section class="metric-panel">
+                <div class="metric-label">"Network"</div>
+                {figure(
+                    Signal::derive(move || match (last(net_in), last(net_out)) {
+                        (Some(i), Some(o)) => format!("↓ {} · ↑ {}", rate(i), rate(o)),
+                        _ => "—".into(),
+                    }),
+                    "in · out".into(),
+                )}
+                <div class="metric-sub">"In"</div>
+                <Sparkline title="Received" points=net_in span=span gap=gap max=Signal::stored(None)
+                    format=rate bare=true/>
+                <div class="metric-sub">"Out"</div>
+                <Sparkline title="Sent" points=net_out span=span gap=gap max=Signal::stored(None)
+                    format=rate bare=true axis=true/>
+            </section>
         </div>
     }
+}
+
+/// The latest figure of a series.
+fn last(series: Signal<Vec<crate::components::Sample>>) -> Option<f64> {
+    series.with(|s| s.last().map(|s| s.value))
+}
+
+/// Bytes per second, as people read them.
+fn rate(v: f64) -> String {
+    format!("{}/s", bytes(v.max(0.0) as u64))
 }
 
 /// Why apps on the node cannot be reached over the web, if they cannot.

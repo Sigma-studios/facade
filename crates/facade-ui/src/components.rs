@@ -416,6 +416,10 @@ pub struct UsageFeed {
     pub cpu: Signal<Vec<Sample>>,
     pub mem: Signal<Vec<Sample>>,
     pub disk: Signal<Vec<Sample>>,
+    /// A node's traffic in bytes per second, received and sent (points with no
+    /// figure left out).
+    pub net_in: Signal<Vec<Sample>>,
+    pub net_out: Signal<Vec<Sample>>,
     pub span: Signal<(u64, u64)>,
     pub gap: Signal<u64>,
 }
@@ -451,6 +455,7 @@ pub fn UsageCharts(
         disk,
         span,
         gap,
+        ..
     } = usage_feed(url, range.into());
 
     view! {
@@ -505,6 +510,25 @@ pub fn usage_feed(url: Signal<String>, range: Signal<Range>) -> UsageFeed {
         let d = p.disk.unwrap_or(0) as f64;
         (d, d)
     });
+    let rates = move |f: fn(&UsagePoint) -> Option<f64>| {
+        Signal::derive(move || {
+            usage.data.with(|u| match u {
+                Some((u, r, points)) if *r == range.get() && *u == url.get() => points
+                    .iter()
+                    .filter_map(|p| {
+                        f(p).map(|value| Sample {
+                            at: p.at,
+                            value,
+                            peak: value,
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+        })
+    };
+    let net_in = rates(|p| p.net_rx);
+    let net_out = rates(|p| p.net_tx);
     let span = Signal::derive(move || {
         let now = crate::util::now();
         (now.saturating_sub(range.get().secs()), now)
@@ -514,6 +538,8 @@ pub fn usage_feed(url: Signal<String>, range: Signal<Range>) -> UsageFeed {
         cpu,
         mem,
         disk,
+        net_in,
+        net_out,
         span,
         gap,
     }

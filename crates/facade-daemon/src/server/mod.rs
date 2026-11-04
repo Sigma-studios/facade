@@ -438,6 +438,8 @@ impl Server {
             cpu: report.node.cpu_percent,
             mem: report.node.mem_used,
             disk: report.node.disk_used,
+            net_rx: report.node.net_rx,
+            net_tx: report.node.net_tx,
         };
         push_capped(
             &mut entry.history,
@@ -454,6 +456,8 @@ impl Server {
                     cpu: stats.cpu_percent,
                     mem: stats.mem_used,
                     disk: 0,
+                    net_rx: 0,
+                    net_tx: 0,
                 });
             }
             let app = live.apps.entry(stats.app.clone()).or_default();

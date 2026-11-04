@@ -182,6 +182,10 @@ pub struct UsageSample {
     pub cpu: f32,
     pub mem: u64,
     pub disk: u64,
+    /// A node's byte counters since boot (0 when unknown); a bucket keeps the
+    /// last ones, and rates come from one bucket to the next.
+    pub net_rx: u64,
+    pub net_tx: u64,
 }
 
 /// The owner id of logins and credentials shared by every admin.
@@ -338,6 +342,8 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(AUTO_DEPLOY_SCHEMA)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
+        add_column(&conn, "node_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "node_usage", "net_tx", "INTEGER NOT NULL DEFAULT 0")?;
         add_column(&conn, "apps", "commit_sha", "TEXT")?;
         add_column(&conn, "deployments", "commit_sha", "TEXT")?;
         add_column(&conn, "deployments", "commit_title", "TEXT")?;
@@ -805,10 +811,14 @@ impl Store {
             // The app table has no disk column: its value is bound and unused.
             let (disk_col, disk_val, disk_set) = match of {
                 UsageOf::App => ("", "", ""),
+                // The last counters of the bucket (0 from agents that send none
+                // leaves what an earlier report said).
                 UsageOf::Node => (
-                    ", disk",
-                    ", ?5",
-                    ", disk = (disk * samples + excluded.disk) / (samples + 1)",
+                    ", disk, net_rx, net_tx",
+                    ", ?5, ?6, ?7",
+                    ", disk = (disk * samples + excluded.disk) / (samples + 1),
+                    net_rx = CASE WHEN excluded.net_rx > 0 THEN excluded.net_rx ELSE net_rx END,
+                    net_tx = CASE WHEN excluded.net_tx > 0 THEN excluded.net_tx ELSE net_tx END",
                 ),
             };
             let mut stmt = tx.prepare_cached(&format!(
@@ -830,6 +840,8 @@ impl Store {
                 ];
                 if of == UsageOf::Node {
                     values.push(Box::new(s.disk as f64));
+                    values.push(Box::new(s.net_rx as i64));
+                    values.push(Box::new(s.net_tx as i64));
                 }
                 stmt.execute(rusqlite::params_from_iter(values.iter()))?;
             }
@@ -848,26 +860,56 @@ impl Store {
         step: u64,
     ) -> anyhow::Result<Vec<UsagePoint>> {
         let (table, key, disk) = of.sql();
+        let net = match of {
+            UsageOf::App => "0, 0",
+            UsageOf::Node => "MAX(net_rx), MAX(net_tx)",
+        };
         let step = step.max(USAGE_BUCKET) as i64;
         let conn = self.0.lock();
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT at / ?3 * ?3 AS b, SUM(cpu * samples) / SUM(samples), MAX(cpu_peak),
                     SUM(mem * samples) / SUM(samples), MAX(mem_peak),
-                    SUM({disk} * samples) / SUM(samples)
+                    SUM({disk} * samples) / SUM(samples), {net}
              FROM {table} WHERE {key} = ?1 AND at >= ?2 GROUP BY b ORDER BY b"
         ))?;
-        let rows = stmt
+        let mut counters = Vec::new();
+        let mut rows: Vec<UsagePoint> = stmt
             .query_map(params![name, since as i64, step], |r| {
-                Ok(UsagePoint {
-                    at: r.get::<_, i64>(0)? as u64,
-                    cpu: r.get::<_, f64>(1)? as f32,
-                    cpu_peak: r.get::<_, f64>(2)? as f32,
-                    mem: r.get::<_, f64>(3)? as u64,
-                    mem_peak: r.get::<_, i64>(4)? as u64,
-                    disk: (of == UsageOf::Node).then(|| r.get::<_, f64>(5).unwrap_or(0.0) as u64),
-                })
+                Ok((
+                    UsagePoint {
+                        at: r.get::<_, i64>(0)? as u64,
+                        cpu: r.get::<_, f64>(1)? as f32,
+                        cpu_peak: r.get::<_, f64>(2)? as f32,
+                        mem: r.get::<_, f64>(3)? as u64,
+                        mem_peak: r.get::<_, i64>(4)? as u64,
+                        disk: (of == UsageOf::Node)
+                            .then(|| r.get::<_, f64>(5).unwrap_or(0.0) as u64),
+                        net_rx: None,
+                        net_tx: None,
+                    },
+                    (r.get::<_, i64>(6)? as u64, r.get::<_, i64>(7)? as u64),
+                ))
             })?
+            .map(|row| {
+                row.map(|(point, c)| {
+                    counters.push(c);
+                    point
+                })
+            })
             .collect::<Result<_, _>>()?;
+        if of == UsageOf::Node {
+            // A bucket's counters are its last reading: the traffic of a period is
+            // what they grew by since the period before, if that one is adjacent.
+            for i in 1..rows.len() {
+                let (t0, t1) = (rows[i - 1].at, rows[i].at);
+                if t1 - t0 > step as u64 * 2 {
+                    continue;
+                }
+                let (a, b) = (counters[i - 1], counters[i]);
+                rows[i].net_rx = facade_core::api::byte_rate((t0, a.0), (t1, b.0));
+                rows[i].net_tx = facade_core::api::byte_rate((t0, a.1), (t1, b.1));
+            }
+        }
         Ok(rows)
     }
 
@@ -1930,6 +1972,8 @@ mod tests {
             cpu,
             mem,
             disk: mem * 10,
+            net_rx: 0,
+            net_tx: 0,
         };
         let app = UsageOf::App;
         // Two samples in one 5-minute bucket, one in the next.
@@ -1981,5 +2025,37 @@ mod tests {
         store.delete_app("a").unwrap();
         assert!(store.usage(app, "a", 0, USAGE_BUCKET).unwrap().is_empty());
         assert_eq!(store.usage(app, "b", 0, USAGE_BUCKET).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn node_traffic_comes_from_counters() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let node = |rx: u64, tx: u64| UsageSample {
+            name: "n".into(),
+            cpu: 1.0,
+            mem: 1,
+            disk: 1,
+            net_rx: rx,
+            net_tx: tx,
+        };
+        let record = |at: u64, s: UsageSample| store.record_usage(UsageOf::Node, at, &[s]).unwrap();
+        // An agent counting nothing (0) leaves the bucket's last counters.
+        record(600, node(1_000, 500));
+        record(650, node(0, 0));
+        record(900, node(301_000, 30_500));
+        // A reboot: the counters start again.
+        record(1200, node(10, 10));
+        record(1500, node(30_010, 3_010));
+        let points = store.usage(UsageOf::Node, "n", 0, USAGE_BUCKET).unwrap();
+        let rates: Vec<_> = points.iter().map(|p| (p.net_rx, p.net_tx)).collect();
+        assert_eq!(
+            rates,
+            vec![
+                (None, None),
+                (Some(1000.0), Some(100.0)),
+                (None, None),
+                (Some(100.0), Some(10.0)),
+            ]
+        );
     }
 }

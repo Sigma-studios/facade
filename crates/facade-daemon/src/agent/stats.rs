@@ -31,6 +31,7 @@ impl NodeSampler {
         let (disk_total, disk_used) = root
             .map(|d| (d.total_space(), d.total_space() - d.available_space()))
             .unwrap_or((0, 0));
+        let traffic = network_traffic();
         NodeStats {
             arch: std::env::consts::ARCH.to_string(),
             cpus: self.system.cpus().len(),
@@ -41,6 +42,49 @@ impl NodeSampler {
             disk_used,
             disk_total,
             uptime: System::uptime(),
+            net_rx: traffic.0,
+            net_tx: traffic.1,
         }
     }
+}
+
+/// Bytes received and sent since boot by the node's network cards: the
+/// interfaces backed by a device, so Docker's bridges and the containers'
+/// virtual pairs (which carry the same packets again) are left out. A machine
+/// whose interfaces show no device counts all but loopback and Docker's.
+fn network_traffic() -> (u64, u64) {
+    let Ok(table) = std::fs::read_to_string("/proc/net/dev") else {
+        return (0, 0);
+    };
+    let rows: Vec<(String, u64, u64)> = table
+        .lines()
+        .skip(2)
+        .filter_map(|line| {
+            let (name, rest) = line.split_once(':')?;
+            let fields: Vec<u64> = rest
+                .split_whitespace()
+                .filter_map(|f| f.parse().ok())
+                .collect();
+            Some((name.trim().to_string(), *fields.first()?, *fields.get(8)?))
+        })
+        .collect();
+    let physical =
+        |name: &str| std::path::Path::new(&format!("/sys/class/net/{name}/device")).exists();
+    let virtual_ = |name: &str| {
+        name == "lo"
+            || [
+                "veth", "docker", "br-", "virbr", "cni", "flannel", "cali", "vxlan",
+            ]
+            .iter()
+            .any(|p| name.starts_with(p))
+    };
+    let cards: Vec<_> = rows.iter().filter(|(n, ..)| physical(n)).collect();
+    let counted: Vec<_> = if cards.is_empty() {
+        rows.iter().filter(|(n, ..)| !virtual_(n)).collect()
+    } else {
+        cards
+    };
+    counted
+        .iter()
+        .fold((0, 0), |(rx, tx), (_, r, t)| (rx + r, tx + t))
 }
