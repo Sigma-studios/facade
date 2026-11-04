@@ -326,18 +326,12 @@ pub fn on_report(server: &Server, node: &str, report: &NodeReport) {
     };
     let was_required = before.as_ref().is_some_and(|u| u.reboot_required);
     if upkeep.reboot_required && !was_required {
-        // Once per server start at most for the same reboot: a restart forgets
-        // what came before, so the entry's own history decides.
-        let recent = server
-            .store
-            .last_node_event(
-                node,
-                EventKind::Upkeep,
-                facade_core::now().saturating_sub(7 * 86400),
-            )
-            .ok()
-            .flatten()
-            .is_some_and(|e| e.summary.starts_with("Reboot required"));
+        // A server restart forgets the upkeep it was told: the entries say
+        // whether this reboot was asked for already (since the last one).
+        let last = |kind| server.store.last_node_event(node, kind, 0).ok().flatten();
+        let asked = last(EventKind::Upkeep).filter(|e| e.summary.starts_with("Reboot required"));
+        let rebooted = last(EventKind::Reboot);
+        let recent = asked.is_some_and(|a| rebooted.is_none_or(|r| a.at > r.at));
         if !recent {
             let why = if upkeep.reboot_packages.is_empty() {
                 String::new()
