@@ -33,7 +33,7 @@ use tracing::{info, warn};
 use super::api::{ApiError, ApiResult, User};
 use super::github::{self, Event};
 use super::registry::{ImageRef, Registry};
-use super::store::{ADMINS, AutoDeployRow, GithubHookRow};
+use super::store::{ADMINS, AutoDeployRow, GithubDeliveryRow, GithubHookRow};
 use super::users::{can_see_app, load_app_for};
 use super::{Server, hash_secret, random_token};
 
@@ -48,6 +48,10 @@ const PUSH: &str = "push";
 /// GitHub sends both for a container published to ghcr.io, to the webhooks of
 /// the repository it is linked to.
 const PACKAGE_EVENTS: [&str; 2] = ["package", "registry_package"];
+/// A webhook facade did not make (one added by hand on a repository or an
+/// organisation) counts as long as it delivered within this time. Nothing else
+/// says it still exists.
+const OUTSIDE_HOOK_FRESH: u64 = 30 * 24 * 3600;
 
 /// State shared by the loop, the webhook endpoint and the API.
 #[derive(Default)]
@@ -346,7 +350,7 @@ pub async fn run(server: Arc<Server>) {
 async fn tick(server: &Arc<Server>) -> anyhow::Result<()> {
     let rows = server.store.list_auto_deploy()?;
     let pending = std::mem::take(&mut *server.auto_deploy.pending.lock());
-    let hooks = server.store.list_github_hooks()?;
+    let hooks = Hooks::load(server)?;
     let url = webhook_url(server);
     let now = facade_core::now();
     for row in rows {
@@ -380,7 +384,7 @@ fn poll_secs(
     server: &Server,
     watched: &Watched,
     row: &AutoDeployRow,
-    hooks: &[GithubHookRow],
+    hooks: &Hooks,
     url: Option<&str>,
 ) -> u64 {
     let poll = server.cfg.auto_deploy.poll_secs.max(10);
@@ -391,22 +395,87 @@ fn poll_secs(
     }
 }
 
-/// The webhook reporting the target's changes, if one does.
-fn hook_working<'a>(
+/// The webhooks GitHub may deliver from: the ones facade made, and the ones it
+/// only knows from their deliveries.
+struct Hooks {
+    own: Vec<GithubHookRow>,
+    outside: Vec<GithubDeliveryRow>,
+}
+
+impl Hooks {
+    fn load(server: &Server) -> anyhow::Result<Self> {
+        Ok(Hooks {
+            own: server.store.list_github_hooks()?,
+            outside: server.store.list_github_deliveries()?,
+        })
+    }
+}
+
+/// A webhook reporting a target's changes: where it sits, and when it last
+/// delivered.
+struct Coverage {
+    scope: String,
+    delivered_at: Option<u64>,
+}
+
+/// The webhook reporting the target's changes, if one does: one facade made on
+/// its repository, or one added by hand there or on its organisation.
+fn hook_working(
     watched: &Watched,
     row: Option<&AutoDeployRow>,
-    hooks: &'a [GithubHookRow],
+    hooks: &Hooks,
     url: Option<&str>,
-) -> Option<&'a GithubHookRow> {
+) -> Option<Coverage> {
     let (location, event) = hook_for(watched, row)?;
     let key = location.key();
-    hooks.iter().find(|h| {
+    if let Some(h) = hooks.own.iter().find(|h| {
         h.repo == key
             && h.hook_id.is_some()
             && h.error.is_none()
             && Some(h.url.as_str()) == url
             && h.events.iter().any(|e| e == event)
-    })
+    }) {
+        return Some(Coverage {
+            scope: h.repo.clone(),
+            delivered_at: h.delivered_at,
+        });
+    }
+    outside_hook(&hooks.outside, &location, event, facade_core::now())
+}
+
+/// A webhook facade did not make that covers the repository: on it or on its
+/// owner (an organisation), sending `event` (or both package events), and
+/// heard from lately.
+fn outside_hook(
+    outside: &[GithubDeliveryRow],
+    location: &RepoLocation,
+    event: &str,
+    now: u64,
+) -> Option<Coverage> {
+    let key = location.key();
+    let owner = key.rsplit_once('/').map(|(owner, _)| owner)?;
+    let sends = |events: &[String]| {
+        events.iter().any(|e| {
+            e == "*"
+                || e == event
+                || (PACKAGE_EVENTS.contains(&event) && PACKAGE_EVENTS.contains(&e.as_str()))
+        })
+    };
+    outside
+        .iter()
+        .filter(|d| d.scope == key || d.scope == owner)
+        .filter(|d| now.saturating_sub(d.delivered_at) <= OUTSIDE_HOOK_FRESH)
+        .filter(|d| sends(&d.events))
+        // The repository's own webhook says more than its organisation's.
+        .max_by_key(|d| (d.scope == key, d.delivered_at))
+        .map(|d| Coverage {
+            scope: if d.scope == key {
+                d.scope.clone()
+            } else {
+                format!("{} (organisation)", d.scope)
+            },
+            delivered_at: Some(d.delivered_at),
+        })
 }
 
 /// Whether a deployment of the target is queued or running.
@@ -744,7 +813,23 @@ async fn sync_hooks(server: &Arc<Server>) -> anyhow::Result<()> {
     let secret = webhook_secret(server)?;
     let secret_hash = hash_secret(&secret);
     let api_base = server.cfg.auto_deploy.github_api.clone();
-    let wanted = wanted_hooks(server)?;
+    let mut wanted = wanted_hooks(server)?;
+    // A webhook added by hand (on the repository or its organisation) already
+    // reports these: a second one would only deliver everything twice.
+    let outside = server.store.list_github_deliveries()?;
+    let now = facade_core::now();
+    wanted.retain(|_, want| {
+        let location = RepoLocation {
+            host: "github.com".into(),
+            port: None,
+            path: want.path.clone(),
+            ssh: false,
+        };
+        !want
+            .events
+            .iter()
+            .all(|e| outside_hook(&outside, &location, e, now).is_some())
+    });
     let existing: HashMap<String, GithubHookRow> = server
         .store
         .list_github_hooks()?
@@ -854,7 +939,7 @@ pub fn view(server: &Server, target: &Target) -> anyhow::Result<AutoDeployView> 
     let watched = watched(server, target)?.context("no such app or stack")?;
     let poll = server.cfg.auto_deploy.poll_secs.max(10);
     let url = webhook_url(server);
-    let hooks = server.store.list_github_hooks()?;
+    let hooks = Hooks::load(server)?;
     let working = hook_working(&watched, row.as_ref(), &hooks, url.as_deref());
     let mut view = AutoDeployView {
         enabled: row.is_some(),
@@ -887,11 +972,11 @@ pub fn view(server: &Server, target: &Target) -> anyhow::Result<AutoDeployView> 
     if let Some(hook) = working {
         view.method = AutoDeployMethod::Webhook;
         view.poll_secs = poll * WEBHOOK_SLOWDOWN;
-        view.webhook_repo = Some(hook.repo.clone());
+        view.webhook_repo = Some(hook.scope);
         view.webhook_delivered_at = hook.delivered_at;
     } else {
         view.method = AutoDeployMethod::Polling;
-        view.note = Some(why_polling(&watched, &row, &hooks, url.as_deref()));
+        view.note = Some(why_polling(&watched, &row, &hooks.own, url.as_deref()));
     }
     // What keeps it from deploying at all comes first.
     let state_note = match target {
@@ -1072,8 +1157,34 @@ pub async fn github_hook(State(server): S, headers: HeaderMap, body: Bytes) -> R
         Ok(e) => e,
         Err(e) => return bad(format!("{e:#}")).into_response(),
     };
+    let now = facade_core::now();
     if let Some(repo) = event.repo()
-        && let Err(e) = server.store.github_hook_delivered(repo, facade_core::now())
+        && let Err(e) = server.store.github_hook_delivered(repo, now)
+    {
+        warn!("recording a webhook delivery: {e:#}");
+    }
+    // A webhook facade did not make (added by hand, maybe on an organisation):
+    // remember where it sits and what it sends, so the targets it covers count
+    // as reported by a webhook.
+    let hook_id = header("x-github-hook-id").parse::<i64>().ok();
+    let own = server
+        .store
+        .list_github_hooks()
+        .map(|hooks| {
+            hooks
+                .iter()
+                .any(|h| h.hook_id.is_some() && h.hook_id == hook_id)
+        })
+        .unwrap_or(false);
+    if !own
+        && let Some((scope, subscribed)) =
+            github::delivery_scope(&header("x-github-hook-installation-target-type"), &body)
+        && let Err(e) = server.store.github_delivery(
+            &scope,
+            &header("x-github-event"),
+            subscribed.as_deref(),
+            now,
+        )
     {
         warn!("recording a webhook delivery: {e:#}");
     }
@@ -1141,6 +1252,42 @@ fn matching(server: &Server, event: &Event) -> anyhow::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhooks_added_by_hand_cover_their_repository_or_organisation() {
+        let now = 10_000_000;
+        let valet = on_github("https://github.com/Sigma-studios/valet").unwrap();
+        let elsewhere = on_github("https://github.com/someone/valet").unwrap();
+        let row = |scope: &str, events: &[&str], ago: u64| GithubDeliveryRow {
+            scope: scope.into(),
+            events: events.iter().map(|e| e.to_string()).collect(),
+            delivered_at: now - ago,
+        };
+        let org = [row("github.com/sigma-studios", &["push", "package"], 60)];
+        let hit = outside_hook(&org, &valet, PUSH, now).unwrap();
+        assert_eq!(hit.scope, "github.com/sigma-studios (organisation)");
+        assert!(outside_hook(&org, &elsewhere, PUSH, now).is_none());
+        // Either package event stands for both.
+        assert!(outside_hook(&org, &valet, "registry_package", now).is_some());
+        // Not sending pushes, or silent for too long: polled.
+        let packages = [row("github.com/sigma-studios", &["package"], 60)];
+        assert!(outside_hook(&packages, &valet, PUSH, now).is_none());
+        let stale = [row(
+            "github.com/sigma-studios",
+            &["push"],
+            OUTSIDE_HOOK_FRESH + 1,
+        )];
+        assert!(outside_hook(&stale, &valet, PUSH, now).is_none());
+        // The repository's own webhook wins over its organisation's.
+        let both = [
+            row("github.com/sigma-studios", &["*"], 10),
+            row("github.com/sigma-studios/valet", &["push"], 3600),
+        ];
+        assert_eq!(
+            outside_hook(&both, &valet, PUSH, now).unwrap().scope,
+            "github.com/sigma-studios/valet"
+        );
+    }
 
     #[test]
     fn decides_on_edges() {

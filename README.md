@@ -384,7 +384,11 @@ which links the package to the repository) and puts a webhook for package events
 there. Images on other registries (Docker Hub…) are polled. Without a domain or such a
 token, `facade auto-deploy <app>` and the app page say what is missing; a webhook can
 also be added by hand: `facade auto-deploy --hook` prints its payload URL and secret
-(content type `application/json`, events *Pushes* and/or *Packages*).
+(content type `application/json`, events *Pushes* and/or *Packages*). One webhook on
+a GitHub organisation covers all its repositories, present and future, with no token
+in facade. facade learns about a webhook it did not make from its deliveries (its
+ping when it is added, then every push), and counts it while it has delivered in the
+last 30 days; it then makes no webhook of its own for what that one covers.
 
 What deploys depends on what changed, not on what runs: a commit or image is deployed
 once. A failed deploy is not retried for the same commit (the next push deploys), a

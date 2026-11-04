@@ -271,6 +271,38 @@ fn repo_key(body: &serde_json::Value) -> Option<String> {
     Some(format!("github.com/{}", name.to_lowercase()))
 }
 
+/// Where the webhook that sent a delivery sits: `github.com/owner` for an
+/// organisation's, `github.com/owner/repo` for a repository's (lowercase), and
+/// for a ping the events it sends. `target_type` is the
+/// `X-GitHub-Hook-Installation-Target-Type` header; a ping also says it in its
+/// body. `None` for anything else (a GitHub App, an unreadable body).
+pub fn delivery_scope(target_type: &str, body: &[u8]) -> Option<(String, Option<Vec<String>>)> {
+    let body: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let kind = match target_type {
+        "" => body.pointer("/hook/type")?.as_str()?.to_lowercase(),
+        t => t.to_lowercase(),
+    };
+    let scope = match kind.as_str() {
+        "organization" => format!(
+            "github.com/{}",
+            body.pointer("/organization/login")?
+                .as_str()?
+                .to_lowercase()
+        ),
+        "repository" => repo_key(&body)?,
+        _ => return None,
+    };
+    let events = body
+        .pointer("/hook/events")
+        .and_then(|e| e.as_array())
+        .map(|e| {
+            e.iter()
+                .filter_map(|e| e.as_str().map(str::to_string))
+                .collect()
+        });
+    Some((scope, events))
+}
+
 /// Reads a delivery of event `kind` (the `X-GitHub-Event` header).
 pub fn parse_event(kind: &str, body: &[u8]) -> anyhow::Result<Event> {
     let body: serde_json::Value = serde_json::from_slice(body).context("the body is not JSON")?;
@@ -327,6 +359,37 @@ pub fn parse_event(kind: &str, body: &[u8]) -> anyhow::Result<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tells_organisation_and_repository_webhooks_apart() {
+        let ping = serde_json::json!({
+            "hook": {"type": "Organization", "events": ["push", "package"]},
+            "organization": {"login": "Sigma-studios"},
+        });
+        assert_eq!(
+            delivery_scope("", ping.to_string().as_bytes()),
+            Some((
+                "github.com/sigma-studios".into(),
+                Some(vec!["push".into(), "package".into()])
+            ))
+        );
+        let push = serde_json::json!({
+            "ref": "refs/heads/main",
+            "repository": {"full_name": "Sigma-studios/Valet"},
+            "organization": {"login": "Sigma-studios"},
+        });
+        let body = push.to_string();
+        assert_eq!(
+            delivery_scope("organization", body.as_bytes()),
+            Some(("github.com/sigma-studios".into(), None))
+        );
+        assert_eq!(
+            delivery_scope("repository", body.as_bytes()),
+            Some(("github.com/sigma-studios/valet".into(), None))
+        );
+        assert_eq!(delivery_scope("integration", body.as_bytes()), None);
+        assert_eq!(delivery_scope("", body.as_bytes()), None);
+    }
     use axum::extract::{Path, State};
     use axum::http::HeaderMap;
     use axum::routing::{get, patch};

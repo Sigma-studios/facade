@@ -1585,6 +1585,11 @@ CREATE TABLE IF NOT EXISTS github_hooks (
     updated_at INTEGER NOT NULL,
     delivered_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS github_deliveries (
+    scope TEXT PRIMARY KEY,
+    events TEXT NOT NULL DEFAULT '',
+    delivered_at INTEGER NOT NULL
+);
 "#;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1600,6 +1605,17 @@ pub struct AutoDeployRow {
     /// For image apps, the GitHub repository the image says it is built from
     /// (`github.com/owner/repo`); `""` when it says none.
     pub image_repo: Option<String>,
+}
+
+/// A GitHub webhook facade did not make, known from its deliveries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GithubDeliveryRow {
+    /// `github.com/owner` for an organisation's webhook, `github.com/owner/repo`
+    /// for a repository's; lowercase.
+    pub scope: String,
+    /// What it sends (from its ping), or what it was seen to send.
+    pub events: Vec<String>,
+    pub delivered_at: u64,
 }
 
 /// A webhook facade manages on a GitHub repository.
@@ -1764,6 +1780,67 @@ impl Store {
         self.0
             .lock()
             .execute("DELETE FROM github_hooks WHERE repo = ?1", [repo])?;
+        Ok(())
+    }
+
+    /// Webhooks facade did not make (added by hand, on a repository or an
+    /// organisation) that delivered, signed with its secret.
+    pub fn list_github_deliveries(&self) -> anyhow::Result<Vec<GithubDeliveryRow>> {
+        let conn = self.0.lock();
+        let mut stmt = conn
+            .prepare("SELECT scope, events, delivered_at FROM github_deliveries ORDER BY scope")?;
+        let rows = stmt
+            .query_map([], |r| {
+                let events: String = r.get(1)?;
+                Ok(GithubDeliveryRow {
+                    scope: r.get(0)?,
+                    events: events
+                        .split(',')
+                        .filter(|e| !e.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    delivered_at: r.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Records a delivery from a webhook facade did not make. A ping says
+    /// which events the webhook sends (`subscribed`); other deliveries add
+    /// their own event to what is known.
+    pub fn github_delivery(
+        &self,
+        scope: &str,
+        event: &str,
+        subscribed: Option<&[String]>,
+        at: u64,
+    ) -> anyhow::Result<()> {
+        let conn = self.0.lock();
+        let known: Option<String> = conn
+            .query_row(
+                "SELECT events FROM github_deliveries WHERE scope = ?1",
+                [scope],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut events: Vec<String> = match subscribed {
+            Some(list) => list.to_vec(),
+            None => known
+                .unwrap_or_default()
+                .split(',')
+                .filter(|e| !e.is_empty())
+                .map(str::to_string)
+                .chain((event != "ping").then(|| event.to_string()))
+                .collect(),
+        };
+        events.sort();
+        events.dedup();
+        conn.execute(
+            "INSERT INTO github_deliveries (scope, events, delivered_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(scope) DO UPDATE SET events = excluded.events, delivered_at = excluded.delivered_at",
+            params![scope, events.join(","), at],
+        )?;
         Ok(())
     }
 
