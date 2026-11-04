@@ -1833,14 +1833,85 @@ impl Runtime {
         }
     }
 
-    pub async fn restart(&self, app: &str) -> anyhow::Result<()> {
+    /// Restarts the app. Where a deploy would overlap (see [`Self::plan_overlap`]),
+    /// a fresh container from the very image it runs starts next to it and takes
+    /// the traffic, as in a deploy, so a restart has no gap either; otherwise, or
+    /// when the running container does not match what the app should run (a
+    /// change waits to be deployed), Docker restarts it in place.
+    pub async fn restart(
+        &self,
+        app: &str,
+        w: Option<&Workload>,
+        log: &DeployLog,
+    ) -> anyhow::Result<()> {
         if self.static_dir(app).exists() {
             return Ok(());
         }
+        let name = container(app);
+        if let Some(w) = w.filter(|w| w.spec.enabled) {
+            self.recover(app).await?;
+            match self.overlap_restart(w, &name, log).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => return Err(e.context(format!("restarting {app}"))),
+            }
+        }
         self.docker_for_stops()
-            .restart_container(&container(app), None::<RestartContainerOptions>)
+            .restart_container(&name, None::<RestartContainerOptions>)
             .await
             .with_context(|| format!("restarting {app}"))
+    }
+
+    /// The overlap half of [`Self::restart`]: `false` when it does not apply.
+    async fn overlap_restart(
+        &self,
+        w: &Workload,
+        name: &str,
+        log: &DeployLog,
+    ) -> anyhow::Result<bool> {
+        let existing = match self
+            .docker()
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) if is_not_found(&e) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let serving = existing
+            .state
+            .as_ref()
+            .is_some_and(|s| s.running == Some(true) && s.restarting != Some(true));
+        let config = existing.config.clone().unwrap_or_default();
+        let (Some(tag), Some(run_key), Some(image_id)) = (
+            config.image.clone(),
+            config
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_RUN))
+                .cloned(),
+            existing.image.clone(),
+        ) else {
+            return Ok(false);
+        };
+        if !serving || !run_key_matches(w, &tag, &run_key) {
+            return Ok(false);
+        }
+        if let Err(why) = self.plan_overlap(w).await {
+            tracing::info!(app = %w.spec.name, "restarting in place: {why}");
+            return Ok(false);
+        }
+        // The image it runs, even if its tag (`latest`…) points elsewhere since:
+        // a restart changes no version.
+        let moved = self
+            .docker()
+            .inspect_image(&tag)
+            .await
+            .map_or(true, |i| i.id.as_deref() != Some(image_id.as_str()));
+        let image = if moved { image_id } else { tag };
+        tracing::info!(app = %w.spec.name, "restarting without downtime: a new container starts next to the running one");
+        self.overlap(w, &image, &run_key, &existing, log).await?;
+        Ok(true)
     }
 
     /// Removes the app's container, network and images; its volumes too when

@@ -262,6 +262,24 @@ impl Agent {
         }
     }
 
+    /// Restarts an app, without downtime where a deploy would have none (see
+    /// `Runtime::restart`); one at a time with its deploys.
+    async fn restart(self: &Arc<Self>, app: String) -> anyhow::Result<()> {
+        let workload = self.workloads.lock().get(&app).cloned();
+        let lock = self.lock_for(&app);
+        let _held = lock.lock().await;
+        let log = DeployLog {
+            agent: self.clone(),
+            deployment: None,
+            app: app.clone(),
+            started: AtomicBool::new(false),
+        };
+        let result = self.runtime.restart(&app, workload.as_ref(), &log).await;
+        // A new container listens on a new local port.
+        self.refresh_routes().await;
+        result
+    }
+
     fn lock_for(&self, app: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
@@ -369,7 +387,7 @@ impl Agent {
                 let agent = self.clone();
                 tokio::spawn(async move { maintenance::refresh_report(&agent).await });
             }
-            AgentRequest::Restart { app } => self.runtime.restart(&app).await?,
+            AgentRequest::Restart { app } => self.restart(app).await?,
             AgentRequest::Ingress { certs, proxies } => {
                 *self.certs.lock() = certs;
                 *self.proxies.lock() = proxies;

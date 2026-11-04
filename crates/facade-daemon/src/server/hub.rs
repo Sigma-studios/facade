@@ -46,10 +46,21 @@ pub struct NodeConn {
 /// How long an agent may take to answer `req`. Removing or restarting an app
 /// waits for it to stop, which takes up to its stop timeout; commands and volume
 /// commands run in containers answer once they exit.
+/// The longest a new container may take to become ready (the agent's
+/// health-check budget and its wait for the ports to listen).
+const RESTART_READY_SECS: u64 = 15 * 60 + 2 * 60 + 30;
+
 fn answer_within(req: &AgentRequest) -> Duration {
     match req {
-        AgentRequest::Remove { .. } | AgentRequest::Restart { .. } => {
+        AgentRequest::Remove { .. } => {
             REQUEST_TIMEOUT + Duration::from_secs(u64::from(MAX_STOP_TIMEOUT))
+        }
+        // Without downtime, a restart waits for the new container to be ready
+        // (its health check, at most about 15 minutes), then the old one gets its
+        // stop timeout for its connections and another one to stop.
+        AgentRequest::Restart { .. } => {
+            REQUEST_TIMEOUT
+                + Duration::from_secs(2 * u64::from(MAX_STOP_TIMEOUT) + RESTART_READY_SECS)
         }
         AgentRequest::Exec { timeout_secs, .. } => {
             REQUEST_TIMEOUT + Duration::from_secs(u64::from(*timeout_secs))

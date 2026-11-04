@@ -428,7 +428,9 @@ traffic moves to it once it is ready (its health check passes, or it stays up a 
 seconds, and it accepts connections on its ports), then the old one has its stop
 timeout for the requests and connections it still serves (WebSockets included) to
 end, and gets its stop signal. If the new one never gets ready, it is removed and the
-old one carries on: the deploy fails, nothing went down.
+old one carries on: the deploy fails, nothing went down. `facade restart` (and the
+Restart button) does the same with a fresh container from the image the app runs, so
+a restart has no gap either.
 
 Otherwise the old container stops before the new one starts, and the app is down
 meanwhile. That is the case of apps with published ports or on the node's network
@@ -835,5 +837,5 @@ the server; older ones need the server's `facaded` installed by hand.
 * Webhooks from forges other than GitHub (GitLab, Gitea…): their repositories are
   polled.
 * Zero downtime for apps that cannot overlap (published ports, the node's network,
-  volumes), for `facade restart`, and for an app moving to another node.
+  volumes), and for an app moving to another node.
 * Stacks and databases owned by members (admins create them for now).
