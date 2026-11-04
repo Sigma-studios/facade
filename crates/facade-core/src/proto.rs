@@ -409,9 +409,30 @@ pub struct Listener {
     pub process: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
-    /// The facade app the socket belongs to; `facade` for facade itself.
+    /// The facade app the socket belongs to; `facade` for facade itself. A TLS
+    /// port of the entry point belongs to the app it passes connections to.
     #[serde(default)]
     pub app: Option<String>,
+    /// What holds it, in a few words, when the agent knows: `façade entry
+    /// point`, `container grafana`, `SSH (system)`. Older agents send none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl Listener {
+    /// Who holds the socket, for messages: `app blog`, `facade itself`,
+    /// `docker-proxy (pid 412, container grafana)`.
+    pub fn holder(&self) -> String {
+        match (&self.app, &self.process, self.pid, &self.description) {
+            (Some(app), ..) if app == "facade" => "facade itself".into(),
+            (Some(app), ..) => format!("app {app}"),
+            (None, Some(p), Some(pid), Some(what)) => format!("{p} (pid {pid}, {what})"),
+            (None, Some(p), Some(pid), None) => format!("{p} (pid {pid})"),
+            (None, Some(p), None, _) => p.clone(),
+            (None, None, _, Some(what)) => what.clone(),
+            _ => "another program".into(),
+        }
+    }
 }
 
 /// What Docker and facade keep on a node's disk, and the last cleanup.

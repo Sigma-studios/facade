@@ -632,8 +632,15 @@ impl Agent {
 
     async fn listeners(&self) -> Vec<facade_core::proto::Listener> {
         match self.runtime.port_owners().await {
-            Ok((containers, published)) => {
-                tokio::task::spawn_blocking(move || ports::scan(&containers, &published))
+            Ok(mut owners) => {
+                // The entry point listens on TLS ports for the apps asking.
+                for w in self.workloads.lock().values().filter(|w| w.spec.enabled) {
+                    for t in &w.spec.tls_ports {
+                        owners.tls_ports.insert(t.public, w.spec.name.clone());
+                    }
+                }
+                owners.entry_ports = self.link.embedded_ports();
+                tokio::task::spawn_blocking(move || ports::scan(&owners))
                     .await
                     .unwrap_or_default()
             }

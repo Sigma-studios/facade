@@ -1012,10 +1012,9 @@ impl Runtime {
         let started = std::time::Instant::now();
         let mut last_said = None::<std::time::Instant>;
         loop {
-            let (containers, published) = self.port_owners().await?;
+            let owners = self.port_owners().await?;
             let listeners =
-                tokio::task::spawn_blocking(move || super::ports::scan(&containers, &published))
-                    .await?;
+                tokio::task::spawn_blocking(move || super::ports::scan(&owners)).await?;
             let busy: Vec<String> = listeners
                 .iter()
                 .filter(|l| l.app.as_deref() != Some(w.spec.name.as_str()))
@@ -1024,14 +1023,7 @@ impl Runtime {
                         .iter()
                         .any(|p| p.protocol == l.protocol && p.contains(l.port))
                 })
-                .map(|l| {
-                    let holder = match (&l.app, &l.process, l.pid) {
-                        (Some(app), _, _) => format!("app {app}"),
-                        (None, Some(p), Some(pid)) => format!("{p} (pid {pid})"),
-                        _ => "another program".into(),
-                    };
-                    format!("{}/{} held by {holder}", l.port, l.protocol)
-                })
+                .map(|l| format!("{}/{} held by {}", l.port, l.protocol, l.holder()))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -1204,29 +1196,31 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    /// Which app each managed container and each published host port belongs to,
-    /// to name the owners of listening sockets.
-    pub async fn port_owners(
-        &self,
-    ) -> anyhow::Result<(HashMap<String, String>, HashMap<(Protocol, u16), String>)> {
-        let filters = HashMap::from([(
-            "label".to_string(),
-            vec![format!("{LABEL_NODE}={}", self.0.token.node)],
-        )]);
+    /// Which app each managed container and each published host port belongs
+    /// to, and the names of the other running containers and of their published
+    /// ports, to name the owners of listening sockets.
+    pub async fn port_owners(&self) -> anyhow::Result<super::ports::Owners> {
         let containers = self
             .docker()
             .list_containers(Some(ListContainersOptions {
                 all: false,
-                filters: Some(filters),
                 ..Default::default()
             }))
             .await?;
-        let mut by_container = HashMap::new();
-        let mut by_port = HashMap::new();
+        let mut owners = super::ports::Owners::default();
         for c in containers {
-            let Some(app) = c.labels.as_ref().and_then(|l| l.get(LABEL_APP)).cloned() else {
-                continue;
-            };
+            let labels = c.labels.unwrap_or_default();
+            let app = labels
+                .get(LABEL_APP)
+                .filter(|_| labels.get(LABEL_NODE) == Some(&self.0.token.node))
+                .cloned();
+            let name = c
+                .names
+                .as_ref()
+                .and_then(|n| n.first())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .or_else(|| c.id.clone())
+                .unwrap_or_default();
             for port in c.ports.unwrap_or_default() {
                 let Some(public) = port.public_port else {
                     continue;
@@ -1235,13 +1229,19 @@ impl Runtime {
                     Some("udp") => Protocol::Udp,
                     _ => Protocol::Tcp,
                 };
-                by_port.insert((proto, public), app.clone());
+                match &app {
+                    Some(app) => owners.published.insert((proto, public), app.clone()),
+                    None => owners.other_published.insert((proto, public), name.clone()),
+                };
             }
             if let Some(id) = c.id {
-                by_container.insert(id, app);
+                match app {
+                    Some(app) => owners.containers.insert(id, app),
+                    None => owners.other_containers.insert(id, name),
+                };
             }
         }
-        Ok((by_container, by_port))
+        Ok(owners)
     }
 
     /// The Docker volume for one of the app's volumes, created if needed.

@@ -3017,7 +3017,7 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
                 return print_json(&ports);
             }
             table(
-                &["PORT", "ADDRESS", "PROCESS", "APP"],
+                &["PORT", "ADDRESS", "PROCESS", "APP", "WHAT"],
                 ports.iter().map(|l| {
                     vec![
                         format!("{}/{}", l.port, l.protocol),
@@ -3028,6 +3028,7 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
                             _ => "?".into(),
                         },
                         l.app.clone().unwrap_or_default(),
+                        l.description.clone().unwrap_or_default(),
                     ]
                 }),
             );
@@ -4144,7 +4145,12 @@ fn print_app_detail(view: &AppView) {
             println!("backups:   {} on the server's disk", bytes(d.backups));
         }
         // What takes the space in the image it runs.
-        let width = d.layers.iter().map(|l| bytes(l.size).len()).max().unwrap_or(0);
+        let width = d
+            .layers
+            .iter()
+            .map(|l| bytes(l.size).len())
+            .max()
+            .unwrap_or(0);
         for (i, layer) in d.layers.iter().enumerate() {
             println!(
                 "{}{:>width$}  {}",

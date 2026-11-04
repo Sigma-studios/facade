@@ -1034,23 +1034,13 @@ fn port_conflict(
                 l.port,
                 l.protocol,
                 spec.node,
-                holder(l),
+                l.holder(),
                 l.address,
                 spec.node
             )));
         }
     }
     Ok(None)
-}
-
-fn holder(l: &Listener) -> String {
-    match (&l.app, &l.process, l.pid) {
-        (Some(app), _, _) if app == "facade" => "facade itself".into(),
-        (Some(app), _, _) => format!("app {app}"),
-        (None, Some(process), Some(pid)) => format!("{process} (pid {pid})"),
-        (None, Some(process), None) => process.clone(),
-        _ => "another program".into(),
-    }
 }
 
 /// Before (re)starting an app by hand: its ports must be free, as the node sees

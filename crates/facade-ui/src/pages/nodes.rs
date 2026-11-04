@@ -455,12 +455,17 @@ fn Ports(
                                             }}
                                         </td>
                                         <td>
-                                            {match l.app.clone() {
-                                                Some(app) if app == "facade" => view! { <span>"façade"</span> }.into_any(),
-                                                Some(app) => view! {
-                                                    <A href=format!("/apps/{app}") attr:class="strong-link">{app.clone()}</A>
+                                            {match (l.app.clone(), l.description.clone()) {
+                                                (Some(app), what) if app == "facade" => view! {
+                                                    <span>{what.unwrap_or_else(|| "façade".into())}</span>
                                                 }.into_any(),
-                                                None => view! { <span class="muted">"another program"</span> }.into_any(),
+                                                (Some(app), what) => view! {
+                                                    <A href=format!("/apps/{app}") attr:class="strong-link">{app.clone()}</A>
+                                                    {what.map(|w| view! { <span class="muted small">{format!(" · {w}")}</span> })}
+                                                }.into_any(),
+                                                (None, what) => view! {
+                                                    <span class="muted">{what.unwrap_or_else(|| "another program".into())}</span>
+                                                }.into_any(),
                                             }}
                                         </td>
                                     </tr>
