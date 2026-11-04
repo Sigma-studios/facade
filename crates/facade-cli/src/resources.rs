@@ -30,7 +30,10 @@ fn app_parts(point: Option<&ResourcePoint>, stats: Option<&AppStats>) -> Vec<Str
         if let Some(t) = p.throttled.filter(|t| *t >= 1.0) {
             parts.push(format!("CPU held back {t:.0}% of the time"));
         }
-        if let (Some(r), Some(w)) = (p.disk_read, p.disk_write) {
+        // No activity at all: nothing worth a word.
+        if let (Some(r), Some(w)) = (p.disk_read, p.disk_write)
+            && r + w >= 1.0
+        {
             parts.push(format!("disk read {}, write {}", rate(r), rate(w)));
         }
     }

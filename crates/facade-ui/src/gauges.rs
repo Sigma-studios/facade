@@ -94,7 +94,7 @@ pub fn VolumeTrend(points: Vec<(u64, u64)>, span: (u64, u64)) -> impl IntoView {
     let width = end.saturating_sub(start).max(1) as f64;
     let x = |at: u64| (at.saturating_sub(start) as f64 / width * TREND_W).clamp(0.0, TREND_W);
     let y = |size: u64| TREND_H - 1.0 - size as f64 / top * (TREND_H - 2.0);
-    let d: String = points
+    let mut d: String = points
         .iter()
         .enumerate()
         .map(|(i, &(at, size))| {
@@ -106,6 +106,11 @@ pub fn VolumeTrend(points: Vec<(u64, u64)>, span: (u64, u64)) -> impl IntoView {
             )
         })
         .collect();
+    // One measure so far: a short stroke ending where it is.
+    if let [(at, size)] = points[..] {
+        let (x1, y1) = (x(at), y(size));
+        d = format!("M{:.1},{y1:.1} L{x1:.1},{y1:.1}", (x1 - 4.0).max(0.0));
+    }
     let summary = match (points.first(), points.last()) {
         (Some(first), Some(last)) if points.len() > 1 => format!(
             "{} {} → {} now",
