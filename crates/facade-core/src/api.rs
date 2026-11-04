@@ -1047,6 +1047,27 @@ pub struct UpdateCheck {
     pub commits: Vec<CommitView>,
 }
 
+/// What a deploy of an image app would pull (`POST /api/apps/{name}/image-updates`):
+/// the digest its tag points to at the registry, against the one the last
+/// successful deploy pulled. Nothing is pulled to find out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUpdateCheck {
+    /// The image and its tag (`ghcr.io/me/blog:latest`).
+    pub image: String,
+    /// The digest the tag points to now.
+    pub latest: String,
+    /// The digest the last successful deploy pulled; `None` when its log does
+    /// not say (the image was already on the node, or never deployed).
+    pub deployed: Option<String>,
+}
+
+impl ImageUpdateCheck {
+    /// `None` when what runs is unknown.
+    pub fn outdated(&self) -> Option<bool> {
+        self.deployed.as_ref().map(|d| *d != self.latest)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitView {
     pub hash: String,

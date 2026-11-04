@@ -23,7 +23,7 @@ use axum::response::{IntoResponse, Response};
 use facade_core::Source;
 use facade_core::api::{
     AutoDeployMethod, AutoDeployTarget, AutoDeployView, DeployRequest, GitCredentialKind,
-    SetAutoDeploy, StackDeployRequest, WebhookInfo,
+    ImageUpdateCheck, SetAutoDeploy, StackDeployRequest, WebhookInfo,
 };
 use facade_core::git::RepoLocation;
 use parking_lot::Mutex;
@@ -547,6 +547,29 @@ fn deployed_digest(server: &Server, app: &str) -> Option<String> {
     super::registry::pulled_digest(&log)
 }
 
+/// For the app page's update check: what the image's tag points to now, against
+/// what the app's last deploy pulled. The poll's own lookup, auto-deploy or not.
+pub async fn image_check(
+    server: &Server,
+    row: &super::store::AppRow,
+) -> anyhow::Result<ImageUpdateCheck> {
+    let Source::Image { image } = &row.spec.source else {
+        bail!("{} does not run a registry image", row.spec.name);
+    };
+    let reference = ImageRef::parse(image);
+    let login = registry_login(server, row.owner.unwrap_or(ADMINS), &reference)?;
+    let latest = server
+        .auto_deploy
+        .registry
+        .digest(image, login.as_ref())
+        .await?;
+    Ok(ImageUpdateCheck {
+        image: reference.display(),
+        latest,
+        deployed: deployed_digest(server, &row.spec.name),
+    })
+}
+
 async fn check_app(
     server: &Arc<Server>,
     name: &str,
@@ -1068,6 +1091,18 @@ pub async fn put_app(
     let target = Target::App(name);
     set(&server, &target, req.enabled)?;
     Ok(Json(view(&server, &target)?))
+}
+
+pub async fn check_image(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+) -> ApiResult<Json<ImageUpdateCheck>> {
+    let row = load_app_for(&server, &user, &name)?;
+    image_check(&server, &row)
+        .await
+        .map(Json)
+        .map_err(|e| bad(format!("{e:#}")))
 }
 
 pub async fn get_stack(

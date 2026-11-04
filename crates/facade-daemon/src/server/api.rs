@@ -85,6 +85,10 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/apps/{name}/deploy", post(deploy_app))
         .route("/api/apps/{name}/updates", post(check_updates))
         .route(
+            "/api/apps/{name}/image-updates",
+            post(super::autodeploy::check_image),
+        )
+        .route(
             "/api/apps/{name}/auto-deploy",
             get(super::autodeploy::get_app).put(super::autodeploy::put_app),
         )

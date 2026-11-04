@@ -188,7 +188,8 @@ enum Command {
         #[command(subcommand)]
         action: Option<ServerCommand>,
     },
-    /// Fetch an app's branch and list the commits a deploy would bring.
+    /// Fetch an app's branch and list the commits a deploy would bring (for an
+    /// image app, whether its tag points to a new image).
     Updates {
         app: String,
     },
@@ -1836,6 +1837,32 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
             );
         }
         Command::Updates { app } => {
+            // An image app: whether its tag points to another image than the one running.
+            let view: AppView = api.get(&format!("/api/apps/{app}")).await?;
+            if matches!(view.spec.source, Source::Image { .. }) {
+                let check: ImageUpdateCheck = api
+                    .json(api.request(Method::POST, &format!("/api/apps/{app}/image-updates")))
+                    .await?;
+                if json {
+                    return print_json(&check);
+                }
+                let short = |d: &str| d.get(..19).unwrap_or(d).to_string();
+                match check.outdated() {
+                    Some(false) => println!("{app} is up to date with {}", check.image),
+                    Some(true) => println!(
+                        "{} points to a new image: {} (running {})\ndeploy it with `facade deploy {app}`",
+                        check.image,
+                        short(&check.latest),
+                        short(check.deployed.as_deref().unwrap_or_default())
+                    ),
+                    None => println!(
+                        "{} points to {}; which image {app} runs is unknown (its last deploy did not pull one)",
+                        check.image,
+                        short(&check.latest)
+                    ),
+                }
+                return Ok(());
+            }
             let check: UpdateCheck = api
                 .json(api.request(Method::POST, &format!("/api/apps/{app}/updates")))
                 .await?;
