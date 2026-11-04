@@ -1,6 +1,7 @@
 //! `facade`: command-line client for a facade server. Every command takes `--json`
 //! for machine-readable output, so scripts and AI agents can drive it.
 
+mod activity;
 mod client;
 mod exec;
 mod output;
@@ -104,6 +105,11 @@ enum Command {
     },
     /// What each node is building and what waits, and recent deployments.
     Builds,
+    /// What happened to apps and nodes, newest first: deploys and who made
+    /// them, crashes and memory kills, health, changes, alerts, logins,
+    /// certificates, reboots. `--id N` shows one with its log lines.
+    #[command(visible_alias = "events")]
+    Activity(activity::ActivityArgs),
     Restart {
         app: String,
     },
@@ -1724,6 +1730,7 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 .await?;
             eprintln!("deployment {id} cancelled");
         }
+        Command::Activity(args) => activity::run(api, args, json).await?,
         Command::Builds => {
             let builds: BuildsView = api.get("/api/builds").await?;
             if json {
