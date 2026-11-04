@@ -1,10 +1,10 @@
-use facade_core::api::{Mention, NotifySettings, NotifyUpdate};
+use facade_core::api::{Mention, NotifySettings, NotifyUpdate, WeeklyPreview};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
 use crate::components::{ErrorNote, Loading};
-use crate::util::{ago, alerts, me, polled, run, toasts};
+use crate::util::{Polled, ago, alerts, date, me, polled, run, toasts};
 
 /// Settings → Alerts: where alerts go (admins), and the recent ones.
 #[component]
@@ -14,10 +14,11 @@ pub fn AlertsTab() -> impl IntoView {
     view! {
         <p class="muted lead">
             "Raised when a problem lasts a minute: a node offline, an app crashed or failing to deploy, "
-            "disk ≥ 90 %, memory ≥ 95 %, an app at its memory or CPU limit, or an app writing over 100 MB inside its container (instead of a volume)."
+            "disk ≥ 90 %, memory ≥ 95 %, an app at its memory or CPU limit, answering too many 5xx or unreachable from outside, "
+            "or an app writing over 100 MB inside its container (instead of a volume)."
         </p>
         <Show when=move || me.is_admin()>
-            <DiscordSettings/>
+            <NotifyCards/>
         </Show>
         <section>
             <h2 class="section-title">"Recent alerts"</h2>
@@ -52,10 +53,18 @@ pub fn AlertsTab() -> impl IntoView {
 }
 
 #[component]
-fn DiscordSettings() -> impl IntoView {
+fn NotifyCards() -> impl IntoView {
     let settings = polled(None, || async {
         api::get::<NotifySettings>("/api/alerts/settings").await
     });
+    view! {
+        <DiscordSettings settings/>
+        <WeeklySummary settings/>
+    }
+}
+
+#[component]
+fn DiscordSettings(settings: Polled<NotifySettings>) -> impl IntoView {
     let webhook = RwSignal::new(String::new());
     let mentions = RwSignal::new(String::new());
     // Fill the mentions field once the settings arrive.
@@ -82,6 +91,7 @@ fn DiscordSettings() -> impl IntoView {
         let update = NotifyUpdate {
             discord_webhook: (!w.is_empty()).then_some(w),
             mentions: Some(list),
+            weekly: None,
         };
         run(
             "Alert settings saved",
@@ -96,6 +106,7 @@ fn DiscordSettings() -> impl IntoView {
         let update = NotifyUpdate {
             discord_webhook: Some(String::new()),
             mentions: None,
+            weekly: None,
         };
         run(
             "Webhook removed",
@@ -224,4 +235,96 @@ fn DiscordSettings() -> impl IntoView {
             </Show>
         </section>
     }
+}
+
+/// The weekly summary: the switch, when it goes out, and a preview.
+#[component]
+fn WeeklySummary(settings: Polled<NotifySettings>) -> impl IntoView {
+    let saving = RwSignal::new(false);
+    let preview = RwSignal::new(None::<WeeklyPreview>);
+    let loading = RwSignal::new(false);
+    let set = move |on: bool| {
+        saving.set(true);
+        let update = NotifyUpdate {
+            weekly: Some(on),
+            ..Default::default()
+        };
+        spawn_local(async move {
+            if let Err(e) = api::put_empty("/api/alerts/settings", &update).await {
+                toasts().err(e);
+            }
+            settings.reload();
+            saving.try_set(false);
+        });
+    };
+    let show_preview = move |_| {
+        loading.set(true);
+        spawn_local(async move {
+            match api::get::<WeeklyPreview>("/api/alerts/weekly").await {
+                Ok(p) => {
+                    preview.try_set(Some(p));
+                }
+                Err(e) => toasts().err(e),
+            }
+            loading.try_set(false);
+        });
+    };
+    move || {
+        settings.data.get().filter(|s| s.weekly_schedule.is_some()).map(|s| {
+            let schedule = s.weekly_schedule.clone().unwrap_or_default();
+            let state = match (s.weekly, s.discord_webhook.is_some(), s.weekly_next) {
+                (false, _, _) => "Off.".to_string(),
+                (true, false, _) => format!("On, {schedule}, once a webhook is set above."),
+                (true, true, Some(next)) => format!("Next summary: {} ({schedule}).", date(next)),
+                (true, true, None) => format!("On, {schedule}."),
+            };
+            view! {
+                <section class="card details auto-deploy">
+                    <h2 class="section-title">"Weekly summary"</h2>
+                    <label class="check">
+                        <input type="checkbox" prop:checked=s.weekly disabled=move || saving.get()
+                            on:change=move |ev| set(event_target_checked(&ev))/>
+                        {format!("Post a summary of the week before, {schedule}")}
+                    </label>
+                    <p class="muted small">
+                        {state}
+                        " Per app: availability, requests and their change, 5xx, visitors, deploys, restarts, crashes. "
+                        "Per node: disk, bandwidth served, pending updates."
+                        {s.weekly_sent.map(|at| format!(" Last sent {}.", ago(at)))}
+                    </p>
+                    <div class="form-actions">
+                        <button type="button" class="button" on:click=show_preview disabled=move || loading.get()>
+                            {move || if loading.get() { "Loading…" } else { "Preview" }}
+                        </button>
+                    </div>
+                    {move || preview.get().map(|p| view! {
+                        <div class="weekly-preview">
+                            <p class="muted small">"The 7 days before today, as it would be posted (nothing is sent):"</p>
+                            <div class="weekly-embed">
+                                <strong>{p.title.clone()}</strong>
+                                {p.parts.iter().flat_map(|part| part.lines().map(str::to_string).collect::<Vec<_>>())
+                                    .map(|line| view! { <div>{bolded(&line)}</div> })
+                                    .collect_view()}
+                            </div>
+                        </div>
+                    })}
+                </section>
+            }
+        })
+    }
+}
+
+/// A line of Discord markdown with its `**bold**` runs bold.
+fn bolded(line: &str) -> impl IntoView + use<> {
+    line.split("**")
+        .enumerate()
+        .map(|(i, run)| {
+            let run = run.to_string();
+            if i % 2 == 1 {
+                view! { <strong>{run}</strong> }.into_any()
+            } else {
+                view! { <span>{run}</span> }.into_any()
+            }
+        })
+        .collect_view()
 }

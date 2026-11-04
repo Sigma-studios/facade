@@ -60,6 +60,7 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/status", get(status))
         .route("/api/alerts", get(alerts))
         .route("/api/alerts/test", post(test_alert))
+        .route("/api/alerts/weekly", get(weekly_preview))
         .route(
             "/api/alerts/settings",
             get(notify_settings).put(update_notify),
@@ -728,6 +729,29 @@ async fn update_notify(
         .update(&server.store, &server.secrets, update)
         .map_err(bad_request)?;
     Ok(Json(server.notifier.settings()))
+}
+
+#[derive(Deserialize)]
+struct WeeklyQuery {
+    /// The last seven days up to now, instead of the seven before today.
+    #[serde(default)]
+    today: bool,
+}
+
+/// The weekly summary as it would be posted now, without posting it.
+async fn weekly_preview(
+    State(server): S,
+    user: User,
+    Query(q): Query<WeeklyQuery>,
+) -> ApiResult<Json<facade_core::api::WeeklyPreview>> {
+    user.require_admin()?;
+    let now = facade_core::now();
+    let week = if q.today {
+        super::weekly::Week::to_now(now)
+    } else {
+        super::weekly::Week::before(now)
+    };
+    Ok(Json(super::weekly::preview(&server, week)?))
 }
 
 async fn test_alert(State(server): S, user: User) -> ApiResult<StatusCode> {

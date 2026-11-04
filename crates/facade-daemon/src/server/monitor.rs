@@ -328,6 +328,24 @@ fn conditions(server: &Server) -> HashMap<String, String> {
     out
 }
 
+/// Notes cut into messages Discord takes: at most 10 embeds, and 6000
+/// characters in all.
+fn messages(notes: &[Note]) -> Vec<&[Note]> {
+    let mut out = Vec::new();
+    let (mut start, mut size) = (0, 0);
+    for (i, note) in notes.iter().enumerate() {
+        if i > start && (i - start == 10 || size + note.size() > MESSAGE_CHARS) {
+            out.push(&notes[start..i]);
+            (start, size) = (i, 0);
+        }
+        size += note.size();
+    }
+    if start < notes.len() {
+        out.push(&notes[start..]);
+    }
+    out
+}
+
 pub struct Note {
     title: String,
     description: String,
@@ -365,6 +383,22 @@ impl Note {
         self
     }
 
+    /// A part of the weekly summary: tags nobody.
+    pub fn summary(title: &str, description: &str) -> Self {
+        Self {
+            title: title.into(),
+            description: description.into(),
+            color: 0x5865f2,
+            ping: false,
+            url: None,
+        }
+    }
+
+    /// What it weighs against Discord's 6000 characters per message.
+    fn size(&self) -> usize {
+        self.title.chars().count() + self.description.chars().count() + 64
+    }
+
     pub fn test() -> Self {
         Self {
             title: "🔔 Test".into(),
@@ -384,6 +418,13 @@ struct Target {
 
 const KV_WEBHOOK: &str = "notify.discord_webhook";
 const KV_MENTIONS: &str = "notify.mentions";
+/// `off` when the weekly summary is switched off (on unless said otherwise:
+/// it only goes out with a webhook anyway).
+const KV_WEEKLY: &str = "notify.weekly";
+/// When the weekly summary last went out.
+const KV_WEEKLY_SENT: &str = "notify.weekly_sent";
+/// Characters Discord takes in one message's embeds.
+const MESSAGE_CHARS: usize = 6000;
 
 /// Posts notes to a Discord webhook, tagging the configured people on problems.
 /// Settings live in the database (the webhook encrypted) and change at runtime.
@@ -394,6 +435,13 @@ pub struct Notifier {
     origin: String,
     /// How the last messages went, to show that alerts do reach Discord.
     delivery: RwLock<Delivery>,
+    weekly: RwLock<Weekly>,
+    schedule: super::weekly::Schedule,
+}
+
+struct Weekly {
+    on: bool,
+    sent: Option<u64>,
 }
 
 /// Kept in the database, so a restart (every update) does not forget it.
@@ -406,7 +454,7 @@ struct Delivery {
 const KV_DELIVERY: &str = "notify.delivery";
 
 impl Notifier {
-    pub fn new(origin: String) -> anyhow::Result<Self> {
+    pub fn new(origin: String, schedule: super::weekly::Schedule) -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -414,6 +462,11 @@ impl Notifier {
             target: Default::default(),
             origin,
             delivery: Default::default(),
+            weekly: RwLock::new(Weekly {
+                on: true,
+                sent: None,
+            }),
+            schedule,
         })
     }
 
@@ -433,7 +486,28 @@ impl Notifier {
         if let Some(json) = store.kv_get(KV_DELIVERY)? {
             *self.delivery.write() = serde_json::from_str(&json).unwrap_or_default();
         }
+        *self.weekly.write() = Weekly {
+            on: store.kv_get(KV_WEEKLY)?.as_deref() != Some("off"),
+            sent: store.kv_get(KV_WEEKLY_SENT)?.and_then(|s| s.parse().ok()),
+        };
         Ok(())
+    }
+
+    /// The weekly summary is switched on and has somewhere to go.
+    pub fn weekly_on(&self) -> bool {
+        self.weekly.read().on && self.is_configured()
+    }
+
+    pub fn weekly_sent(&self) -> Option<u64> {
+        self.weekly.read().sent
+    }
+
+    /// Kept, so that a restart the same day does not send it again.
+    pub fn weekly_was_sent(&self, store: &Store, at: u64) {
+        self.weekly.write().sent = Some(at);
+        if let Err(e) = store.kv_put(KV_WEEKLY_SENT, &at.to_string()) {
+            warn!("saving when the weekly summary went out: {e:#}");
+        }
     }
 
     pub fn update(
@@ -471,6 +545,12 @@ impl Notifier {
             store.kv_put(KV_MENTIONS, &serde_json::to_string(&mentions)?)
         };
         save().map_err(|e| format!("{e:#}"))?;
+        if let Some(on) = update.weekly {
+            store
+                .kv_put(KV_WEEKLY, if on { "on" } else { "off" })
+                .map_err(|e| format!("{e:#}"))?;
+            self.weekly.write().on = on;
+        }
         if target.webhook != before {
             // Another channel: what reached the old one says nothing about it.
             *self.delivery.write() = Delivery::default();
@@ -491,6 +571,11 @@ impl Notifier {
             mentions: target.mentions.iter().map(|m| m.to_string()).collect(),
             last_sent: self.delivery.read().sent,
             last_error: self.delivery.read().failed.clone(),
+            weekly: self.weekly.read().on,
+            weekly_schedule: Some(self.schedule.describe()),
+            weekly_next: (self.weekly.read().on && target.webhook.is_some())
+                .then(|| self.schedule.next_due(facade_core::now())),
+            weekly_sent: self.weekly.read().sent,
         }
     }
 
@@ -562,8 +647,7 @@ impl Notifier {
             (String::new(), json!({ "parse": [] }))
         };
 
-        // Discord takes at most 10 embeds per message.
-        for (i, chunk) in notes.chunks(10).enumerate() {
+        for (i, chunk) in messages(notes).into_iter().enumerate() {
             let embeds: Vec<_> = chunk
                 .iter()
                 .map(|n| {
@@ -620,6 +704,20 @@ impl Notifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_stay_within_discord_limits() {
+        let short: Vec<Note> = (0..23).map(|_| Note::problem("x")).collect();
+        let sizes: Vec<usize> = messages(&short).iter().map(|m| m.len()).collect();
+        assert_eq!(sizes, [10, 10, 3]);
+        // Weekly parts of 3800 characters: one per message.
+        let long: Vec<Note> = (0..3)
+            .map(|_| Note::summary("📊 Week", &"a".repeat(3800)))
+            .collect();
+        let sizes: Vec<usize> = messages(&long).iter().map(|m| m.len()).collect();
+        assert_eq!(sizes, [1, 1, 1]);
+        assert!(messages(&[]).is_empty());
+    }
 
     #[test]
     fn fires_after_two_checks_and_resolves() {

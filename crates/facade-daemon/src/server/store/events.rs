@@ -285,6 +285,34 @@ impl Store {
             .optional()?)
     }
 
+    /// How many times each app had each of `kinds` in `[from, to)`, a folded
+    /// entry counting for its occurrences: `(app, kind, count)`.
+    pub fn app_event_counts(
+        &self,
+        kinds: &[EventKind],
+        from: u64,
+        to: u64,
+    ) -> anyhow::Result<Vec<(String, EventKind, u64)>> {
+        let list: Vec<String> = kinds.iter().map(|k| format!("'{}'", k.as_str())).collect();
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT app, kind, SUM(count) FROM events
+             WHERE app IS NOT NULL AND at >= ?1 AND at < ?2 AND kind IN ({})
+             GROUP BY app, kind",
+            list.join(", ")
+        ))?;
+        let rows = stmt
+            .query_map(params![from, to], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    EventKind::parse(&r.get::<_, String>(1)?),
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     /// Drops entries older than `before`.
     pub fn prune_events(&self, before: u64) -> anyhow::Result<usize> {
         Ok(self
@@ -321,6 +349,33 @@ mod tests {
             fold: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn counts_per_app_and_kind_with_folded_ones() {
+        let (store, dir) = store();
+        store.insert_event(&crash(1000, "blog")).unwrap();
+        store.insert_event(&crash(1060, "blog")).unwrap();
+        store.insert_event(&crash(1070, "api")).unwrap();
+        // Outside the period.
+        store.insert_event(&crash(5000, "blog")).unwrap();
+        let mut restart = crash(1200, "blog");
+        restart.kind = Some(EventKind::Restart);
+        restart.fold = false;
+        store.insert_event(&restart).unwrap();
+        let mut counts = store
+            .app_event_counts(&[EventKind::Crash, EventKind::Restart], 0, 2000)
+            .unwrap();
+        counts.sort_by(|a, b| (&a.0, a.1.as_str()).cmp(&(&b.0, b.1.as_str())));
+        assert_eq!(
+            counts,
+            [
+                ("api".to_string(), EventKind::Crash, 1),
+                ("blog".to_string(), EventKind::Crash, 2),
+                ("blog".to_string(), EventKind::Restart, 1),
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

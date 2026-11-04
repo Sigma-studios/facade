@@ -38,6 +38,7 @@ pub struct ServerConfig {
     pub update: UpdateConfig,
     pub auto_deploy: AutoDeployConfig,
     pub checks: ChecksConfig,
+    pub alerts: AlertsConfig,
     /// The file this was read from (handed to the binary checking an update).
     #[serde(skip)]
     pub path: PathBuf,
@@ -62,6 +63,7 @@ impl Default for ServerConfig {
             update: UpdateConfig::default(),
             auto_deploy: AutoDeployConfig::default(),
             checks: ChecksConfig::default(),
+            alerts: AlertsConfig::default(),
             path: "/etc/facade/server.toml".into(),
         }
     }
@@ -203,6 +205,67 @@ impl Default for ChecksConfig {
     }
 }
 
+/// Discord notifications. The webhook and who to tag live in the database
+/// (`facade alerts config`); only when the weekly summary goes out is here.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlertsConfig {
+    /// The day of the week the summary of the week before is posted (UTC).
+    pub weekly_day: Weekday,
+    /// The hour it is posted at (UTC, 0-23).
+    pub weekly_hour: u8,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            weekly_day: Weekday::Monday,
+            weekly_hour: 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Weekday {
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+    Sunday,
+}
+
+impl Weekday {
+    pub const ALL: [Weekday; 7] = [
+        Weekday::Monday,
+        Weekday::Tuesday,
+        Weekday::Wednesday,
+        Weekday::Thursday,
+        Weekday::Friday,
+        Weekday::Saturday,
+        Weekday::Sunday,
+    ];
+
+    /// Days after Monday.
+    pub fn index(self) -> u64 {
+        Self::ALL.iter().position(|d| *d == self).unwrap_or(0) as u64
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Weekday::Monday => "Monday",
+            Weekday::Tuesday => "Tuesday",
+            Weekday::Wednesday => "Wednesday",
+            Weekday::Thursday => "Thursday",
+            Weekday::Friday => "Friday",
+            Weekday::Saturday => "Saturday",
+            Weekday::Sunday => "Sunday",
+        }
+    }
+}
+
 impl ServerConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         if !path.exists() {
@@ -218,6 +281,9 @@ impl ServerConfig {
             toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         config.path = path.to_path_buf();
         facade_core::validate_name("local_node", &config.local_node)?;
+        if config.alerts.weekly_hour > 23 {
+            anyhow::bail!("[alerts] weekly_hour must be 0 to 23 (UTC)");
+        }
         Ok(config)
     }
 

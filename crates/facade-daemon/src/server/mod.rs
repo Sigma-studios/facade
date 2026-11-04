@@ -26,6 +26,7 @@ pub mod store;
 mod ui;
 mod updates;
 pub mod users;
+mod weekly;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -581,7 +582,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         .clone()
         .or_else(sysinfo::System::host_name)
         .unwrap_or_else(|| cfg.local_node.clone());
-    let notifier = monitor::Notifier::new(origin)?;
+    let notifier = monitor::Notifier::new(origin, weekly::Schedule::new(&cfg.alerts))?;
     let public_host_ip = match &cfg.public_host {
         Some(host) => tokio::net::lookup_host((host.as_str(), 0))
             .await
@@ -665,6 +666,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(release::check_regularly(server.clone()));
     tokio::spawn(autodeploy::run(server.clone()));
     tokio::spawn(events::run(server.clone()));
+    tokio::spawn(weekly::run(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
     let files_dir = server.cfg.data_dir.clone();

@@ -58,7 +58,7 @@ enum Command {
     Passwd,
     /// Nodes and apps at a glance.
     Status,
-    /// Firing and recently resolved alerts; `config` and `test` for Discord notifications.
+    /// Firing and recently resolved alerts; `config`, `test` and `weekly` for Discord.
     Alerts {
         #[command(subcommand)]
         action: Option<AlertsCommand>,
@@ -249,9 +249,21 @@ enum AlertsCommand {
         /// Tag nobody.
         #[arg(long, conflicts_with = "mentions")]
         no_mentions: bool,
+        /// Post a summary of the week before every Monday morning: on or off.
+        #[arg(long, value_parser = on_off)]
+        weekly: Option<bool>,
     },
     /// Send a test notification.
     Test,
+    /// The weekly summary: when it goes out; --preview prints it without sending.
+    Weekly {
+        /// Print the summary as it would be posted now (the 7 days before today).
+        #[arg(long)]
+        preview: bool,
+        /// With --preview: the last 7 days, today so far included.
+        #[arg(long, requires = "preview")]
+        today: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1513,6 +1525,7 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                     webhook,
                     mentions,
                     no_mentions,
+                    weekly,
                 }),
         } => {
             for mention in &mentions {
@@ -1525,17 +1538,20 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 } else {
                     (!mentions.is_empty()).then_some(mentions)
                 },
+                weekly,
             };
-            let settings: NotifySettings =
-                if update.discord_webhook.is_none() && update.mentions.is_none() {
-                    api.get("/api/alerts/settings").await?
-                } else {
-                    api.json(
-                        api.request(Method::PUT, "/api/alerts/settings")
-                            .json(&update),
-                    )
-                    .await?
-                };
+            let settings: NotifySettings = if update.discord_webhook.is_none()
+                && update.mentions.is_none()
+                && update.weekly.is_none()
+            {
+                api.get("/api/alerts/settings").await?
+            } else {
+                api.json(
+                    api.request(Method::PUT, "/api/alerts/settings")
+                        .json(&update),
+                )
+                .await?
+            };
             if json {
                 return print_json(&settings);
             }
@@ -1562,6 +1578,33 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 if let Some(e) = &settings.last_error {
                     println!("last FAILURE:    {} ({})", e.error, output::ago(e.at));
                 }
+            }
+            print_weekly(&settings);
+        }
+        Command::Alerts {
+            action: Some(AlertsCommand::Weekly { preview, today }),
+        } => {
+            if !preview {
+                let settings: NotifySettings = api.get("/api/alerts/settings").await?;
+                if json {
+                    return print_json(&settings);
+                }
+                print_weekly(&settings);
+                return Ok(());
+            }
+            let path = if today {
+                "/api/alerts/weekly?today=true"
+            } else {
+                "/api/alerts/weekly"
+            };
+            let preview: WeeklyPreview = api.get(path).await?;
+            if json {
+                return print_json(&preview);
+            }
+            println!("{}", preview.title);
+            for part in &preview.parts {
+                println!();
+                println!("{part}");
             }
         }
         Command::Alerts { action: None } => {
@@ -2956,6 +2999,22 @@ async fn save_stack(api: &Api, spec: &StackSpec, json: bool) -> anyhow::Result<(
         spec.name
     );
     Ok(())
+}
+
+fn print_weekly(settings: &NotifySettings) {
+    let Some(schedule) = &settings.weekly_schedule else {
+        println!("weekly summary:  not supported by this server");
+        return;
+    };
+    let state = match (settings.weekly, settings.weekly_next) {
+        (false, _) => "off".to_string(),
+        (true, None) => format!("on, {schedule}, once a webhook is set"),
+        (true, Some(next)) => format!("on, {schedule} (next {})", output::date(next)),
+    };
+    println!("weekly summary:  {state}");
+    if let Some(sent) = settings.weekly_sent {
+        println!("last summary:    {}", output::ago(sent));
+    }
 }
 
 fn on_off(s: &str) -> Result<bool, String> {

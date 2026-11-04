@@ -46,6 +46,11 @@ email = "you@example.com"
 
 # Alerts go to Discord; set the webhook and who to tag from the CLI:
 #   facade alerts config --webhook https://discord.com/api/webhooks/… --mention @here
+# With a webhook, a summary of the week before is posted every Monday at 07:00 UTC
+# (`facade alerts config --weekly off` turns it off).
+# [alerts]
+# weekly_day = "monday"
+# weekly_hour = 7                 # UTC
 
 # Every minute the server loads each domain as a visitor would (DNS, certificate,
 # entry point) for the domains' badges, availability and "site unreachable" alerts.

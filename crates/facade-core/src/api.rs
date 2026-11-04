@@ -792,6 +792,29 @@ pub struct NotifySettings {
     /// The last delivery that failed, and why; cleared by the next success.
     #[serde(default)]
     pub last_error: Option<NotifyError>,
+    /// The weekly summary is switched on (it goes out only with a webhook).
+    #[serde(default)]
+    pub weekly: bool,
+    /// When it goes out, like `Monday 07:00 UTC`; `None` from servers without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_schedule: Option<String>,
+    /// The next time it goes out, if it is on and there is a webhook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_next: Option<u64>,
+    /// When it last went out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_sent: Option<u64>,
+}
+
+/// The weekly summary as it would be posted: a title, then one Discord embed
+/// per part (a long one is cut at line ends).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WeeklyPreview {
+    pub title: String,
+    pub parts: Vec<String>,
+    /// The days covered, `[from, to)` (UTC days since the epoch).
+    pub from_day: u64,
+    pub to_day: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -807,6 +830,8 @@ pub struct NotifyUpdate {
     pub discord_webhook: Option<String>,
     #[serde(default)]
     pub mentions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
