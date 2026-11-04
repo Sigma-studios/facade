@@ -3,6 +3,7 @@
 
 mod client;
 mod exec;
+mod insights;
 mod output;
 
 use std::collections::BTreeMap;
@@ -158,10 +159,18 @@ enum Command {
         #[arg(long)]
         branch: Option<String>,
     },
-    /// CPU, memory, network and traffic history of an app (last hour).
+    /// CPU, memory, network and traffic history of an app (last hour), with
+    /// its availability, visitors and bandwidth.
     Metrics {
         app: String,
     },
+    /// An app's availability, domains seen from outside, visitors and
+    /// bandwidth, day by day.
+    Insights {
+        app: String,
+    },
+    /// An app's failed requests (4xx, 5xx), grouped by status, method and path.
+    Errors(insights::ErrorsArgs),
     /// Credentials for private repositories: deploy keys and access tokens.
     #[command(subcommand)]
     Git(GitCommand),
@@ -2301,8 +2310,17 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
             if json {
                 return print_json(&metrics);
             }
+            // A server from before these has no such route: nothing to say.
+            if let Some(i) = insights::app_insights(api, &app).await
+                && !insights::summary(&i).is_empty()
+            {
+                insights::print_summary(&i);
+                println!();
+            }
             print_app_metrics(&metrics);
         }
+        Command::Insights { app } => insights::show(api, &app, json).await?,
+        Command::Errors(args) => insights::errors(api, &args, json).await?,
         Command::Export { output } => {
             let toml = api
                 .send(api.request(Method::GET, "/api/export"))
@@ -3366,6 +3384,14 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
                     row
                 })
                 .collect();
+            if let Some(i) = insights::node_insights(api, &name).await {
+                let b = &i.bandwidth;
+                println!(
+                    "this month: {} served through the entry point, {} received\n",
+                    bytes(b.month_out),
+                    bytes(b.month_in)
+                );
+            }
             table(&headers, rows.into_iter().rev().take(40));
         }
     }
@@ -3557,6 +3583,9 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 && let Some(traffic) = traffic_summary(&metrics)
             {
                 println!("traffic:   {traffic}");
+            }
+            if let Some(i) = insights::app_insights(api, &name).await {
+                insights::print_summary(&i);
             }
             // A server from before auto-deploy has no such route: nothing to say.
             if let Ok(auto) = api
