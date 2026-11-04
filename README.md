@@ -274,6 +274,7 @@ template in `lang::generated_dockerfile`.
 | | |
 |---|---|
 | `facade status` / `facade alerts` | nodes, apps, CPU/memory, firing alerts |
+| `facade activity [--app X] [--node N] [--kind K] [--problems]` | what happened, newest first (see [Activity](#activity)); `--id N` for one entry |
 | `facade alerts config --webhook URL --mention @here` / `facade alerts test` | Discord notifications |
 | `facade logs <app> -f` | container logs |
 | `facade exec <app> -- <cmd…>` / `exec -it <app> -- sh` | run a command (or a shell) in the app's container; its exit code is facade's |
@@ -806,9 +807,56 @@ facade alerts test
 A message is posted when a problem lasts a minute (node offline, app crashed or failed
 to deploy, disk ≥ 90 %, memory ≥ 95 %, app at its memory/CPU limit, entry point unable
 to bind its port, failed backup, app writing over 100 MB inside its container, app
-answering 5xx to at least 20 % of at least 20 requests over 5 minutes) and again when it clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
+answering 5xx to at least 20 % of at least 20 requests over 5 minutes, a certificate
+expiring within 7 days, a node waiting for a reboot or for security updates, disk
+errors on a node in the last day) and again when it clears. Each alert is also an
+[Activity](#activity) entry, and with an API domain set, its message links to it. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
 repeatable; copy ids with Discord's developer mode); resolutions tag nobody.
 `--no-mentions` turns tagging off. The webhook is stored encrypted on the server.
+
+### Activity
+
+Everything that happens to apps and nodes is an entry, with an icon, a line and a
+time: the **Activity** page (all of them, filtered by app, node and kind, the filters in
+its URL), each app's and node's Activity tab, the last three on an app's overview, and
+`facade activity`. *Problems only* keeps what is bad or unusual: crashes, memory kills,
+failing health checks, failed deploys and renewals, alerts, disk errors, reboots.
+Entries are kept 90 days.
+
+* **Who did what.** Deploys, rebuilds and rollbacks, restarts, stops and starts,
+  variables (their names, never their values), settings, domains, owners and access,
+  auto-deploy on or off, apps created and deleted: with the account that did it. How
+  each deploy ended. What auto-deploy noticed (`New commit 3f2a9c1 on main noticed
+  (webhook) → deploying`).
+* **Why an app stopped.** The agent watches Docker's events for its containers:
+  `Killed: out of memory (512 MB limit)`, `Crashed: exit code 1`, `Crashed: killed by
+  SIGSEGV`, `Stopped outside facade (SIGTERM)` (a `docker stop` over SSH), with the last
+  50 lines the app wrote before it died (open the entry). facade marks the containers it
+  stops itself (deploys, restarts, settings changes, moves, the two containers of a
+  replacement without downtime), so those never read as crashes. A crash loop is one
+  entry with a count. The Restarts tile on the overview says why it last stopped.
+* **Health.** `Unhealthy: <the check's output>` and `Healthy again`, from Docker's health
+  status.
+* **Certificates and DNS.** Issued and renewed (with the date they are valid until),
+  failed renewals, DNS records created, changed and removed. The Domains page shows
+  expiry dates orange under 14 days and red under 7.
+* **Nodes.** Memory kills from the kernel log, naming the program (`Kernel killed mysqld
+  (out of memory)`; one inside an app's container shows on the app too); reboots (from
+  the boot time each agent reports), restarts and updates of facade; successful SSH
+  logins (`SSH login by ubuntu from 81.2.3.4 (key)`, from the journal or
+  `/var/log/auth.log`; failed attempts are left out); disk I/O errors and filesystems
+  remounted read-only (a red badge on the node and an alert for a day). Every 3 hours
+  the agent reads what the system already knows about updates (Ubuntu's `apt-check`,
+  or `apt list --upgradable`; it never runs `apt update`) and `/var/run/reboot-required`:
+  the node's header shows `7 updates (2 security) · reboot required`, its packages in
+  the tooltip, and a pending reboot or security update is an alert. The node's uptime
+  links to its last reboot.
+
+Agents keep their entries while the server is away and send them when it is back.
+Members see the entries of the apps they manage; node and server-wide entries are for
+admins. `GET /api/events?app=&node=&kind=&problems=true&before=&limit=` (a `kind` is a
+category: `deploys`, `restarts`, `health`, `changes`, `alerts`, `logins`, `certificates`,
+`system`, or one kind like `oom_kill`), and `GET /api/events/{id}` with its log lines.
 
 ### Accounts
 
