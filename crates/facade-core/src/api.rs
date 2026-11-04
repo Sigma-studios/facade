@@ -966,7 +966,47 @@ pub struct BackupView {
     pub volume: String,
     /// Unix time it was taken; also its id.
     pub id: u64,
+    /// What a full copy of it takes, compressed: for an incremental backup, its
+    /// chunks, shared with other backups or not.
     pub size: u64,
+    /// What it added to the backup store (the chunks no other backup had); none
+    /// for a full copy (`.tar.gz`, from before incremental backups).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<u64>,
+}
+
+/// `GET /api/backups/store`: what volume backups take on the server's disk.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupStoreView {
+    /// Chunks of incremental backups, each stored once: how many, and what they
+    /// take.
+    pub chunks: u64,
+    pub chunk_bytes: u64,
+    /// Incremental backups, and what they would take as separate full copies.
+    pub snapshots: u64,
+    pub snapshot_bytes: u64,
+    /// Full copies (`.tar.gz`, from before incremental backups), and what they
+    /// take.
+    pub full_copies: u64,
+    pub full_copy_bytes: u64,
+}
+
+impl BackupStoreView {
+    /// What volume backups take on disk.
+    pub fn on_disk(&self) -> u64 {
+        self.chunk_bytes + self.full_copy_bytes
+    }
+}
+
+/// `POST /api/backups/check`: every chunk incremental backups hold, read back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupCheckReport {
+    pub store: BackupStoreView,
+    /// Chunks found intact.
+    pub verified: u64,
+    /// Missing or damaged chunks (with the backups holding them), unreadable
+    /// manifests.
+    pub problems: Vec<String>,
 }
 
 /// `POST /api/backups`: back up now. Empty means every app with volumes.

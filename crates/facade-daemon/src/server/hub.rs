@@ -163,6 +163,24 @@ impl Hub {
         create: Option<facade_core::proto::NewVolume>,
         path: &std::path::Path,
     ) -> anyhow::Result<()> {
+        let file = tokio::fs::File::open(path).await?;
+        let size = file.metadata().await?.len();
+        self.import_volume_from(node, app, volume, create, file, size)
+            .await
+    }
+
+    /// Replaces the volume's contents with the `size` bytes of archive read from
+    /// `archive`. The agent receives them all before touching the volume, so an
+    /// archive failing to read midway changes nothing.
+    pub async fn import_volume_from(
+        &self,
+        node: &str,
+        app: &str,
+        volume: &str,
+        create: Option<facade_core::proto::NewVolume>,
+        mut archive: impl tokio::io::AsyncRead + Unpin,
+        size: u64,
+    ) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt;
         let (a, v) = (app.to_string(), volume.to_string());
         let mut stream = self
@@ -173,10 +191,11 @@ impl Hub {
                 create,
             })
             .await?;
-        let mut file = tokio::fs::File::open(path).await?;
-        let size = file.metadata().await?.len();
         stream.write_all(format!("{size}\n").as_bytes()).await?;
-        tokio::io::copy(&mut file, &mut stream).await?;
+        let sent = tokio::io::copy(&mut archive, &mut stream).await?;
+        if sent != size {
+            bail!("the archive ended after {sent} of {size} bytes");
+        }
         stream.flush().await?;
         let answer = read_line_unbuffered(&mut stream)
             .await

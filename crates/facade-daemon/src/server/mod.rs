@@ -4,6 +4,7 @@ mod acme;
 mod api;
 mod artifacts;
 mod autodeploy;
+pub mod backup_store;
 pub mod backups;
 mod compose;
 mod dns;
@@ -67,6 +68,9 @@ pub struct Server {
     pub stack_runs: parking_lot::Mutex<HashMap<uuid::Uuid, stack::StackRun>>,
     /// Last failed backups, `app/volume` → why. Cleared by the next success.
     pub backup_errors: RwLock<HashMap<String, String>>,
+    /// Shared by what writes or reads the backup store, taken alone by its
+    /// garbage collection (see `backups::collect_garbage`).
+    pub backup_store_lock: Arc<tokio::sync::RwLock<()>>,
     pub settings: settings::SettingsCell,
     /// Last binary sent to each node to update its agent, and when.
     pub upgrade_attempts: parking_lot::Mutex<HashMap<String, (String, u64)>>,
@@ -534,6 +538,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         notifier,
         stack_runs: Default::default(),
         backup_errors: Default::default(),
+        backup_store_lock: Default::default(),
         settings,
         upgrade_attempts: Default::default(),
         releases: Default::default(),

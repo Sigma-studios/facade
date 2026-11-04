@@ -616,7 +616,9 @@ pub struct StorageReport {
     /// only, where they are kept (`<data dir>/backups`).
     #[serde(default)]
     pub backups: u64,
-    /// What each app's volume backups take, by app (on the server's node).
+    /// What each app's volume backups take, by app (on the server's node): its
+    /// full copies, and the chunks of its incremental backups, a chunk held by
+    /// several apps split between them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub app_backups: BTreeMap<String, u64>,
     /// Docker's folders on disk, volumes aside: images, build cache, containers

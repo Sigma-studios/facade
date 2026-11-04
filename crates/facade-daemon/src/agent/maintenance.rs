@@ -243,23 +243,18 @@ async fn du(dir: &Path) -> Result<u64, String> {
     Ok(kib * 1024)
 }
 
-/// What the backups under `dir` take in all, and by app. The server keeps them
-/// in its data directory (see `server::backups`), so only its node has any;
-/// `_server` holds copies of its database, not an app's.
+/// What the backups under `dir` take on disk, and by app. The server keeps them
+/// in its data directory (see `server::backups`), so only its node has any. An
+/// app's figure counts the chunks of its incremental backups once however many
+/// hold them (a chunk several apps hold is split between them), and its full
+/// copies; copies of the server's database are nobody's.
 async fn backups(dir: &Path) -> (u64, BTreeMap<String, u64>) {
-    let mut total = 0;
-    let mut by_app = BTreeMap::new();
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return (0, by_app);
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let size = dir_size(entry.path(), vec![]).await;
-        total += size;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(['_', '.']) && size > 0 {
-            by_app.insert(name, size);
-        }
-    }
+    let total = dir_size(dir.to_path_buf(), vec![]).await;
+    let dir = dir.to_path_buf();
+    let by_app =
+        tokio::task::spawn_blocking(move || crate::server::backup_store::usage_by_app(&dir))
+            .await
+            .unwrap_or_default();
     (total, by_app)
 }
 
