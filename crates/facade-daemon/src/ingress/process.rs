@@ -47,13 +47,19 @@ pub enum ToIngress {
     Table { table: Table },
     /// Hand over to the binary now installed (after an agent self-update).
     Upgrade,
+    /// How many requests and connections are open to these local ports (a
+    /// replaced container's), answered with [`FromIngress::Connections`]. Being
+    /// answered in order, it also tells the tables sent before are in use.
+    Connections { ports: Vec<u16> },
 }
 
-/// Entry point → agent, on connection and whenever it changes.
+/// Entry point → agent: its status on connection and whenever it changes, and
+/// answers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum FromIngress {
     Status { bind_errors: Vec<String>, pid: u32 },
+    Connections { open: usize },
 }
 
 pub struct Options {
@@ -286,6 +292,12 @@ async fn control_connection(
             msg = lines.next::<ToIngress>() => match msg {
                 Ok(Some(ToIngress::Table { table })) => ingress.set_table(table),
                 Ok(Some(ToIngress::Upgrade)) => upgrade.notify_one(),
+                Ok(Some(ToIngress::Connections { ports })) => {
+                    let open = ingress.open_connections(&ports);
+                    if write_json(&mut write, &FromIngress::Connections { open }).await.is_err() {
+                        return;
+                    }
+                }
                 Ok(None) => return,
                 Err(e) => {
                     warn!("control connection: {e:#}");
