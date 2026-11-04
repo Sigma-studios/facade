@@ -121,9 +121,12 @@ pub fn Builds() -> impl IntoView {
         }
     });
     let options = Signal::derive(move || {
-        let mut names = apps
-            .data
-            .with(|a| a.iter().flatten().map(|a| a.spec.name.clone()).collect::<Vec<_>>());
+        let mut names = apps.data.with(|a| {
+            a.iter()
+                .flatten()
+                .map(|a| a.spec.name.clone())
+                .collect::<Vec<_>>()
+        });
         builds.data.with(|b| {
             if let Some(b) = b {
                 names.extend(b.queue.iter().map(|q| q.app.clone()));
@@ -182,7 +185,11 @@ pub fn Builds() -> impl IntoView {
         recent_sort.apply(&mut recent, deployment_key);
         recent
     });
-    let total_queue = move || builds.data.with(|b| b.as_ref().map_or(0, |b| b.queue.len()));
+    let total_queue = move || {
+        builds
+            .data
+            .with(|b| b.as_ref().map_or(0, |b| b.queue.len()))
+    };
 
     view! {
         <div class="page">
