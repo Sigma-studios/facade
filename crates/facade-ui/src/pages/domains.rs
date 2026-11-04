@@ -6,7 +6,7 @@ use leptos::task::spawn_local;
 use leptos_router::components::A;
 
 use crate::api;
-use crate::components::{ErrorNote, Loading};
+use crate::components::{ErrorNote, Loading, Sort, SortKey, SortTh};
 use crate::util::{me, polled, run, toasts};
 
 #[component]
@@ -15,6 +15,26 @@ pub fn Domains() -> impl IntoView {
     let domains = polled(Some(Duration::from_secs(15)), || async {
         api::get::<Vec<DomainStatus>>("/api/domains").await
     });
+    let filter = RwSignal::new(String::new());
+    let total = move || domains.data.with(|d| d.as_ref().map_or(0, Vec::len));
+    let shown = Signal::derive(move || {
+        let needle = filter.with(|f| f.trim().to_lowercase());
+        domains
+            .data
+            .get()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d.domain.contains(&needle))
+            .collect::<Vec<_>>()
+    });
+    let problems = move || {
+        domains.data.with(|d| {
+            d.iter()
+                .flatten()
+                .filter(|d| dns_state(d) == Check::Failed || https_state(d) == Check::Failed)
+                .count()
+        })
+    };
     view! {
         <div class="page">
             <header class="page-head"><h1>"Domains"</h1></header>
@@ -22,34 +42,121 @@ pub fn Domains() -> impl IntoView {
                 "Each domain points straight at the node running its app, which serves it over HTTPS. "
                 "Add domains in an app's settings."
             </p>
-            <Show when=move || me.is_admin()>
-                <DnsProvider on_change=move || domains.reload()/>
-            </Show>
             <ErrorNote error=domains.error/>
             <Show when=move || domains.loaded() fallback=Loading>
-                <DomainTable domains=Signal::derive(move || domains.data.get().unwrap_or_default()) show_app=true/>
+                <Show when=move || { total() > 0 }>
+                    <div class="toolbar">
+                        <input type="search" class="filter-input" placeholder="Filter by domain"
+                            aria-label="Filter by domain" autocomplete="off"
+                            prop:value=move || filter.get()
+                            on:input=move |ev| filter.set(event_target_value(&ev))/>
+                        <span class="muted small">
+                            {move || {
+                                let (n, all) = (shown.with(Vec::len), total());
+                                if n == all { format!("{all} domain{}", if all == 1 { "" } else { "s" }) } else { format!("{n} of {all}") }
+                            }}
+                        </span>
+                        <Show when=move || { problems() > 0 }>
+                            <span class="badge badge-critical">
+                                <span class="badge-icon" aria-hidden="true">"✕"</span>
+                                {move || format!("{} with a problem", problems())}
+                            </span>
+                        </Show>
+                    </div>
+                </Show>
+                <Show when=move || { total() == 0 || !shown.with(Vec::is_empty) }
+                    fallback=move || view! {
+                        <div class="empty"><p>{move || format!("No domain matches “{}”.", filter.get().trim())}</p></div>
+                    }>
+                    <DomainTable domains=shown show_app=true/>
+                </Show>
+            </Show>
+            <Show when=move || me.is_admin()>
+                <DnsProvider on_change=move || domains.reload()/>
             </Show>
         </div>
     }
 }
 
-/// Status rows, also used on an app's page.
+/// How a check stands, worst first (the order a sort by it shows).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Check {
+    Failed,
+    Pending,
+    Ok,
+}
+
+fn dns_state(d: &DomainStatus) -> Check {
+    if d.dns_error.is_some() || (!d.dns_ok && !d.managed) {
+        Check::Failed
+    } else if d.dns_ok {
+        Check::Ok
+    } else {
+        Check::Pending
+    }
+}
+
+fn https_state(d: &DomainStatus) -> Check {
+    if d.cert_error.is_some() {
+        Check::Failed
+    } else if d.certificate.is_some() {
+        Check::Ok
+    } else {
+        Check::Pending
+    }
+}
+
+fn app_label(d: &DomainStatus) -> String {
+    d.app.clone().unwrap_or_else(|| "façade itself".into())
+}
+
+/// Columns: domain, app, node, DNS, HTTPS.
+fn sort_key(col: usize, d: &DomainStatus) -> SortKey {
+    match col {
+        0 => SortKey::text(&d.domain),
+        1 => SortKey::text(app_label(d)),
+        2 => SortKey::text(&d.node),
+        3 => SortKey::num(Some(dns_state(d) as u8)),
+        _ => SortKey::num(Some(https_state(d) as u8)),
+    }
+}
+
+/// Domains with their DNS and certificate status, also used on an app's page
+/// (`show_app` off: app and node are the page's).
 #[component]
 pub fn DomainTable(
     #[prop(into)] domains: Signal<Vec<DomainStatus>>,
     show_app: bool,
 ) -> impl IntoView {
+    let sort = Sort::new();
     view! {
         <Show
             when=move || domains.with(|d| !d.is_empty())
             fallback=|| view! { <div class="empty"><p>"No domains yet."</p></div> }
         >
-            <div class="domain-list">
-                <For each=move || domains.get()
-                    key=|d| (d.domain.clone(), d.dns_ok, d.certificate.clone(), d.dns_error.clone(), d.cert_error.clone(), d.resolved.clone())
-                    let:d>
-                    <DomainRow d=d show_app=show_app/>
-                </For>
+            <div class="table-wrap domain-table">
+                <table class="table">
+                    <thead><tr>
+                        <SortTh sort=sort col=0 label="Domain"/>
+                        {show_app.then(|| view! {
+                            <SortTh sort=sort col=1 label="App"/>
+                            <SortTh sort=sort col=2 label="Node"/>
+                        })}
+                        <SortTh sort=sort col=3 label="DNS"/>
+                        <SortTh sort=sort col=4 label="HTTPS"/>
+                    </tr></thead>
+                    <tbody>
+                        <For each=move || {
+                                let mut rows = domains.get();
+                                sort.apply(&mut rows, sort_key);
+                                rows
+                            }
+                            key=|d| (d.domain.clone(), d.app.clone(), d.dns_ok, d.certificate.clone(), d.dns_error.clone(), d.cert_error.clone(), d.resolved.clone(), d.expected_ip.clone())
+                            let:d>
+                            <DomainRow d=d show_app=show_app/>
+                        </For>
+                    </tbody>
+                </table>
             </div>
         </Show>
     }
@@ -58,21 +165,16 @@ pub fn DomainTable(
 #[component]
 fn DomainRow(d: DomainStatus, show_app: bool) -> impl IntoView {
     let ip = d.expected_ip.clone();
-    let (dns_class, dns_icon, dns_label) = if d.dns_error.is_some() {
-        ("critical", "✕", "DNS error")
-    } else if d.dns_ok {
-        ("good", "●", "DNS ok")
-    } else if d.managed {
-        ("busy", "◐", "DNS propagating")
-    } else {
-        ("critical", "✕", "DNS missing")
+    let (dns_class, dns_icon, dns_label) = match dns_state(&d) {
+        Check::Failed if d.dns_error.is_some() => ("critical", "✕", "error"),
+        Check::Failed => ("critical", "✕", "missing"),
+        Check::Pending => ("busy", "◐", "propagating"),
+        Check::Ok => ("good", "●", "ok"),
     };
-    let (cert_class, cert_icon, cert_label) = if d.cert_error.is_some() {
-        ("critical", "✕", "HTTPS failed")
-    } else if d.certificate.is_some() {
-        ("good", "●", "HTTPS")
-    } else {
-        ("busy", "◐", "HTTPS pending")
+    let (cert_class, cert_icon, cert_label) = match https_state(&d) {
+        Check::Failed => ("critical", "✕", "failed"),
+        Check::Pending => ("busy", "◐", "pending"),
+        Check::Ok => ("good", "●", "valid"),
     };
     let dns_detail = match (&d.dns_error, d.dns_ok, d.managed, &ip) {
         (Some(e), ..) => e.clone(),
@@ -85,8 +187,7 @@ fn DomainRow(d: DomainStatus, show_app: bool) -> impl IntoView {
             format!("façade set the record to {ip}; it can take a few minutes to be visible.")
         }
         (None, false, false, Some(ip)) => format!(
-            "Create an A record for {} pointing to {ip} at your domain provider.{}",
-            d.domain,
+            "Create an A record pointing to {ip} at your domain provider.{}",
             if d.resolved.is_empty() {
                 String::new()
             } else {
@@ -103,42 +204,41 @@ fn DomainRow(d: DomainStatus, show_app: bool) -> impl IntoView {
         (None, Some(name)) => {
             let until = d.cert_expires.map(crate::util::date).unwrap_or_default();
             if name.starts_with("*.") {
-                format!("Wildcard certificate {name}, valid until {until}, renewed automatically.")
+                format!("Wildcard {name}, until {until}, renewed automatically.")
             } else {
-                format!("Valid until {until}, renewed automatically.")
+                format!("Until {until}, renewed automatically.")
             }
         }
         (None, None) => "Requested once the DNS record points to the node.".into(),
     };
     let app = d.app.clone();
     view! {
-        <article class="domain-row">
-            <div class="domain-main">
+        <tr>
+            <td class="domain-cell">
                 <a class="domain-name" href=format!("https://{}", d.domain) target="_blank" rel="noopener">{d.domain.clone()}</a>
-                <span class="muted small">
-                    {show_app.then(|| match app.clone() {
-                        Some(app) => view! {
-                            <A href=format!("/apps/{app}")>{app.clone()}</A>
-                        }.into_any(),
-                        None => view! { <span>"façade itself"</span> }.into_any(),
-                    })}
-                    {show_app.then_some(" · ")}
-                    {format!("node {}", d.node)}
-                </span>
-            </div>
-            <div class="domain-check">
+            </td>
+            {show_app.then(|| view! {
+                <td class="app-cell">
+                    {match app.clone() {
+                        Some(app) => view! { <A href=format!("/apps/{app}")>{app.clone()}</A> }.into_any(),
+                        None => view! { <span class="muted">"façade itself"</span> }.into_any(),
+                    }}
+                </td>
+                <td class="muted">{d.node.clone()}</td>
+            })}
+            <td class="check-cell">
                 <span class=format!("badge badge-{dns_class}")>
                     <span class="badge-icon" aria-hidden="true">{dns_icon}</span>{dns_label}
                 </span>
-                <span class="small">{dns_detail}</span>
-            </div>
-            <div class="domain-check">
+                <div class="small check-detail">{dns_detail}</div>
+            </td>
+            <td class="check-cell">
                 <span class=format!("badge badge-{cert_class}")>
                     <span class="badge-icon" aria-hidden="true">{cert_icon}</span>{cert_label}
                 </span>
-                <span class="small">{cert_detail}</span>
-            </div>
-        </article>
+                <div class="small check-detail">{cert_detail}</div>
+            </td>
+        </tr>
     }
 }
 
@@ -201,7 +301,7 @@ fn DnsProvider(on_change: impl Fn() + Copy + Send + Sync + 'static) -> impl Into
                 fallback=move || view! {
                     <p class="muted small">
                         "Connect Porkbun and façade creates each domain's DNS record and a wildcard certificate "
-                        "per domain by itself. Without it, create the records shown below by hand."
+                        "per domain by itself. Without it, create the records listed above by hand."
                     </p>
                     <form class="form" on:submit=connect>
                         <div class="form-row">

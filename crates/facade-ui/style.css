@@ -433,7 +433,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .field { display: flex; flex-direction: column; gap: 5px; }
 .field > span { font-size: 12.5px; font-weight: 550; color: var(--text-secondary); }
 .field small { color: var(--text-muted); font-size: 12px; }
-input[type="text"], input[type="password"], input[type="url"], input[type="number"], select, textarea {
+input[type="text"], input[type="password"], input[type="url"], input[type="number"], input[type="search"], select, textarea {
   font: inherit;
   color: var(--text-primary);
   background: var(--surface-1);
@@ -750,7 +750,6 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 
 /* ---------------------------------------------------------------- domains */
 
-.domain-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; }
 .domain-row {
   display: grid;
   grid-template-columns: minmax(200px, 1.1fr) 1.5fr 1.5fr;
@@ -762,9 +761,7 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
   padding: 12px 16px;
 }
 @media (max-width: 900px) { .domain-row { grid-template-columns: 1fr; } }
-.domain-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .domain-name { font-weight: 600; word-break: break-all; color: var(--text-primary); }
-.domain-check { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; color: var(--text-secondary); min-width: 0; word-break: break-word; }
 .app-domains { margin-bottom: 16px; }
 .app-backups { margin-top: 24px; }
 .shell-banner { padding: 20px 36px 0; max-width: 1240px; }
@@ -913,3 +910,31 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .service-log { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; }
 .service-log summary { display: flex; align-items: center; gap: 10px; padding: 8px 12px; cursor: pointer; }
 .service-log .deploy-log { border-radius: 0 0 8px 8px; height: 320px; min-height: 0; }
+
+/* ---------------------------------------------------------------- domains table, settings tabs */
+
+.toolbar input.filter-input { width: min(320px, 100%); }
+.domain-table td { vertical-align: top; }
+.domain-table { margin-bottom: 24px; }
+.domain-table .domain-cell, .domain-table .app-cell { white-space: nowrap; }
+.domain-table .domain-name { word-break: normal; }
+.domain-table .check-cell { min-width: 220px; }
+.check-detail { margin-top: 4px; color: var(--text-secondary); word-break: break-word; }
+a.tab { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
+.tab-count { line-height: 16px; padding: 0 6px; }
+.note-warning { background: var(--surface-2); color: var(--text-primary); box-shadow: inset 3px 0 0 var(--warning); }
+.commit-details { margin-top: 8px; }
+.commit-details summary { padding: 7px 12px; font-size: 13px; }
+.commit-details .build-details-body { padding: 0 12px 10px; }
+.config-apply { border-top: 1px solid var(--border); padding-top: 14px; }
+.repo-keys li { max-width: none; flex-wrap: wrap; }
+/* On a phone each domain is a block: its checks matter more than the columns. */
+@media (max-width: 760px) {
+  .domain-table thead { display: none; }
+  .domain-table table, .domain-table tbody, .domain-table tr, .domain-table td { display: block; }
+  .domain-table tr { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .domain-table tr:last-child { border-bottom: 0; }
+  .domain-table td { padding: 2px 0; border: 0; min-width: 0; }
+  .domain-table .app-cell, .domain-table .app-cell + td { display: inline-block; margin-right: 10px; }
+  .domain-table .check-cell { margin-top: 6px; }
+}

@@ -1,37 +1,83 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AppChange, ApplyReport, ChangePassword, CreateGitCredential, GitCredentialKind,
-    GitCredentialView, NewGitSecret, NodeBuildState, RegistryLoginView, ServerSettings,
+    AppChange, ApplyReport, ChangePassword, NodeBuildState, RegistryLoginView, ServerSettings,
     ServerSettingsUpdate, ServerUpdate, SetRegistryLogin, UpdateRun, UpdateState, UpdateTarget,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
-use leptos_router::hooks::use_navigate;
+use leptos_router::hooks::{use_navigate, use_params_map};
 
+use super::alerts::AlertsTab;
 use super::app::CommitRow;
+use super::git::GitAccess;
 use crate::api;
 use crate::components::{CopyField, ErrorNote, Loading, Modal};
-use crate::util::{ago, download, me, polled, run, short_hash, toasts};
+use crate::util::{ago, alerts, download, me, polled, run, short_hash, toasts};
+
+/// Settings tabs: `(key, label, admins only)`.
+const TABS: &[(&str, &str, bool)] = &[
+    ("general", "General", true),
+    ("alerts", "Alerts", false),
+    ("app-access", "App access", false),
+    ("password", "Password", false),
+];
 
 #[component]
 pub fn Settings() -> impl IntoView {
-    // Members only manage their password and their own logins.
+    // Members only see the alerts, their own logins and their password.
     let me = me();
+    let params = use_params_map();
+    let firing = move || alerts().firing();
+    let visible = move |key: &str| {
+        TABS.iter()
+            .any(|(k, _, admin)| *k == key && (!admin || me.is_admin()))
+    };
+    // `/settings` and unknown tabs open the first one this user has.
+    let tab = Memo::new(move |_| {
+        let asked = params.read().get("tab").unwrap_or_default();
+        if visible(&asked) {
+            asked
+        } else if me.is_admin() {
+            "general".to_string()
+        } else {
+            "alerts".to_string()
+        }
+    });
     view! {
         <div class="page page-narrow">
             <header class="page-head"><h1>"Settings"</h1></header>
-            <Password/>
-            <Show when=move || me.is_admin()>
-                <ServerAccess/>
-                <Updates/>
-            </Show>
-            <GitAccess/>
-            <RegistryLogins/>
-            <Show when=move || me.is_admin()>
-                <Export/>
-                <Apply/>
+            <Show when=move || me.0.loaded() fallback=Loading>
+                <nav class="tabs" aria-label="Settings">
+                    {move || TABS.iter().filter(|(k, ..)| visible(k)).map(|(key, label, _)| {
+                        let key = *key;
+                        view! {
+                            <A href=format!("/settings/{key}")
+                                attr:class=move || if tab.get() == key { "tab active" } else { "tab" }>
+                                {*label}
+                                {(key == "alerts").then(|| view! {
+                                    <Show when=move || { firing() > 0 }>
+                                        <span class="nav-count tab-count" title="firing alerts">{firing}</span>
+                                    </Show>
+                                })}
+                            </A>
+                        }
+                    }).collect_view()}
+                </nav>
+                {move || match tab.get().as_str() {
+                    "general" => view! {
+                        <ServerAccess/>
+                        <Updates/>
+                        <Configuration/>
+                    }.into_any(),
+                    "app-access" => view! {
+                        <GitAccess/>
+                        <RegistryLogins/>
+                    }.into_any(),
+                    "password" => view! { <Password/> }.into_any(),
+                    _ => view! { <AlertsTab/> }.into_any(),
+                }}
             </Show>
         </div>
     }
@@ -376,6 +422,22 @@ fn Updates() -> impl IntoView {
                 </div>
             </Show>
             <Show when=move || status.loaded() fallback=Loading>
+                // Behind the latest build: said up front, not only by the Update button.
+                {move || current().filter(|s| s.available && !updating()).map(|s| {
+                    let behind = match s.commits.len() {
+                        0 => "A newer build of main is available.".to_string(),
+                        1 => "façade is 1 commit behind main.".to_string(),
+                        n => format!("façade is {n} commits behind main."),
+                    };
+                    let since = s.latest.map(|l| format!(" Latest build {}.", ago(l.time))).unwrap_or_default();
+                    view! {
+                        <div class="note note-warning" role="status">
+                            <span aria-hidden="true">"⚠ "</span>
+                            <strong>{behind}</strong>
+                            {since}
+                        </div>
+                    }
+                })}
                 <div class="field">
                     <span>"Running"</span>
                     <p class="small">
@@ -406,12 +468,16 @@ fn Updates() -> impl IntoView {
                             .map(|t| format!("Checked {} on github.com/{}.", ago(t), repo()))}
                     </small>
                     {move || current().filter(|s| s.available && !s.commits.is_empty()).map(|s| view! {
-                        <div class="muted small">
-                            {format!("{} new commit{}:", s.commits.len(), if s.commits.len() == 1 { "" } else { "s" })}
-                        </div>
-                        <ul class="commit-list">
-                            {s.commits.into_iter().map(|c| view! { <CommitRow c=c/> }).collect_view()}
-                        </ul>
+                        <details class="build-details commit-details">
+                            <summary>
+                                <span>{format!("{} new commit{}", s.commits.len(), if s.commits.len() == 1 { "" } else { "s" })}</span>
+                            </summary>
+                            <div class="build-details-body">
+                                <ul class="commit-list">
+                                    {s.commits.into_iter().map(|c| view! { <CommitRow c=c/> }).collect_view()}
+                                </ul>
+                            </div>
+                        </details>
                     })}
                 </div>
                 {move || current().and_then(|s| s.run).map(|r| view! { <RunNote run=r/> })}
@@ -662,8 +728,9 @@ fn RegistryLogins() -> impl IntoView {
     }
 }
 
+/// Export to and apply from a facade.toml.
 #[component]
-fn Export() -> impl IntoView {
+fn Configuration() -> impl IntoView {
     let export = move |_| {
         spawn_local(async move {
             match api::get_text("/api/export").await {
@@ -672,22 +739,6 @@ fn Export() -> impl IntoView {
             }
         });
     };
-    view! {
-        <section class="card form">
-            <h2 class="section-title">"Export configuration"</h2>
-            <p class="muted small">
-                "Every node and app as TOML, to keep in git or restore elsewhere. Sensitive variables are "
-                "listed without their values."
-            </p>
-            <div class="form-actions">
-                <button class="button" on:click=export>"Download facade.toml"</button>
-            </div>
-        </section>
-    }
-}
-
-#[component]
-fn Apply() -> impl IntoView {
     let text = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let report = RwSignal::new(None::<ApplyReport>);
@@ -708,15 +759,28 @@ fn Apply() -> impl IntoView {
     };
     view! {
         <section class="card form">
-            <h2 class="section-title">"Apply configuration"</h2>
-            <p class="muted small">
-                "Creates or updates the nodes and apps described in a facade.toml. Nothing is deleted, "
-                "and new apps are not deployed."
-            </p>
-            <form class="form" on:submit=submit>
+            <h2 class="section-title">"Configuration"</h2>
+            <div class="field">
+                <span>"Export"</span>
+                <p class="muted small">
+                    "Every node and app as TOML, to keep in git or restore elsewhere. Sensitive variables are "
+                    "listed without their values."
+                </p>
+                <div class="form-actions push-left">
+                    <button class="button" on:click=export>"Download facade.toml"</button>
+                </div>
+            </div>
+            <form class="form config-apply" on:submit=submit>
+                <div class="field">
+                    <span>"Apply"</span>
+                    <p class="muted small">
+                        "Creates or updates the nodes and apps described in a facade.toml. Nothing is deleted, "
+                        "and new apps are not deployed."
+                    </p>
+                </div>
                 <label class="field">
-                    <span>"facade.toml"</span>
-                    <textarea class="mono" rows="10" bind:value=text required
+                    <span class="visually-hidden">"facade.toml"</span>
+                    <textarea class="mono" rows="8" bind:value=text required
                         placeholder="[[app]]\nname = \"landing\"\nnode = \"main\"\n…"></textarea>
                 </label>
                 <ErrorNote error=error/>
@@ -744,186 +808,5 @@ fn Apply() -> impl IntoView {
                 </div>
             })}
         </section>
-    }
-}
-
-/// Deploy keys and access tokens for private repositories.
-#[component]
-fn GitAccess() -> impl IntoView {
-    let me = me();
-    let list = polled(None, || async {
-        api::get::<Vec<GitCredentialView>>("/api/git/credentials").await
-    });
-    let kind = RwSignal::new("token");
-    let name = RwSignal::new(String::new());
-    let scope = RwSignal::new(String::new());
-    let username = RwSignal::new(String::new());
-    let secret = RwSignal::new(String::new());
-    let error = RwSignal::new(None::<String>);
-    let created = RwSignal::new(None::<GitCredentialView>);
-    let add_open = RwSignal::new(false);
-    let open = move |k: &'static str| {
-        kind.set(k);
-        name.set(String::new());
-        scope.set(String::new());
-        username.set(String::new());
-        secret.set(String::new());
-        error.set(None);
-        created.set(None);
-        add_open.set(true);
-    };
-    let submit = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        let token = kind.get_untracked() == "token";
-        let body = CreateGitCredential {
-            name: name.get_untracked().trim().to_string(),
-            scope: scope.get_untracked().trim().to_string(),
-            secret: if token {
-                NewGitSecret::Token {
-                    username: Some(username.get_untracked()).filter(|u| !u.trim().is_empty()),
-                    token: secret.get_untracked(),
-                }
-            } else {
-                NewGitSecret::SshKey {
-                    private_key: Some(secret.get_untracked()).filter(|k| !k.trim().is_empty()),
-                }
-            },
-        };
-        error.set(None);
-        spawn_local(async move {
-            match api::post::<_, GitCredentialView>("/api/git/credentials", &body).await {
-                Ok(c) => {
-                    list.reload();
-                    if c.kind == GitCredentialKind::Token {
-                        toasts().ok(format!("Token {} saved", c.name));
-                        add_open.set(false);
-                    } else {
-                        created.set(Some(c));
-                    }
-                }
-                Err(e) => error.set(Some(e)),
-            }
-        });
-    };
-    let remove = move |n: String| {
-        run(
-            format!("{n} removed"),
-            async move { api::delete(&format!("/api/git/credentials/{n}")).await },
-            move || list.reload(),
-        );
-    };
-    view! {
-        <section class="card form">
-            <h2 class="section-title">"Git access"</h2>
-            <p class="muted small">
-                "Public repositories need nothing. For private ones, give façade read access: a "
-                <strong>"deploy key"</strong> " for one repository, or an " <strong>"access token"</strong>
-                " for every repository of an account or organisation (on GitHub, a fine-grained token with read access to Contents). "
-                "Credentials are encrypted on the server, used for scans and builds (submodules and private dependencies included), and never exported."
-            </p>
-            <ErrorNote error=list.error/>
-            <Show when=move || list.data.with(|l| l.as_ref().is_some_and(|l| !l.is_empty()))>
-                <div class="table-wrap">
-                    <table class="table">
-                        <thead>
-                            <tr>
-                                <th>"Name"</th><th>"Kind"</th><th>"Covers"</th><th>"Apps"</th>
-                                <Show when=move || me.is_admin()><th>"Owner"</th></Show>
-                                <th></th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <For each=move || list.data.get().unwrap_or_default() key=|c| (c.name.clone(), c.apps.clone(), c.owner.clone()) let:c>
-                                {
-                                    let n = c.name.clone();
-                                    let owner = c.owner.clone();
-                                    let public_key = c.public_key.clone();
-                                    view! {
-                                        <tr>
-                                            <td><strong>{c.name.clone()}</strong><div class="muted small">{format!("added {}", ago(c.created_at))}</div></td>
-                                            <td>{match c.kind { GitCredentialKind::SshKey => "deploy key", GitCredentialKind::Token => "token" }}</td>
-                                            <td><code>{c.scope.clone()}</code></td>
-                                            <td class="small">{if c.apps.is_empty() { "—".to_string() } else { c.apps.join(", ") }}</td>
-                                            <Show when=move || me.is_admin()>
-                                                <td class="muted">{owner.clone().unwrap_or_else(|| "admins".into())}</td>
-                                            </Show>
-                                            <td class="row-actions">
-                                                {public_key.map(|k| view! {
-                                                    <button type="button" class="link-button" on:click=move |_| {
-                                                        crate::util::copy_to_clipboard(&k);
-                                                        toasts().ok("Public key copied");
-                                                    }>"Copy public key"</button>
-                                                })}
-                                                <button type="button" class="link-button danger" on:click=move |_| remove(n.clone())>"Remove"</button>
-                                            </td>
-                                        </tr>
-                                    }
-                                }
-                            </For>
-                        </tbody>
-                    </table>
-                </div>
-            </Show>
-            <div class="form-actions">
-                <button type="button" class="button" on:click=move |_| open("key")>"New deploy key"</button>
-                <button type="button" class="button button-primary" on:click=move |_| open("token")>"Add access token"</button>
-            </div>
-        </section>
-
-        <Modal open=add_open title="Git access">
-            <Show when=move || created.with(Option::is_none) fallback=move || view! {
-                <p>"Add this public key to the repository as a read-only deploy key:"</p>
-                <CopyField value=Signal::derive(move || created.get().and_then(|c| c.public_key).unwrap_or_default())/>
-                {move || created.get().and_then(|c| c.add_key_url).map(|url| view! {
-                    <p><a href=url target="_blank" rel="noopener">"Open the repository's deploy key page ↗"</a></p>
-                })}
-                <div class="form-actions">
-                    <button class="button button-primary" on:click=move |_| add_open.set(false)>"Done"</button>
-                </div>
-            }>
-                <form class="form" on:submit=submit>
-                    <label class="field">
-                        <span>"Name"</span>
-                        <input type="text" bind:value=name required autocomplete="off"
-                            placeholder=move || if kind.get() == "token" { "github-my-org" } else { "shop-deploy-key" }
-                            pattern="[a-z0-9]([a-z0-9\\-]*[a-z0-9])?"/>
-                    </label>
-                    <label class="field">
-                        <span>{move || if kind.get() == "token" { "Repositories it covers" } else { "Repository" }}</span>
-                        <input type="text" bind:value=scope required autocomplete="off"
-                            placeholder=move || if kind.get() == "token" { "github.com/my-org" } else { "https://github.com/me/app" }/>
-                        <small>{move || if kind.get() == "token" {
-                            "A host and owner (github.com/my-org), one repository, or a whole host."
-                        } else {
-                            "Deploy keys work for one repository."
-                        }}</small>
-                    </label>
-                    <Show when=move || kind.get() == "token" fallback=move || view! {
-                        <label class="field">
-                            <span>"Private key (optional)"</span>
-                            <textarea rows="4" class="mono" bind:value=secret
-                                placeholder="Leave empty to have façade generate one (recommended)"></textarea>
-                        </label>
-                    }>
-                        <label class="field">
-                            <span>"Token"</span>
-                            <input type="password" bind:value=secret required autocomplete="off"/>
-                        </label>
-                        <label class="field">
-                            <span>"User name"</span>
-                            <input type="text" bind:value=username autocomplete="off" placeholder="x-access-token"/>
-                            <small>"Sent with the token over HTTPS. The default works for GitHub and GitLab."</small>
-                        </label>
-                    </Show>
-                    <ErrorNote error=error/>
-                    <div class="form-actions">
-                        <button type="button" class="button" on:click=move |_| add_open.set(false)>"Cancel"</button>
-                        <button type="submit" class="button button-primary">
-                            {move || if kind.get() == "token" { "Save token" } else if secret.with(|s| s.trim().is_empty()) { "Generate key" } else { "Save key" }}
-                        </button>
-                    </div>
-                </form>
-            </Show>
-        </Modal>
     }
 }

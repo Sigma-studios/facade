@@ -1535,7 +1535,7 @@ fn PrivateRepo(form: SpecForm, editing: bool) -> impl IntoView {
                 </button>
                 <span class="muted small">
                     " Several private repositories? Add one access token for all of them in "
-                    <A href="/settings">"Settings → Git access"</A> "."
+                    <A href="/settings/app-access">"Settings → App access"</A> "."
                 </span>
             </Show>
             <ErrorNote error=error/>

@@ -1,26 +1,26 @@
-use std::time::Duration;
-
-use facade_core::api::{AlertView, Mention, NotifySettings, NotifyUpdate};
+use facade_core::api::{Mention, NotifySettings, NotifyUpdate};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
 use crate::components::{ErrorNote, Loading};
-use crate::util::{ago, me, polled, run, toasts};
+use crate::util::{ago, alerts, me, polled, run, toasts};
 
+/// Settings → Alerts: where alerts go (admins), and the recent ones.
 #[component]
-pub fn Alerts() -> impl IntoView {
+pub fn AlertsTab() -> impl IntoView {
     let me = me();
-    let alerts = polled(Some(Duration::from_secs(10)), || async {
-        api::get::<Vec<AlertView>>("/api/alerts").await
-    });
+    let alerts = alerts().0;
     view! {
-        <div class="page">
-            <header class="page-head"><h1>"Alerts"</h1></header>
-            <p class="muted lead">
-                "Raised when a problem lasts a minute: a node offline, an app crashed or failing to deploy, "
-                "disk ≥ 90 %, memory ≥ 95 %, an app at its memory or CPU limit, or an app writing over 100 MB inside its container (instead of a volume)."
-            </p>
+        <p class="muted lead">
+            "Raised when a problem lasts a minute: a node offline, an app crashed or failing to deploy, "
+            "disk ≥ 90 %, memory ≥ 95 %, an app at its memory or CPU limit, or an app writing over 100 MB inside its container (instead of a volume)."
+        </p>
+        <Show when=move || me.is_admin()>
+            <DiscordSettings/>
+        </Show>
+        <section>
+            <h2 class="section-title">"Recent alerts"</h2>
             <ErrorNote error=alerts.error/>
             <Show when=move || alerts.loaded() fallback=Loading>
                 <Show when=move || alerts.data.with(|a| a.as_ref().is_some_and(|a| !a.is_empty()))
@@ -47,10 +47,7 @@ pub fn Alerts() -> impl IntoView {
                     </ul>
                 </Show>
             </Show>
-            <Show when=move || me.is_admin()>
-                <DiscordSettings/>
-            </Show>
-        </div>
+        </section>
     }
 }
 

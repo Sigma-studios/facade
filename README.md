@@ -88,7 +88,7 @@ an SSH tunnel (`ssh -L 7701:127.0.0.1:7701 VPS`) as a way back in.
 Every commit on main is tested, built for x86_64 and aarch64 by GitHub Actions
 (`.github/workflows/build.yml`) and published to the
 [`edge` release](https://github.com/Sigma-studios/facade/releases/tag/edge). The server
-checks it every six hours. To update, open **Settings → Updates** in the web UI
+checks it every six hours. To update, open **Settings → General → Updates** in the web UI
 (it lists the new commits; **Update to …** downloads the build, shows which apps
 it would restart, and installs it after you confirm), or from the CLI:
 
@@ -396,7 +396,9 @@ Dockerfiles can fetch private dependencies without baking them into the image:
 `RUN --mount=type=ssh …` (keys); facade's generated Rust builds do this for git
 dependencies. Host keys of GitHub, GitLab and Bitbucket are built in; other hosts are
 remembered on first use. In the web UI, a scan that is refused offers to create the
-deploy key on the spot. URLs with a password or token in them are refused.
+deploy key on the spot; an app's Settings tab shows the credential its builds use and
+makes, replaces or removes its deploy key, and Settings → App access holds the tokens
+covering many repositories. URLs with a password or token in them are refused.
 
 ### Variables for builds
 

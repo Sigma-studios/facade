@@ -10,11 +10,11 @@ use std::time::Duration;
 use facade_core::api::{AlertView, BuildsView, LoginRequest, LoginResponse, WhoAmI};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use leptos_router::components::{A, Outlet, ParentRoute, Route, Router, Routes};
+use leptos_router::components::{A, Outlet, ParentRoute, Redirect, Route, Router, Routes};
 use leptos_router::hooks::use_navigate;
 use leptos_router::path;
 
-use util::{Me, polled};
+use util::{Alerts, Me, polled};
 
 fn main() {
     console_error_panic_hook::set_once();
@@ -37,9 +37,11 @@ fn App() -> impl IntoView {
                     <Route path=path!("apps/:name") view=pages::app::AppPage/>
                     <Route path=path!("nodes") view=pages::nodes::Nodes/>
                     <Route path=path!("domains") view=pages::domains::Domains/>
-                    <Route path=path!("alerts") view=pages::alerts::Alerts/>
+                    // Alerts moved to Settings; old links still land there.
+                    <Route path=path!("alerts") view=|| view! { <Redirect path="/settings/alerts"/> }/>
                     <Route path=path!("users") view=|| view! { <AdminOnly><pages::users::Users/></AdminOnly> }/>
                     <Route path=path!("settings") view=pages::settings::Settings/>
+                    <Route path=path!("settings/:tab") view=pages::settings::Settings/>
                 </ParentRoute>
             </Routes>
         </Router>
@@ -64,17 +66,13 @@ fn Shell() -> impl IntoView {
     });
     let me = Me(whoami);
     provide_context(me);
+    provide_context(Alerts(alerts));
     let must_change_password = move || {
         whoami
             .data
             .with(|w| w.as_ref().is_some_and(|w| w.must_change_password))
     };
-    let firing = move || {
-        alerts.data.with(|a| {
-            a.as_ref()
-                .map_or(0, |a| a.iter().filter(|x| x.resolved_at.is_none()).count())
-        })
-    };
+    let firing = move || Alerts(alerts).firing();
     let builds = polled(Some(Duration::from_secs(5)), || async {
         api::get::<BuildsView>("/api/builds").await
     });
@@ -110,32 +108,32 @@ fn Shell() -> impl IntoView {
                     </li>
                     <li><A href="/nodes">"Nodes"</A></li>
                     <li><A href="/domains">"Domains"</A></li>
+                    <Show when=move || me.is_admin()>
+                        <li><A href="/users">"Users"</A></li>
+                    </Show>
                     <li>
-                        <A href="/alerts">
-                            "Alerts"
+                        // Alerts live in Settings: their count shows here.
+                        <A href="/settings">
+                            "Settings"
                             <Show when=move || { firing() > 0 }>
                                 <span class="nav-count" title="firing alerts">{firing}</span>
                             </Show>
                         </A>
                     </li>
-                    <Show when=move || me.is_admin()>
-                        <li><A href="/users">"Users"</A></li>
-                    </Show>
-                    <li><A href="/settings">"Settings"</A></li>
                 </ul>
                 <button class="nav-logout" on:click=logout>"Log out"</button>
             </nav>
             <main class="content">
                 <Show when=must_change_password>
                     <div class="shell-banner">
-                        <A href="/settings" attr:class="banner banner-critical">
+                        <A href="/settings/password" attr:class="banner banner-critical">
                             <span aria-hidden="true">"⚠"</span>
                             <span>
                                 <strong>"Change your password."</strong>
                                 {move || if me.is_admin() {
-                                    " It is still the one generated at install. Set your own in Settings."
+                                    " It is still the one generated at install. Set your own in Settings → Password."
                                 } else {
-                                    " It is still the one-time password you were given. Set your own in Settings."
+                                    " It is still the one-time password you were given. Set your own in Settings → Password."
                                 }}
                             </span>
                         </A>

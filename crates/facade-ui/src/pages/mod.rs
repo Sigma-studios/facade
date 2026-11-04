@@ -3,6 +3,7 @@ pub mod app;
 pub mod apps;
 pub mod builds;
 pub mod domains;
+pub mod git;
 pub mod nodes;
 pub mod overview;
 pub mod settings;

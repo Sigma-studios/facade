@@ -275,6 +275,7 @@ pub fn AppPage() -> impl IntoView {
                         Some((stack, service)) => view! {
                             <super::stack::ServiceSettings stack=stack service=service
                                 on_saved=Callback::new(move |_| app.reload())/>
+                            <super::git::AppGitAccess app=Signal::derive(move || app.data.get())/>
                         }.into_any(),
                         None => view! {
                             <SettingsTab app=app.data.get_untracked().expect("loaded")
@@ -1482,6 +1483,7 @@ fn SettingsTab(
                 "Saving applies right away: the app restarts, and is rebuilt first if its source changed."
             </p>
         </form>
+        <super::git::AppGitAccess app=live/>
         <Show when=move || me.is_admin()>
             <AccessSection live=live on_change=on_access.clone()/>
         </Show>

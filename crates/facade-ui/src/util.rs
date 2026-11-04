@@ -82,6 +82,10 @@ impl Me {
             .with(|w| w.as_ref().is_some_and(|w| w.role == "admin"))
     }
 
+    pub fn username(&self) -> Option<String> {
+        self.0.data.with(|w| w.as_ref().map(|w| w.username.clone()))
+    }
+
     pub fn is_member(&self) -> bool {
         self.0
             .data
@@ -101,6 +105,25 @@ impl Me {
         self.0.data.with(|w| {
             let w = w.as_ref()?;
             Some((w.cpus_allocated, w.cpu_cap?))
+        })
+    }
+}
+
+/// The alerts, polled by the shell for its count and shared with the pages.
+#[derive(Clone, Copy)]
+pub struct Alerts(pub Polled<Vec<facade_core::api::AlertView>>);
+
+pub fn alerts() -> Alerts {
+    expect_context::<Alerts>()
+}
+
+impl Alerts {
+    pub fn firing(&self) -> usize {
+        self.0.data.with(|a| {
+            a.iter()
+                .flatten()
+                .filter(|x| x.resolved_at.is_none())
+                .count()
         })
     }
 }
