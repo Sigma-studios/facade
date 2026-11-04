@@ -3847,7 +3847,9 @@ async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()>
                 }),
             );
             // Admins only: it covers every app's backups.
-            if let Ok(store) = api.get::<BackupStoreView>("/api/backups/store").await {
+            if let Ok(store) = api.get::<BackupStoreView>("/api/backups/store").await
+                && store.snapshots + store.full_copies > 0
+            {
                 println!();
                 println!("{}", store_summary(&store));
             }

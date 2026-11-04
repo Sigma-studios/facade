@@ -2908,8 +2908,8 @@ async fn download_backup(
                 .context("opening backup")?;
             Body::from_stream(tokio_util::io::ReaderStream::new(file))
         }
-        // Gzipped on the fly, like the full copies: a damaged chunk cuts the
-        // download short, which the gzip trailer then shows.
+        // Gzipped on the fly, like the full copies. A damaged chunk ends the
+        // download with an error, before the gzip trailer.
         super::backups::Stored::Snapshot(path) => {
             let (_, tar) = super::backups::snapshot_stream(&server, &path, true)
                 .await
