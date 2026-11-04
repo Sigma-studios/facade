@@ -253,7 +253,7 @@ p { margin: 0 0 12px; }
 .meter-fill { height: 100%; background: var(--series-1); border-radius: 3px; transition: width 0.4s ease; }
 .meter-fill-high { background: var(--critical); }
 
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 16px; margin-bottom: 16px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 16px; margin-bottom: 16px; }
 .tile {
   background: var(--surface-1);
   border: 1px solid var(--border);
@@ -451,6 +451,8 @@ textarea { resize: vertical; min-height: 38px; }
 input:disabled, textarea:disabled { background: var(--surface-2); color: var(--text-muted); }
 .check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; cursor: pointer; padding-top: 26px; }
 .toolbar .check, .modal .check, .checks .check { padding-top: 0; }
+.auto-deploy .check { padding-top: 0; margin-bottom: 10px; }
+.auto-deploy > p { margin: 10px 0 0; }
 .inline-field { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
 .inline-field select { width: auto; padding: 4px 8px; }
 
@@ -777,12 +779,6 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .access-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .access-list li { display: flex; justify-content: space-between; align-items: center; gap: 12px; max-width: 420px; }
 .form-row > select { flex: 1 1 200px; }
-.update-check { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
-.update-check .toolbar { margin-bottom: 8px; }
-.commit-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-.commit { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
-.commit-subject { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.update-check { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px; }
 .commit-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .commit { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
 .commit-subject { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1132,9 +1128,36 @@ a.tab { display: inline-flex; align-items: center; gap: 6px; text-decoration: no
   .domain-table .expires-none { display: none; }
 }
 
-/* ---------------------------------------------------------------- image layers */
+/* ---------------------------------------------------------------- app overview & info */
 
-.image-layers { margin-top: 24px; }
+/* What the update check found, under the header until deployed or dismissed. */
+.note-info { background: var(--surface-2); color: var(--text-primary); box-shadow: inset 3px 0 0 var(--accent); }
+.update-found { white-space: normal; }
+.update-found-head { display: flex; align-items: center; gap: 12px; }
+.update-found .icon-button { margin: -4px -4px -4px auto; }
+.update-found .commit-list { margin-bottom: 2px; }
+/* The last deployment on one line, between the tiles and the charts. */
+.deploy-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 16px;
+  margin-bottom: 24px;
+  min-width: 0;
+}
+.deploy-strip-label { font-size: 12px; color: var(--text-secondary); font-weight: 500; }
+.deploy-strip-what { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; color: var(--text-primary); }
+.deploy-strip-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.deploy-strip .push-right { white-space: nowrap; }
+.tile-link { color: inherit; }
+.tile-link:hover { text-decoration: none; border-color: var(--border-strong); background: var(--surface-2); }
+.subsection-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin: 0 0 4px; }
+.kv-foot { margin: 10px 0 0; }
+.image-layers { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
 .layers { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .layer { display: grid; grid-template-columns: minmax(80px, 180px) 72px 1fr; align-items: center; gap: 12px; min-width: 0; }
 .layer-bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }

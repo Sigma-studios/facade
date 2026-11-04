@@ -326,6 +326,13 @@ facade rollback api                    # the previous successfully deployed comm
 facade deploy api --rebuild            # build again, without Docker's layer cache
 ```
 
+On the app page, a running app's main button is **Check for updates**: it fetches the
+branch (`facade updates api`), or asks the registry what an image's tag points to now,
+and becomes **Deploy 3 new commits** (or **Deploy new image**) with what is new listed.
+A stopped, failed or never deployed app gets **Deploy**. Its **More** menu redeploys
+the running commit, rolls back to the previous one, or deploys the latest without
+checking.
+
 Each node builds one app at a time; other deployments wait in its queue (`facade
 builds`, or the Builds page). `facade cancel <app>` stops a queued or building
 deployment: the running version stays, and the app does not move to the cancelled
@@ -343,7 +350,7 @@ it does not. Without one, a deploy waits for the container to stay up a few seco
 ### Auto-deploy (deploys on push)
 
 ```sh
-facade app update api --auto-deploy on      # or the switch on the app's Overview tab
+facade app update api --auto-deploy on      # or the switch in the app's Settings tab
 facade stack update shop --auto-deploy on
 facade auto-deploy                          # what deploys by itself, and how it notices
 facade auto-deploy api                      # webhook or polling, last check, last deploy, error
@@ -628,7 +635,7 @@ cache. `facade node prune <node> [--aggressive]` (or the Nodes page) does it now
 cache, volumes (sized ones measured by their own filesystem), what containers wrote,
 facade's own files, backups (on the server's node, with the apps taking the most:
 each app's chunks counted once, those several apps hold split between them), and
-the rest of the system; then each app's share. An app's Overview tab (and `facade app
+the rest of the system; then each app's share. An app's Info tab (and `facade app
 show`) shows its own, with the largest layers of the image it runs.
 What an app writes inside its container, outside volumes, is lost on redeploy: past
 100 MB it raises an alert. Volumes no app declares any more are flagged as orphaned.

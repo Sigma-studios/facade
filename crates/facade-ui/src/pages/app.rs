@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AppDiskView, AppView, BackupReport, BackupRequest, BackupView, CommitView, DeployRequest,
-    DeploymentStatus, DeploymentView, DomainStatus, EnvPatch, EnvView, NodeView, SetEnv, SetOwner,
-    UpdateCheck, UserView, VolumeView, WRITTEN_WARNING,
+    AppDiskView, AppView, AutoDeployMethod, AutoDeployView, BackupReport, BackupRequest,
+    BackupView, CommitView, DeployRequest, DeploymentStatus, DeploymentView, DomainStatus,
+    EnvPatch, EnvView, ImageUpdateCheck, NodeView, SetEnv, SetOwner, UpdateCheck, UserView,
+    VolumeView, WRITTEN_WARNING,
 };
 use facade_core::proto::AppState;
 use facade_core::{Build, Source};
@@ -16,9 +17,9 @@ use uuid::Uuid;
 use super::domains::DomainTable;
 use super::spec_form::{SpecFields, SpecForm};
 use crate::api;
-use crate::components::{ErrorNote, Loading, Modal, StateBadge, UsageCharts};
+use crate::components::{ErrorNote, Loading, Menu, Modal, StateBadge, TabBar, UsageCharts};
 use crate::util::{
-    ago, bytes, clock, date, me, percent, polled, run, short_hash, strip_ansi, toasts,
+    Polled, ago, bytes, clock, cpus, date, me, percent, polled, run, short_hash, strip_ansi, toasts,
 };
 
 const TABS: &[(&str, &str)] = &[
@@ -27,8 +28,83 @@ const TABS: &[(&str, &str)] = &[
     ("deployments", "Deployments"),
     ("env", "Environment"),
     ("volumes", "Volumes"),
+    ("info", "Info"),
     ("settings", "Settings"),
 ];
+
+#[derive(Clone, Copy, PartialEq)]
+enum SourceKind {
+    Git,
+    Image,
+    Executable,
+}
+
+/// What the header's main button does: deploy where the app needs it, else
+/// look for something new first, then deploy what was found.
+#[derive(Clone, Copy, PartialEq)]
+enum Primary {
+    Stack,
+    First,
+    Deploy,
+    Check,
+    Update,
+}
+
+/// What the header's update check found that a deploy would bring.
+#[derive(Clone)]
+enum Found {
+    Commits(UpdateCheck),
+    Image(ImageUpdateCheck),
+}
+
+impl Found {
+    /// `Some(false)`: up to date; `None`: what runs is unknown.
+    fn news(&self) -> Option<bool> {
+        match self {
+            Found::Commits(c) => c.behind.map(|n| n > 0),
+            Found::Image(i) => i.outdated(),
+        }
+    }
+
+    fn deploy_label(&self) -> String {
+        match self {
+            Found::Commits(c) => match c.behind {
+                Some(n) => format!("Deploy {n} new commit{}", if n == 1 { "" } else { "s" }),
+                None => format!("Deploy {}", short_hash(&c.latest.hash)),
+            },
+            Found::Image(i) if i.outdated() == Some(true) => "Deploy new image".into(),
+            Found::Image(_) => "Pull and deploy".into(),
+        }
+    }
+
+    /// The commit to deploy: the one the check saw, not whatever the branch has
+    /// by the time the button is pressed. Images are pulled by their tag.
+    fn commit(&self) -> Option<String> {
+        match self {
+            Found::Commits(c) => Some(c.latest.hash.clone()),
+            Found::Image(_) => None,
+        }
+    }
+
+    fn up_to_date(&self) -> String {
+        match self {
+            Found::Commits(c) => format!(
+                "Up to date with {} ({})",
+                c.branch.as_deref().unwrap_or("the default branch"),
+                short_hash(&c.latest.hash)
+            ),
+            Found::Image(i) => format!("Up to date: {} has not changed", i.image),
+        }
+    }
+}
+
+/// A commit's 7 characters, or a digest's first 12 hex digits.
+fn short_digest(digest: &str) -> String {
+    match digest.strip_prefix("sha256:") {
+        Some(hex) => format!("sha256:{}", hex.get(..12).unwrap_or(hex)),
+        None => short_hash(digest).to_string(),
+    }
+}
 
 #[component]
 pub fn AppPage() -> impl IntoView {
@@ -43,6 +119,11 @@ pub fn AppPage() -> impl IntoView {
     let app = polled(Some(Duration::from_secs(3)), move || {
         let name = name.get();
         async move { api::get::<AppView>(&format!("/api/apps/{name}")).await }
+    });
+    // For the overview's latest deployment and the header's rollback.
+    let deployments = polled(Some(Duration::from_secs(10)), move || {
+        let name = name.get();
+        async move { api::get::<Vec<DeploymentView>>(&format!("/api/apps/{name}/deployments")).await }
     });
     let set_tab = {
         let navigate = navigate.clone();
@@ -59,6 +140,8 @@ pub fn AppPage() -> impl IntoView {
     };
 
     let busy = RwSignal::new(false);
+    let checking = RwSignal::new(false);
+    let found = RwSignal::new(None::<Found>);
     // The stack a service belongs to, which deploys it.
     let stack = move || {
         app.data.with(|a| {
@@ -66,10 +149,29 @@ pub fn AppPage() -> impl IntoView {
                 .and_then(|a| a.spec.stack.as_ref().map(|s| s.stack.clone()))
         })
     };
-    let deploy = {
+    let kind = Memo::new(move |_| {
+        app.data.with(|a| {
+            a.as_ref().map(|a| match a.spec.source {
+                Source::Git { .. } => SourceKind::Git,
+                Source::Image { .. } => SourceKind::Image,
+                Source::Executable { .. } => SourceKind::Executable,
+            })
+        })
+    });
+    let commit = Memo::new(move |_| app.data.with(|a| a.as_ref().and_then(|a| a.commit.clone())));
+    // What was found is stale once another commit runs.
+    Effect::new(move |previous: Option<Option<String>>| {
+        let now = commit.get();
+        if previous.is_some_and(|p| p != now) {
+            found.set(None);
+        }
+        now
+    });
+    // `commit`: a specific one to deploy (the update check's, a rollback's), or
+    // the branch's latest.
+    let deploy = Callback::new({
         let set_tab = set_tab.clone();
         let navigate = navigate.clone();
-        // `commit`: a specific one to deploy (the update check's), or the branch's latest.
         move |commit: Option<String>| {
             busy.set(true);
             let set_tab = set_tab.clone();
@@ -99,21 +201,47 @@ pub fn AppPage() -> impl IntoView {
             spawn_local(async move {
                 match api::post::<_, DeploymentView>(&path, &body).await {
                     Ok(d) => {
+                        found.set(None);
                         selected_deployment.set(Some(d.id));
                         set_tab("deployments");
                         app.reload();
+                        deployments.reload();
                     }
                     Err(e) => toasts().err(e),
                 }
                 busy.set(false);
             });
         }
-    };
-    // For the Update button of the overview's update check.
-    let on_deploy = Callback::new({
-        let deploy = deploy.clone();
-        move |commit: Option<String>| deploy(commit)
     });
+    // Fetching the branch (or asking the registry) takes a few seconds: only
+    // when asked.
+    let check = move || {
+        checking.set(true);
+        let name = name.get_untracked();
+        let image = kind.get_untracked() == Some(SourceKind::Image);
+        spawn_local(async move {
+            let result = if image {
+                api::act_json::<ImageUpdateCheck>(&format!("/api/apps/{name}/image-updates"))
+                    .await
+                    .map(Found::Image)
+            } else {
+                api::act_json::<UpdateCheck>(&format!("/api/apps/{name}/updates"))
+                    .await
+                    .map(Found::Commits)
+            };
+            match result {
+                Ok(f) if f.news() == Some(false) => {
+                    toasts().ok(f.up_to_date());
+                    found.try_set(None);
+                }
+                Ok(f) => {
+                    found.try_set(Some(f));
+                }
+                Err(e) => toasts().err(e),
+            }
+            checking.try_set(false);
+        });
+    };
     let simple = move |action: &'static str, done: &'static str| {
         let path = format!("/api/apps/{}/{action}", name.get_untracked());
         run(done, async move { api::act(&path).await }, move || {
@@ -142,9 +270,121 @@ pub fn AppPage() -> impl IntoView {
     let state = Signal::derive(move || view_of().map(|a| a.state).unwrap_or(AppState::Unknown));
     let enabled = move || view_of().is_some_and(|a| a.spec.enabled);
     let deployed = move || view_of().is_some_and(|a| a.revision > 0);
+    let primary = move || {
+        if stack().is_some() {
+            return Primary::Stack;
+        }
+        if !deployed() {
+            return Primary::First;
+        }
+        if found.with(Option::is_some) {
+            return Primary::Update;
+        }
+        // Stopped, failed or crashed, a deploy is what it needs; an uploaded
+        // executable has nothing new to look for.
+        let settled = enabled()
+            && matches!(
+                state.get(),
+                AppState::Running | AppState::Building | AppState::Pending
+            );
+        match kind.get() {
+            Some(SourceKind::Git | SourceKind::Image) if settled => Primary::Check,
+            _ => Primary::Deploy,
+        }
+    };
+    let primary_label = move || {
+        if busy.get() {
+            return "Starting…".to_string();
+        }
+        if checking.get() {
+            return "Checking…".to_string();
+        }
+        match primary() {
+            Primary::Stack => "Deploy stack".into(),
+            Primary::First => "First deploy".into(),
+            Primary::Deploy => "Deploy".into(),
+            Primary::Check => "Check for updates".into(),
+            Primary::Update => found
+                .with(|f| f.as_ref().map(Found::deploy_label))
+                .unwrap_or_default(),
+        }
+    };
+    let primary_title = move || match (primary(), kind.get()) {
+        (Primary::Check, Some(SourceKind::Image)) => {
+            "Ask the registry whether the tag points to a new image"
+        }
+        (Primary::Check, _) => "Fetch the branch and compare it with the deployed commit",
+        (Primary::Update, _) => "Deploy what the check found",
+        _ => "Fetch the latest code or image, rebuild and restart",
+    };
+    let on_primary = move |_| match primary() {
+        Primary::Check => check(),
+        Primary::Update => deploy.run(found.with_untracked(|f| f.as_ref().and_then(Found::commit))),
+        _ => deploy.run(None),
+    };
+    // The previous successfully deployed commit, as `facade rollback` takes.
+    let rollback = Memo::new(move |_| {
+        let current = commit.get()?;
+        deployments.data.with(|l| {
+            l.iter()
+                .flatten()
+                .find(|d| {
+                    d.status == DeploymentStatus::Succeeded
+                        && d.commit.as_ref().is_some_and(|c| *c != current)
+                })
+                .and_then(|d| d.commit.clone())
+        })
+    });
+    // Deploys besides the main button's: the same commit again, the previous one,
+    // or the latest without looking first. A stack's services deploy with it.
+    let more = Memo::new(move |_| {
+        let mut items: Vec<(String, &'static str, Option<String>)> = vec![];
+        if stack().is_some() || !deployed() {
+            return items;
+        }
+        let checks = matches!(primary(), Primary::Check | Primary::Update);
+        match kind.get() {
+            Some(SourceKind::Git) => {
+                if checks {
+                    items.push((
+                        "Deploy latest commit".into(),
+                        "Fetch the branch and deploy its latest commit, without checking first",
+                        None,
+                    ));
+                }
+                if let Some(c) = commit.get() {
+                    items.push((
+                        format!("Redeploy {}", short_hash(&c)),
+                        "Deploy the running commit again; its image is reused if it is still on the node",
+                        Some(c),
+                    ));
+                }
+                if let Some(c) = rollback.get() {
+                    items.push((
+                        format!("Roll back to {}", short_hash(&c)),
+                        "Deploy the previous successfully deployed commit",
+                        Some(c),
+                    ));
+                }
+            }
+            Some(SourceKind::Image) if checks => items.push((
+                "Pull and redeploy".into(),
+                "Pull the tag again and restart on it, new image or not",
+                None,
+            )),
+            _ => {}
+        }
+        items
+    });
     let has_volumes = Memo::new(move |_| {
         app.data
             .with(|a| a.as_ref().is_some_and(|a| !a.spec.volumes.is_empty()))
+    });
+    let tabs = Signal::derive(move || {
+        TABS.iter()
+            .copied()
+            .filter(|(key, _)| *key != "volumes" || has_volumes.get())
+            .collect::<Vec<_>>()
     });
     // A memo, so the tabs are only rebuilt when this changes, not at every poll
     // (which would reset the settings form while it is being edited).
@@ -185,21 +425,10 @@ pub fn AppPage() -> impl IntoView {
                     </div>
                 </div>
                 <div class="actions">
-                    <button class="button button-primary" disabled=move || busy.get() || !app.loaded()
-                        on:click={
-                            let deploy = deploy.clone();
-                            move |_| deploy(None)
-                        }
-                        title="Fetch the latest code or image, rebuild and restart">
-                        {move || if busy.get() {
-                            "Starting…"
-                        } else if stack().is_some() {
-                            "Deploy stack"
-                        } else if deployed() {
-                            "Deploy"
-                        } else {
-                            "First deploy"
-                        }}
+                    <button class="button button-primary"
+                        disabled=move || busy.get() || checking.get() || !app.loaded()
+                        on:click=on_primary title=primary_title>
+                        {primary_label}
                     </button>
                     <button class="button" disabled=move || !deployed()
                         on:click=move |_| simple("restart", "Restarted")>"Restart"</button>
@@ -211,6 +440,15 @@ pub fn AppPage() -> impl IntoView {
                     >
                         <button class="button" disabled=move || !deployed()
                             on:click=move |_| simple("stop", "Stopped")>"Stop"</button>
+                    </Show>
+                    <Show when=move || more.with(|m| !m.is_empty())>
+                        <Menu label="More" title="Other deploys">
+                            {move || more.get().into_iter().map(|(label, title, commit)| view! {
+                                <button class="menu-item" role="menuitem" title=title
+                                    disabled=move || busy.get()
+                                    on:click=move |_| deploy.run(commit.clone())>{label}</button>
+                            }).collect_view()}
+                        </Menu>
                     </Show>
                 </div>
             </header>
@@ -239,20 +477,12 @@ pub fn AppPage() -> impl IntoView {
                     {m}
                 </div>
             })}
+            <UpdateFound found/>
 
-            <div class="tabs" role="tablist">
-                {move || TABS.iter().filter(|(key, _)| *key != "volumes" || has_volumes.get()).map(|(key, label)| {
-                    let key = *key;
-                    let set_tab = set_tab.clone();
-                    view! {
-                        <button role="tab" class=move || if tab.get() == key { "tab active" } else { "tab" }
-                            aria-selected=move || (tab.get() == key).to_string()
-                            on:click=move |_| set_tab(key)>
-                            {*label}
-                        </button>
-                    }
-                }).collect_view()}
-            </div>
+            <TabBar tabs active=tab on_pick=Callback::new({
+                let set_tab = set_tab.clone();
+                move |t: &'static str| set_tab(t)
+            })/>
 
             <Show when=move || app.loaded() fallback=Loading>
                 {move || match tab.get().as_str() {
@@ -260,7 +490,10 @@ pub fn AppPage() -> impl IntoView {
                     "deployments" => view! {
                         <DeploymentsTab name=name selected=selected_deployment
                             current=Signal::derive(move || view_of().and_then(|a| a.commit))
-                            on_deployed=move || app.reload()/>
+                            on_deployed=move || {
+                                app.reload();
+                                deployments.reload();
+                            }/>
                     }.into_any(),
                     "env" => view! {
                         <EnvTab builds=true
@@ -272,6 +505,7 @@ pub fn AppPage() -> impl IntoView {
                             })/>
                     }.into_any(),
                     "volumes" => view! { <VolumesTab name=name app=Signal::derive(move || app.data.get())/> }.into_any(),
+                    "info" => view! { <InfoTab app=Signal::derive(move || app.data.get())/> }.into_any(),
                     // Stacks are managed by admins; members edit a service as a plain app.
                     "settings" => match stack_service.get().filter(|_| me.is_admin()) {
                         Some((stack, service)) => view! {
@@ -286,8 +520,7 @@ pub fn AppPage() -> impl IntoView {
                         }.into_any(),
                     },
                     _ => view! {
-                        <OverviewTab name=name app=Signal::derive(move || app.data.get())
-                            deploying=busy on_deploy=on_deploy/>
+                        <OverviewTab name=name app=Signal::derive(move || app.data.get()) deployments/>
                     }.into_any(),
                 }}
             </Show>
@@ -330,37 +563,107 @@ fn subtitle(app: &AppView) -> String {
         Source::Image { image } => format!("image {image}"),
         Source::Executable { filename, arch, .. } => format!("executable {filename} ({arch})"),
         Source::Git { repo, build, .. } => {
-            let kind = match build {
-                Build::Dockerfile { .. } => "Dockerfile",
-                Build::Rust { .. } => "Rust",
-                Build::Python { .. } => "Python",
-                Build::Static { .. } => "static site",
-                Build::Trunk { .. } => "Rust web app (trunk)",
-            };
-            let commit = app
-                .commit
-                .as_deref()
-                .map(|c| format!(" · {}", short_hash(c)))
-                .unwrap_or_default();
-            format!("{} · {kind}{commit}", repo.trim_start_matches("https://"))
+            format!(
+                "{} · {}",
+                repo.trim_start_matches("https://"),
+                build_kind(build)
+            )
         }
     };
     let deployed = match (&app.commit, app.revision) {
         (_, 0) => "never deployed".to_string(),
-        (Some(commit), _) => format!("commit {}", &commit[..commit.len().min(7)]),
+        (Some(commit), _) => format!("commit {}", short_hash(commit)),
         (None, revision) => format!("revision {revision}"),
     };
     format!("on {} · {source} · {deployed}", app.spec.node)
 }
 
+fn build_kind(build: &Build) -> &'static str {
+    match build {
+        Build::Dockerfile { .. } => "Dockerfile",
+        Build::Rust { .. } => "Rust",
+        Build::Python { .. } => "Python",
+        Build::Static { .. } => "static site",
+        Build::Trunk { .. } => "Rust web app (trunk)",
+    }
+}
+
+/// What the update check found, under the header until deployed or dismissed:
+/// the new commits, or the new image.
+#[component]
+fn UpdateFound(found: RwSignal<Option<Found>>) -> impl IntoView {
+    /// Commits listed at most; the rest are counted.
+    const SHOWN: usize = 5;
+    move || {
+        let f = found.get()?;
+        let (headline, commits, more) = match f {
+            Found::Commits(c) => {
+                let branch = c
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "the default branch".into());
+                let headline = match (c.behind, &c.deployed) {
+                    (Some(n), _) => format!(
+                        "{n} new commit{} on {branch}:",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    (None, Some(d)) => format!(
+                        "The deployed commit {} is not on {branch}. Its latest commits:",
+                        short_hash(d)
+                    ),
+                    (None, None) => format!("Latest commits on {branch}:"),
+                };
+                let total = c.behind.map_or(c.commits.len(), |n| n as usize);
+                let more = total.saturating_sub(SHOWN);
+                let commits: Vec<CommitView> = c.commits.into_iter().take(SHOWN).collect();
+                (headline, commits, more)
+            }
+            Found::Image(i) => {
+                let headline = match &i.deployed {
+                    Some(d) => format!(
+                        "{} points to a new image: {} (running {}).",
+                        i.image,
+                        short_digest(&i.latest),
+                        short_digest(d)
+                    ),
+                    None => format!(
+                        "{} points to {}; which image runs is not known (its last deploy did not pull one).",
+                        i.image,
+                        short_digest(&i.latest)
+                    ),
+                };
+                (headline, vec![], 0)
+            }
+        };
+        Some(view! {
+            <div class="note note-info update-found" role="status">
+                <div class="update-found-head">
+                    <span>{headline}</span>
+                    <button class="icon-button push-right" aria-label="Dismiss" title="Dismiss"
+                        on:click=move |_| found.set(None)>"✕"</button>
+                </div>
+                {(!commits.is_empty()).then(|| view! {
+                    <ul class="commit-list">
+                        {commits.into_iter().map(|c| view! { <CommitRow c=c/> }).collect_view()}
+                    </ul>
+                })}
+                {(more > 0).then(|| view! {
+                    <div class="muted small">{format!("and {more} more")}</div>
+                })}
+            </div>
+        })
+    }
+}
+
 // ---------------------------------------------------------------- overview
 
+/// The essentials, on one screen: what it uses, its last deployment (and
+/// whether it deploys by itself), its domains. The rest is in Info.
 #[component]
 fn OverviewTab(
     name: Memo<String>,
     #[prop(into)] app: Signal<Option<AppView>>,
-    deploying: RwSignal<bool>,
-    on_deploy: Callback<Option<String>>,
+    deployments: Polled<Vec<DeploymentView>>,
 ) -> impl IntoView {
     let spec = move || app.get().map(|a| a.spec);
     let stats = move || app.get().and_then(|a| a.stats);
@@ -372,11 +675,10 @@ fn OverviewTab(
             .map(|m| (m * 1024 * 1024) as f64)
     });
     let is_static = move || spec().is_some_and(|s| s.is_static());
-    let from_git = move || spec().is_some_and(|s| matches!(s.source, Source::Git { .. }));
-    let commit = move || app.get().and_then(|a| a.commit);
     let domains = polled(Some(Duration::from_secs(30)), || async {
         api::get::<Vec<DomainStatus>>("/api/domains").await
     });
+    let info_href = move || format!("/apps/{}?tab=info", name.get());
 
     view! {
         <Show when=move || !is_static() fallback=move || view! {
@@ -389,7 +691,7 @@ fn OverviewTab(
                 <div class="tile">
                     <span class="tile-label">"CPU"</span>
                     <span class="tile-value">{move || stats().map(|s| format!("{:.1} %", s.cpu_percent)).unwrap_or_else(|| "—".into())}</span>
-                    <span class="tile-sub">{move || spec().and_then(|s| s.limits.cpus).map(|c| format!("limit {c} CPU")).unwrap_or_else(|| "no limit".into())}</span>
+                    <span class="tile-sub">{move || spec().and_then(|s| s.limits.cpus).map(|c| format!("limit {} CPU", cpus(c))).unwrap_or_else(|| "no limit".into())}</span>
                 </div>
                 <div class="tile">
                     <span class="tile-label">"Memory"</span>
@@ -399,9 +701,9 @@ fn OverviewTab(
                 <div class="tile">
                     <span class="tile-label">"Restarts"</span>
                     <span class="tile-value">{move || stats().map(|s| s.restarts.to_string()).unwrap_or_else(|| "—".into())}</span>
-                    <span class="tile-sub">"since the container was created"</span>
+                    <span class="tile-sub" title="Since the container was created">"since created"</span>
                 </div>
-                <div class="tile" title=move || disk().map(disk_detail).unwrap_or_default()>
+                <A href=info_href attr:class="tile tile-link" attr:title=move || disk().map(disk_detail).unwrap_or_default()>
                     <span class="tile-label">"Disk"</span>
                     <span class="tile-value">{move || disk().map(|d| bytes(d.total())).unwrap_or_else(|| "—".into())}</span>
                     {move || disk().map(|d| if d.written >= WRITTEN_WARNING {
@@ -420,16 +722,19 @@ fn OverviewTab(
                             }}</span>
                         }.into_any()
                     })}
-                </div>
+                </A>
                 <div class="tile">
                     <span class="tile-label">"Network"</span>
                     <span class="tile-value">{move || stats().map(|s| format!("↓ {}", bytes(s.net_rx))).unwrap_or_else(|| "—".into())}</span>
                     <span class="tile-sub">{move || stats().map(|s| format!("↑ {} sent", bytes(s.net_tx))).unwrap_or_default()}</span>
                 </div>
             </div>
+        </Show>
+        <LatestDeployment name=name deployments
+            auto_deploy=Signal::derive(move || spec().is_some_and(|s| s.stack.is_none()))/>
+        <Show when=move || !is_static()>
             <UsageCharts url=Signal::derive(move || format!("/api/apps/{}/usage", name.get()))
                 cpu_max=cpu_max mem_max=mem_max/>
-            <ImageLayers disk=Signal::derive(disk)/>
         </Show>
         <Show when=move || spec().is_some_and(|s| !s.domains.is_empty())>
             <section class="app-domains">
@@ -442,10 +747,100 @@ fn OverviewTab(
                 }) show_app=false/>
             </section>
         </Show>
+    }
+}
+
+/// The last deployment on one line, leading to the Deployments tab, and
+/// whether the app deploys by itself (`auto_deploy`: its own switch, not its
+/// stack's), leading to the switch in Settings.
+#[component]
+fn LatestDeployment(
+    name: Memo<String>,
+    deployments: Polled<Vec<DeploymentView>>,
+    #[prop(into)] auto_deploy: Signal<bool>,
+) -> impl IntoView {
+    let status = polled(Some(Duration::from_secs(30)), move || {
+        let (name, wanted) = (name.get(), auto_deploy.get());
+        async move {
+            if !wanted {
+                return Ok(None);
+            }
+            api::get::<AutoDeployView>(&format!("/api/apps/{name}/auto-deploy"))
+                .await
+                .map(Some)
+        }
+    });
+    let auto = move || {
+        let s = status
+            .data
+            .get()
+            .flatten()
+            .filter(|s| s.watching.is_some())?;
+        let (text, class) = match (s.enabled, &s.error, s.method) {
+            (false, _, _) => ("Auto-deploy off".to_string(), "muted"),
+            (true, Some(_), _) => (
+                "Auto-deploy on · last check failed".to_string(),
+                "tile-warn",
+            ),
+            (true, None, AutoDeployMethod::Webhook) => ("Auto-deploy on · webhook".into(), ""),
+            (true, None, _) => ("Auto-deploy on · polling".into(), ""),
+        };
+        Some(view! {
+            <A href=move || format!("/apps/{}?tab=settings", name.get()) attr:class=format!("small {class}")
+                attr:title="Its switch and how changes are noticed, in Settings">
+                {text}
+            </A>
+        })
+    };
+    let latest = move || {
+        deployments
+            .data
+            .with(|l| l.as_ref().and_then(|l| l.first().cloned()))
+    };
+    view! {
+        <Show when=move || deployments.data.with(|l| l.as_ref().is_some_and(|l| !l.is_empty()))>
+            <section class="deploy-strip">
+                {move || latest().map(|d| {
+                    let took = match (d.started_at, d.finished_at) {
+                        (Some(s), Some(f)) => format!(" · took {}s", f.saturating_sub(s)),
+                        (None, None) => " · waiting for the build slot".into(),
+                        _ => String::new(),
+                    };
+                    view! {
+                        <span class="deploy-strip-label">"Latest deployment"</span>
+                        <DeployStatus status=d.status/>
+                        <A href=move || format!("/apps/{}?tab=deployments", name.get()) attr:class="deploy-strip-what">
+                            <code>{d.commit.as_deref().map(|c| short_hash(c).to_string()).unwrap_or_else(|| format!("rev {}", d.revision))}</code>
+                            {d.commit_title.clone().map(|t| view! { <span class="deploy-strip-title">{t}</span> })}
+                        </A>
+                        <span class="muted small">{format!("{}{took}", ago(d.created_at))}</span>
+                    }
+                })}
+                <span class="push-right">{auto}</span>
+            </section>
+        </Show>
+    }
+}
+
+// ---------------------------------------------------------------- info
+
+/// What the app is and what it takes: its configuration as it runs, and its
+/// disk with the largest layers of its image.
+#[component]
+fn InfoTab(#[prop(into)] app: Signal<Option<AppView>>) -> impl IntoView {
+    let spec = move || app.get().map(|a| a.spec);
+    let commit = move || app.get().and_then(|a| a.commit);
+    let disk = move || app.get().and_then(|a| a.disk);
+    view! {
         <section class="card details">
             <h2 class="section-title">"Configuration"</h2>
-            {move || spec().map(|s| view! {
+            {move || spec().map(|s| {
+                let node = s.node.clone();
+                let node_href = format!("/nodes/{node}");
+                view! {
                 <dl class="kv">
+                    <dt>"Node"</dt>
+                    <dd><A href=node_href>{node}</A></dd>
                     <dt>"Source"</dt>
                     <dd>{match &s.source {
                         Source::Image { image } => format!("Docker image {image}").into_any(),
@@ -453,8 +848,12 @@ fn OverviewTab(
                             "Executable {filename} ({arch}){}",
                             if args.is_empty() { String::new() } else { format!(", run with {}", facade_core::join_command(args)) }
                         ).into_any(),
-                        Source::Git { repo, branch, .. } => {
-                            let branch = format!(" ({})", branch.clone().unwrap_or_else(|| "default branch".into()));
+                        Source::Git { repo, branch, build } => {
+                            let branch = format!(
+                                " ({}) · {}",
+                                branch.clone().unwrap_or_else(|| "default branch".into()),
+                                build_kind(build)
+                            );
                             match facade_core::git::parse(repo) {
                                 Some(location) => view! {
                                     <a href=location.web_url() target="_blank" rel="noopener">{repo.clone()}</a>
@@ -471,6 +870,8 @@ fn OverviewTab(
                             None => view! { <span>"—"</span> }.into_any(),
                         }}</dd>
                     })}
+                    <dt>"Limits"</dt>
+                    <dd>{limits(&s.limits)}</dd>
                     <dt>"HTTP port"</dt>
                     <dd>{s.http_port.map(|p| p.to_string()).unwrap_or_else(|| "—".into())}</dd>
                     <dt>"Published ports"</dt>
@@ -486,6 +887,14 @@ fn OverviewTab(
                     })}
                     {s.release_command.clone().map(|r| view! {
                         <dt>"Release command"</dt><dd><code>{r}</code></dd>
+                    })}
+                    {s.healthcheck.clone().map(|h| view! {
+                        <dt>"Health check"</dt>
+                        <dd>{if h.is_disabled() {
+                            view! { <span>"off (the image's own too)"</span> }.into_any()
+                        } else {
+                            view! { <code>{h.command()}</code> }.into_any()
+                        }}</dd>
                     })}
                     {(!s.redirects.is_empty()).then(|| view! {
                         <dt>"Redirects"</dt>
@@ -511,91 +920,55 @@ fn OverviewTab(
                         view! { <dt>"Deploys"</dt><dd title=why>{how}</dd> }
                     })}
                 </dl>
+                }
             })}
-            <Show when=from_git>
-                <UpdateCheckPanel name=name deploying=deploying on_deploy=on_deploy/>
-            </Show>
         </section>
-        <Show when=move || spec().is_some_and(|s| s.stack.is_none())>
-            <super::auto_deploy::AutoDeployPanel
-                path=Signal::derive(move || format!("/api/apps/{}/auto-deploy", name.get()))/>
-        </Show>
+        {move || disk().map(|d| {
+            let written_class = if d.written >= WRITTEN_WARNING { "tile-warn" } else { "" };
+            view! {
+            <section class="card details">
+                <h2 class="section-title">"Disk"</h2>
+                <dl class="kv">
+                    <dt>"Images"</dt>
+                    <dd>{bytes(d.images)}{(d.rollback_images > 0).then(|| view! {
+                        <span class="muted small">{format!(" · with {} kept for rollbacks", d.rollback_images)}</span>
+                    })}</dd>
+                    <dt>"Volumes"</dt>
+                    <dd>{bytes(d.volumes)}</dd>
+                    <dt>"Written in the container"</dt>
+                    <dd class=written_class>
+                        {bytes(d.written)}
+                        <span class="muted small">" · lost on redeploy"</span>
+                    </dd>
+                    {(d.files > 0).then(|| view! { <dt>"Static files"</dt><dd>{bytes(d.files)}</dd> })}
+                    {(d.backups > 0).then(|| view! {
+                        <dt>"Backups"</dt>
+                        <dd>{bytes(d.backups)}<span class="muted small">" · on the server's disk, chunks shared with other apps split"</span></dd>
+                    })}
+                </dl>
+                <p class="muted small kv-foot">{format!("Measured {}.", ago(d.at))}</p>
+                <ImageLayers disk=Signal::stored(Some(d))/>
+            </section>
+            }
+        })}
     }
 }
 
-/// Compares the deployed commit with the branch on demand: fetching the repository
-/// takes a few seconds.
-#[component]
-fn UpdateCheckPanel(
-    name: Memo<String>,
-    deploying: RwSignal<bool>,
-    on_deploy: Callback<Option<String>>,
-) -> impl IntoView {
-    let checking = RwSignal::new(false);
-    let result = RwSignal::new(None::<UpdateCheck>);
-    let error = RwSignal::new(None::<String>);
-    let check = move |_| {
-        checking.set(true);
-        error.set(None);
-        let path = format!("/api/apps/{}/updates", name.get_untracked());
-        spawn_local(async move {
-            match api::act_json::<UpdateCheck>(&path).await {
-                Ok(r) => {
-                    result.try_set(Some(r));
-                }
-                Err(e) => {
-                    result.try_set(None);
-                    error.try_set(Some(e));
-                }
-            }
-            checking.try_set(false);
-        });
-    };
-    let summary = move || {
-        result.get().map(|r| {
-            let branch = r
-                .branch
-                .clone()
-                .unwrap_or_else(|| "the default branch".into());
-            match r.behind {
-                Some(0) => format!("Up to date at {}.", short_hash(&r.latest.hash)),
-                Some(n) => format!(
-                    "{n} commit{} behind {branch}.",
-                    if n == 1 { "" } else { "s" }
-                ),
-                None => format!(
-                    "Latest on {branch}: {} {}",
-                    short_hash(&r.latest.hash),
-                    r.latest.subject
-                ),
-            }
-        })
-    };
-    let outdated = move || result.with(|r| r.as_ref().is_some_and(|r| r.behind != Some(0)));
-    view! {
-        <div class="update-check">
-            <div class="toolbar">
-                <button class="button" disabled=checking on:click=check>
-                    {move || if checking.get() { "Checking…" } else { "Check for updates" }}
-                </button>
-                <span>{summary}</span>
-                <Show when=outdated>
-                    <button class="button button-primary push-right" disabled=deploying
-                        on:click=move |_| on_deploy.run(result.get_untracked().map(|r| r.latest.hash))>
-                        "Update"
-                    </button>
-                </Show>
-            </div>
-            <ErrorNote error=error/>
-            {move || result.get().filter(|r| r.behind != Some(0) && !r.commits.is_empty()).map(|r| view! {
-                <div class="muted small">
-                    {if r.behind.is_some() { "New commits" } else { "Recent commits" }}
-                </div>
-                <ul class="commit-list">
-                    {r.commits.into_iter().map(|c| view! { <CommitRow c=c/> }).collect_view()}
-                </ul>
-            })}
-        </div>
+fn limits(l: &facade_core::Limits) -> String {
+    let mut parts = vec![];
+    if let Some(m) = l.memory_mb {
+        parts.push(format!("{m} MB memory"));
+    }
+    if let Some(c) = l.cpus {
+        parts.push(format!("{} CPU", cpus(c)));
+    }
+    if let Some(p) = l.pids {
+        parts.push(format!("{p} processes"));
+    }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -639,11 +1012,10 @@ fn ImageLayers(#[prop(into)] disk: Signal<Option<AppDiskView>>) -> impl IntoView
         });
         Some(view! {
             <section class="image-layers">
-                <h2 class="section-title">"What its image holds"</h2>
+                <h3 class="subsection-title">"What its image holds"</h3>
                 <p class="muted small">{format!(
-                    "{} in all, largest layers first; each one is a step of its Dockerfile. Measured {}.",
+                    "{} in all, largest layers first; each one is a step of its Dockerfile.",
                     bytes(image),
-                    ago(d.at)
                 )}</p>
                 <ul class="layers">
                     {d.layers.into_iter().map(|l| view! {
@@ -1518,6 +1890,7 @@ fn SettingsTab(
     let form = SpecForm::from_spec(&app.spec);
     let error = RwSignal::new(None::<String>);
     let name = app.spec.name.clone();
+    let auto_deploy = format!("/api/apps/{name}/auto-deploy");
     // Volumes only follow the app to another node when asked to.
     let old_node = StoredValue::new(app.spec.node.clone());
     let had_volumes = !app.spec.volumes.is_empty();
@@ -1544,6 +1917,10 @@ fn SettingsTab(
         );
     };
     view! {
+        // A stack's services deploy with it: the switch is the stack's.
+        {app.spec.stack.is_none().then(|| view! {
+            <super::auto_deploy::AutoDeployPanel path=auto_deploy/>
+        })}
         <form class="card form" on:submit=submit>
             <SpecFields form nodes=Signal::derive(move || nodes.data.get().unwrap_or_default())
                 apps=Signal::derive(move || apps.data.get().unwrap_or_default()) editing=true/>
