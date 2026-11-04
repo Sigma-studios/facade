@@ -357,6 +357,17 @@ p { margin: 0 0 12px; }
 .table tbody tr:hover { background: var(--surface-2); }
 .table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .strong-link { font-weight: 600; color: var(--text-primary); }
+/* Rows that lead where their main link does (see `follow_row`). */
+.table .row-link { cursor: pointer; }
+.table tr.row-link:focus-within, .table tbody.row-link:focus-within tr { background: var(--surface-2); }
+.table-filter { width: 260px; max-width: 100%; padding: 5px 10px; }
+input[type="search"] {
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
 .domains { display: flex; flex-wrap: wrap; gap: 4px 12px; }
 .row-actions { text-align: right; white-space: nowrap; }
 .row-actions .link-button + .link-button { margin-left: 14px; }
@@ -783,6 +794,84 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .commit-subject { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .node-ports { margin-top: 28px; }
 .node-ports .section-title { margin: 0; }
+
+/* ---------------------------------------------------------------- nodes */
+
+/* The overview's nodes, one row each. Not clipped by the wrapper, so the meters'
+   tips can rise above it; narrow, each node becomes a block. */
+.nodes-section { container: nodes / inline-size; }
+.nodes-table-wrap { overflow: visible; }
+.nodes-table th:first-child { border-top-left-radius: var(--radius); }
+.nodes-table th:last-child { border-top-right-radius: var(--radius); }
+.nodes-table tbody:last-child tr:last-child td:first-child { border-bottom-left-radius: var(--radius); }
+.nodes-table tbody:last-child tr:last-child td:last-child { border-bottom-right-radius: var(--radius); }
+.nodes-table td { border-bottom: 0; vertical-align: top; padding: 12px 16px; }
+.nodes-table tbody + tbody > tr:first-child > td { border-top: 1px solid var(--border); }
+.table tbody.row-group:hover tr { background: var(--surface-2); }
+.nodes-table th:first-child, .nodes-table .node-cell { width: 22%; }
+.nodes-table .node-meter { min-width: 0; width: 26%; }
+/* The column header names each meter. */
+.nodes-table .meter-label { display: none; }
+.nodes-table .meter-head { justify-content: flex-end; }
+.nodes-table .meter-row { grid-template-columns: minmax(0, 1fr) 64px; gap: 10px; }
+.node-cell-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
+.nodes-table .node-silent { vertical-align: middle; }
+.nodes-table .node-sub td { padding-top: 0; }
+.nodes-table .node-sub .note { margin-bottom: 0; }
+@container nodes (max-width: 720px) {
+  .nodes-table, .nodes-table tbody, .nodes-table tr, .nodes-table td { display: block; }
+  .nodes-table .node-cell, .nodes-table .node-meter { width: auto; }
+  .nodes-table tbody + tbody > tr:first-child > td { border-top: 0; }
+  .nodes-table tbody + tbody { border-top: 1px solid var(--border); }
+  .nodes-table thead { display: none; }
+  .nodes-table td { padding: 6px 16px; }
+  .nodes-table tr:first-child td:first-child { padding-top: 14px; }
+  .nodes-table tbody > tr:last-child > td:last-child { padding-bottom: 14px; }
+  .nodes-table .node-sub td { padding-top: 6px; }
+  .nodes-table .meter-label { display: inline; }
+  .nodes-table .meter-head { justify-content: space-between; }
+  .nodes-table .meter-row { grid-template-columns: minmax(0, 1fr) 88px; }
+  .nodes-table tbody:last-child tr:last-child td { border-radius: 0 0 var(--radius) var(--radius); }
+}
+
+/* The Nodes page: one node, picked at the top. */
+.node-picker { width: auto; min-width: 140px; font-weight: 600; padding: 5px 10px; }
+.node-title { font-size: 17px; font-weight: 650; }
+.node-meters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 28px; }
+@media (max-width: 900px) { .node-meters { grid-template-columns: 1fr; } }
+.card-actions { flex-wrap: wrap; }
+
+/* ---------------------------------------------------------------- filters */
+
+.filters { margin-bottom: 20px; }
+.filter-select { width: auto; padding: 6px 10px; }
+.filter-select.filter-active, .multi-select-active { border-color: var(--accent); }
+.multi-select { position: relative; }
+.multi-select-button { list-style: none; gap: 8px; max-width: 320px; }
+.multi-select-button::-webkit-details-marker { display: none; }
+.multi-select-label { overflow: hidden; text-overflow: ellipsis; }
+.multi-select-caret { font-size: 10px; color: var(--text-muted); }
+.multi-select-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  min-width: 220px;
+  max-width: min(360px, calc(100vw - 32px));
+  padding: 8px;
+  border-radius: 9px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.14);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.multi-select-search { padding: 5px 9px; }
+.multi-select-options { display: flex; flex-direction: column; max-height: 280px; overflow: auto; }
+.multi-select-options .check { padding: 5px 6px; border-radius: 6px; word-break: break-word; }
+.multi-select-options .check:hover { background: var(--surface-2); }
+.multi-select-clear { align-self: flex-start; padding: 2px 6px; font-size: 12.5px; }
 .provider-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 
 .ports-editor { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }

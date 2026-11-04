@@ -3,16 +3,17 @@ use std::time::Duration;
 use facade_core::api::{
     AlertView, AppDiskView, AppView, NodeView, StatusView, UsagePoint, VolumeView, WRITTEN_WARNING,
 };
-use facade_core::proto::StorageReport;
 use leptos::prelude::*;
 use leptos_router::components::A;
 
-use super::nodes::{NodeDisk, orphaned_on};
+use super::nodes::{
+    IngressNote, StorageNotes, node_meters, not_reporting, orphaned_on, storage_notes_shown,
+};
 use crate::api;
 use crate::components::{
-    DiskMeter, ErrorNote, Loading, Meter, OnlineBadge, Sort, SortKey, SortTh, StateBadge, Trend,
+    ErrorNote, Loading, Meter, OnlineBadge, Sort, SortKey, SortTh, StateBadge, follow_row,
 };
-use crate::util::{ago, bytes, cpus, me, percent, polled};
+use crate::util::{Polled, ago, bytes, cpus, me, percent, polled};
 
 #[component]
 pub fn Overview() -> impl IntoView {
@@ -71,32 +72,9 @@ pub fn Overview() -> impl IntoView {
                 </A>
             </Show>
             <Show when=move || status.loaded() fallback=Loading>
-                <section>
+                <section class="nodes-section">
                     <h2 class="section-title">"Nodes"</h2>
-                    <div class="grid-cards">
-                        <For
-                            each=move || status.data.get().map(|s| s.nodes).unwrap_or_default()
-                            key=|n| (n.name.clone(), n.ingress_errors.clone())
-                            children=move |node| {
-                                // The card stays; its disk part follows the status.
-                                let name = node.name.clone();
-                                let storage = Signal::derive({
-                                    let name = name.clone();
-                                    move || status.data.with(|s| {
-                                        s.as_ref()?.nodes.iter().find(|n| n.name == name)?.storage.clone()
-                                    })
-                                });
-                                let orphaned = orphaned_on(volumes, name.clone());
-                                let connected = node.connected;
-                                view! {
-                                    <div class="node-wrap">
-                                        <NodeCard node trends=true storage/>
-                                        <NodeDisk name connected storage orphaned/>
-                                    </div>
-                                }
-                            }
-                        />
-                    </div>
+                    <NodesTable status volumes/>
                 </section>
                 <section>
                     <div class="section-head">
@@ -114,111 +92,118 @@ pub fn Overview() -> impl IntoView {
     }
 }
 
+/// Every node on one row each: its meters with their last hour, then what its
+/// disk holds and why its apps cannot be reached, if they cannot. A row leads to
+/// the node's page.
 #[component]
-/// `trends` adds each meter's last hour beside it.
-pub fn NodeCard(
-    node: NodeView,
-    #[prop(optional)] trends: bool,
-    /// What takes the disk, followed as reports arrive; else the node's own.
-    #[prop(optional, into)]
-    storage: Option<Signal<Option<StorageReport>>>,
-) -> impl IntoView {
-    let storage = storage.unwrap_or_else({
-        let storage = node.storage.clone();
-        move || Signal::derive(move || storage.clone())
-    });
-    let stats = node.stats.clone();
-    let online = node.connected;
+fn NodesTable(status: Polled<StatusView>, volumes: Polled<Vec<VolumeView>>) -> impl IntoView {
     view! {
-        <article class="card node-card">
-            <header class="card-head">
-                <div>
-                    <h3>{node.name.clone()}</h3>
-                    <div class="muted small">
-                        {node.public_ip.clone().unwrap_or_else(|| "no public IP yet".into())}
-                        {node.stats.as_ref().filter(|s| !s.arch.is_empty()).map(|s| format!(" · {}", s.arch))}
-                        {node.local.then_some(" · this server")}
-                    </div>
-                </div>
-                <OnlineBadge online=online/>
-            </header>
-            {(online && !node.ingress_errors.is_empty()).then(|| view! {
-                <div class="note note-error" role="alert">
-                    <span aria-hidden="true">"⚠ "</span>
-                    "Apps on this node are not reachable over the web: "
-                    {node.ingress_errors.join("; ")}
-                    ". Another program (a web server?) holds the port; façade keeps retrying. "
-                    "The Ports list on the Nodes page shows which."
-                </div>
-            })}
-            {match stats.filter(|_| online) {
-                Some(s) if trends => {
-                    let name = node.name.clone();
-                    let usage = polled(Some(Duration::from_secs(15)), move || {
-                        let name = name.clone();
-                        async move {
-                            api::get::<Vec<UsagePoint>>(&format!("/api/nodes/{name}/usage?range=1h")).await
-                        }
-                    });
-                    let (mem_total, disk_total, cores) = (s.mem_total, s.disk_total, s.cpus);
-                    // The card is not redrawn as the status refreshes: the meters
-                    // follow the usage feed instead.
-                    let latest = move || usage.data.with(|u| u.as_ref().and_then(|u| u.last().cloned()));
-                    let mem_now = move || latest().map_or(s.mem_used, |p| p.mem);
-                    let disk_now = move || latest().and_then(|p| p.disk).unwrap_or(s.disk_used);
-                    let series = move |f: Box<dyn Fn(&UsagePoint) -> f64 + Send + Sync>| {
-                        Signal::derive(move || {
-                            usage.data.with(|u| u.iter().flatten().map(|p| (p.at, f(p))).collect::<Vec<_>>())
-                        })
-                    };
-                    let cpu = series(Box::new(|p| f64::from(p.cpu)));
-                    let mem = series(Box::new(move |p| percent(p.mem, mem_total)));
-                    let disk = series(Box::new(move |p| percent(p.disk.unwrap_or(0), disk_total)));
-                    let span = Signal::derive(|| {
-                        let now = crate::util::now();
-                        (now.saturating_sub(3600), now)
-                    });
-                    view! {
-                        <div class="meters">
-                            <div class="meter-row">
-                                <Meter label="CPU" percent=Signal::derive(move || latest().map_or(s.cpu_percent, |p| p.cpu) as f64)
-                                    detail=Signal::derive(move || format!("{:.0} % of {cores} cores", latest().map_or(s.cpu_percent, |p| p.cpu)))/>
-                                <Trend label="CPU" points=cpu span=span gap=40
-                                    format=Callback::new(|v: f64| format!("{v:.0} %"))/>
-                            </div>
-                            <div class="meter-row">
-                                <Meter label="Memory" percent=Signal::derive(move || percent(mem_now(), mem_total))
-                                    detail=Signal::derive(move || format!("{} / {}", bytes(mem_now()), bytes(mem_total)))/>
-                                <Trend label="Memory" points=mem span=span gap=40
-                                    format=Callback::new(move |v: f64| bytes((v / 100.0 * mem_total as f64) as u64))/>
-                            </div>
-                            <div class="meter-row">
-                                <DiskMeter storage used=Signal::derive(disk_now) total=disk_total/>
-                                <Trend label="Disk" points=disk span=span gap=40
-                                    format=Callback::new(move |v: f64| bytes((v / 100.0 * disk_total as f64) as u64))/>
-                            </div>
-                        </div>
-                    }.into_any()
+        <div class="table-wrap nodes-table-wrap">
+            <table class="table nodes-table">
+                <thead>
+                    <tr><th>"Node"</th><th>"CPU"</th><th>"Memory"</th><th>"Disk"</th></tr>
+                </thead>
+                <For
+                    each=move || status.data.get().map(|s| s.nodes).unwrap_or_default()
+                    key=|n| (n.name.clone(), n.connected, n.stats.as_ref().map(|s| (s.cpus, s.mem_total, s.disk_total)))
+                    children=move |node| view! { <NodeRow node status volumes/> }
+                />
+            </table>
+        </div>
+    }
+}
+
+/// A node's rows in [`NodesTable`], grouped in a `tbody`. They are not redrawn as
+/// the status refreshes: the meters follow the node's usage feed, the rest the
+/// status.
+#[component]
+fn NodeRow(
+    node: NodeView,
+    status: Polled<StatusView>,
+    volumes: Polled<Vec<VolumeView>>,
+) -> impl IntoView {
+    let name = node.name.clone();
+    let current = Signal::derive({
+        let name = name.clone();
+        move || {
+            status
+                .data
+                .with(|s| s.as_ref()?.nodes.iter().find(|n| n.name == name).cloned())
+        }
+    });
+    let storage = Signal::derive(move || current.with(|n| n.as_ref()?.storage.clone()));
+    let errors = Signal::derive(move || {
+        current.with(|n| {
+            n.as_ref()
+                .filter(|n| n.connected)
+                .map(|n| n.ingress_errors.clone())
+                .unwrap_or_default()
+        })
+    });
+    let orphaned = orphaned_on(volumes, name.clone());
+    let has_notes = storage_notes_shown(storage, orphaned);
+    let meters = node.stats.clone().filter(|_| node.connected).map(|s| {
+        let usage = polled(Some(Duration::from_secs(15)), {
+            let name = name.clone();
+            move || {
+                let name = name.clone();
+                async move {
+                    api::get::<Vec<UsagePoint>>(&format!("/api/nodes/{name}/usage?range=1h")).await
                 }
-                Some(s) => view! {
-                    <div class="meters">
-                        <Meter label="CPU" percent=s.cpu_percent as f64
-                            detail=format!("{:.0} % of {} cores", s.cpu_percent, s.cpus)/>
-                        <Meter label="Memory" percent=percent(s.mem_used, s.mem_total)
-                            detail=format!("{} / {}", bytes(s.mem_used), bytes(s.mem_total))/>
-                        <DiskMeter storage used=s.disk_used total=s.disk_total/>
+            }
+        });
+        let snapshot = s.clone();
+        let now = Signal::derive(move || {
+            let latest = usage
+                .data
+                .with(|u| u.as_ref().and_then(|u| u.last().cloned()));
+            match latest {
+                Some(p) => (p.cpu, p.mem, p.disk.unwrap_or(snapshot.disk_used)),
+                None => (snapshot.cpu_percent, snapshot.mem_used, snapshot.disk_used),
+            }
+        });
+        node_meters(&s, now, storage, Some(usage))
+    });
+    let href = format!("/nodes/{name}");
+    view! {
+        <tbody class="row-link row-group" on:click=follow_row on:mouseup=follow_row>
+            <tr>
+                <td class="node-cell">
+                    <div class="node-cell-head">
+                        <A href=href.clone() attr:class="strong-link row-link-main">{name.clone()}</A>
+                        <OnlineBadge online=node.connected/>
                     </div>
-                }.into_any(),
-                None => view! {
-                    <p class="muted small">
-                        {match node.last_seen {
-                            Some(at) => format!("Last seen {}", ago(at)),
-                            None => "Start its agent with the join command from the Nodes page.".into(),
-                        }}
-                    </p>
-                }.into_any(),
-            }}
-        </article>
+                    <div class="muted small">
+                        {move || current.with(|n| n.as_ref().map(|n| {
+                            let mut facts = vec![n.public_ip.clone().unwrap_or_else(|| "no public IP yet".into())];
+                            if let Some(s) = n.stats.as_ref().filter(|s| !s.arch.is_empty()) {
+                                facts.push(s.arch.clone());
+                            }
+                            if n.local {
+                                facts.push("this server".into());
+                            }
+                            facts.join(" · ")
+                        }))}
+                    </div>
+                </td>
+                {match meters {
+                    Some(meters) => meters.into_iter().map(|m| view! { <td class="node-meter">{m}</td> }).collect_view().into_any(),
+                    None => view! { <td colspan="3" class="muted small node-silent">{not_reporting(&node)}</td> }.into_any(),
+                }}
+            </tr>
+            <Show when=move || errors.with(|e| !e.is_empty())>
+                <tr class="node-sub">
+                    <td colspan="4"><IngressNote errors here=false/></td>
+                </tr>
+            </Show>
+            <Show when=move || has_notes.get()>
+                <tr class="node-sub">
+                    <td colspan="4" class="small muted">
+                        <StorageNotes storage orphaned volumes_href=format!("{href}#volumes")/>
+                    </td>
+                </tr>
+            </Show>
+        </tbody>
     }
 }
 
@@ -261,9 +246,9 @@ pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
                                 let href = format!("/apps/{}", app.spec.name);
                                 let stats = app.stats.clone().filter(|s| s.mem_used > 0);
                                 view! {
-                                    <tr>
+                                    <tr class="row-link" on:click=follow_row on:mouseup=follow_row>
                                         <td>
-                                            <A href=href attr:class="strong-link">{app.spec.name.clone()}</A>
+                                            <A href=href attr:class="strong-link row-link-main">{app.spec.name.clone()}</A>
                                             {app.owner.clone().map(|owner| view! {
                                                 <Show when=move || me.is_admin()>
                                                     <div class="muted small">{format!("owned by {owner}")}</div>

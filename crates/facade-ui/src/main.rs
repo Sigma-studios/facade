@@ -36,6 +36,7 @@ fn App() -> impl IntoView {
                     <Route path=path!("builds") view=pages::builds::Builds/>
                     <Route path=path!("apps/:name") view=pages::app::AppPage/>
                     <Route path=path!("nodes") view=pages::nodes::Nodes/>
+                    <Route path=path!("nodes/:name") view=pages::nodes::Nodes/>
                     <Route path=path!("domains") view=pages::domains::Domains/>
                     // Alerts moved to Settings; old links still land there.
                     <Route path=path!("alerts") view=|| view! { <Redirect path="/settings/alerts"/> }/>
