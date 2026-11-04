@@ -172,25 +172,57 @@ fn app_label(d: &DomainStatus) -> String {
     d.app.clone().unwrap_or_else(|| "façade itself".into())
 }
 
-/// Columns: domain, app, node, DNS, HTTPS.
+/// Columns: domain, app, node, points to, certificate, expires. A check sorts
+/// worst first, then by its value.
 fn sort_key(col: usize, d: &DomainStatus) -> SortKey {
     match col {
         0 => SortKey::text(&d.domain),
         1 => SortKey::text(app_label(d)),
         2 => SortKey::text(&d.node),
-        3 => SortKey::num(Some(dns_state(d) as u8)),
-        _ => SortKey::num(Some(https_state(d) as u8)),
+        3 => SortKey::text(format!(
+            "{}{}",
+            dns_state(d) as u8,
+            d.expected_ip.as_deref().unwrap_or_default()
+        )),
+        4 => SortKey::text(format!(
+            "{}{}",
+            https_state(d) as u8,
+            d.certificate.as_deref().unwrap_or_default()
+        )),
+        _ => SortKey::num(d.cert_expires.map(|t| t as f64)),
     }
 }
 
 /// Domains with their DNS and certificate status, also used on an app's page
-/// (`show_app` off: app and node are the page's).
+/// (`show_app` off: app and node are the page's). A healthy row is three short
+/// facts (address, certificate, expiry); only a row with a problem spells it out,
+/// and what is automatic is said once, under the table.
 #[component]
 pub fn DomainTable(
     #[prop(into)] domains: Signal<Vec<DomainStatus>>,
     show_app: bool,
 ) -> impl IntoView {
     let sort = Sort::new();
+    // A node column that always says the same thing is noise.
+    let show_node = Memo::new(move |_| {
+        show_app
+            && domains.with(|d| {
+                d.iter()
+                    .any(|x| d.first().is_some_and(|f| f.node != x.node))
+            })
+    });
+    let note = move || {
+        domains.with(|d| {
+            let managed = d.iter().any(|d| d.managed);
+            let manual = d.iter().any(|d| !d.managed);
+            let dns = match (managed, manual) {
+                (true, false) => "façade keeps every DNS record up to date. ",
+                (true, true) => "façade keeps the DNS records of its provider up to date; the others are set by hand. ",
+                _ => "DNS records are set by hand at the domain provider. ",
+            };
+            format!("{dns}Certificates renew automatically before they expire.")
+        })
+    };
     view! {
         <Show
             when=move || domains.with(|d| !d.is_empty())
@@ -200,55 +232,39 @@ pub fn DomainTable(
                 <table class="table">
                     <thead><tr>
                         <SortTh sort=sort col=0 label="Domain"/>
-                        {show_app.then(|| view! {
-                            <SortTh sort=sort col=1 label="App"/>
-                            <SortTh sort=sort col=2 label="Node"/>
-                        })}
-                        <SortTh sort=sort col=3 label="DNS"/>
-                        <SortTh sort=sort col=4 label="HTTPS"/>
+                        {show_app.then(|| view! { <SortTh sort=sort col=1 label="App"/> })}
+                        {move || show_node.get().then(|| view! { <SortTh sort=sort col=2 label="Node"/> })}
+                        <SortTh sort=sort col=3 label="Points to"/>
+                        <SortTh sort=sort col=4 label="Certificate"/>
+                        <SortTh sort=sort col=5 label="Expires" num=true/>
                     </tr></thead>
                     <tbody>
                         <For each=move || {
                                 let mut rows = domains.get();
                                 sort.apply(&mut rows, sort_key);
-                                rows
+                                let node = show_node.get();
+                                rows.into_iter().map(|d| (d, node)).collect::<Vec<_>>()
                             }
-                            key=|d| (d.domain.clone(), d.app.clone(), d.dns_ok, d.certificate.clone(), d.dns_error.clone(), d.cert_error.clone(), d.resolved.clone(), d.expected_ip.clone())
-                            let:d>
-                            <DomainRow d=d show_app=show_app/>
+                            key=|(d, node)| (d.domain.clone(), d.app.clone(), d.dns_ok, d.certificate.clone(), d.cert_expires, d.dns_error.clone(), d.cert_error.clone(), d.resolved.clone(), d.expected_ip.clone(), d.managed, *node)
+                            let:row>
+                            <DomainRow d=row.0 show_app=show_app show_node=row.1/>
                         </For>
                     </tbody>
                 </table>
             </div>
+            <p class="muted small table-note">{note}</p>
         </Show>
     }
 }
 
-#[component]
-fn DomainRow(d: DomainStatus, show_app: bool) -> impl IntoView {
-    let ip = d.expected_ip.clone();
-    let (dns_class, dns_icon, dns_label) = match dns_state(&d) {
-        Check::Failed if d.dns_error.is_some() => ("critical", "✕", "error"),
-        Check::Failed => ("critical", "✕", "missing"),
-        Check::Pending => ("busy", "◐", "propagating"),
-        Check::Ok => ("good", "●", "ok"),
-    };
-    let (cert_class, cert_icon, cert_label) = match https_state(&d) {
-        Check::Failed => ("critical", "✕", "failed"),
-        Check::Pending => ("busy", "◐", "pending"),
-        Check::Ok => ("good", "●", "valid"),
-    };
-    let dns_detail = match (&d.dns_error, d.dns_ok, d.managed, &ip) {
+/// What to do about a DNS record that does not point where it must yet.
+fn dns_problem(d: &DomainStatus) -> String {
+    match (&d.dns_error, d.managed, &d.expected_ip) {
         (Some(e), ..) => e.clone(),
-        (None, true, true, Some(ip)) => {
-            format!("Points to {ip}. Record kept up to date by façade.")
-        }
-        (None, true, false, Some(ip)) => format!("Points to {ip}."),
-        (None, true, _, None) => "Resolves.".into(),
-        (None, false, true, Some(ip)) => {
+        (None, true, Some(ip)) => {
             format!("façade set the record to {ip}; it can take a few minutes to be visible.")
         }
-        (None, false, false, Some(ip)) => format!(
+        (None, false, Some(ip)) => format!(
             "Create an A record pointing to {ip} at your domain provider.{}",
             if d.resolved.is_empty() {
                 String::new()
@@ -256,23 +272,93 @@ fn DomainRow(d: DomainStatus, show_app: bool) -> impl IntoView {
                 format!(" It points to {} now.", d.resolved.join(", "))
             }
         ),
-        (None, false, _, None) => format!(
+        (None, _, None) => format!(
             "Node {} has no known public IP: set it on the Nodes page.",
             d.node
         ),
-    };
-    let cert_detail = match (&d.cert_error, &d.certificate) {
-        (Some(e), _) => e.clone(),
-        (None, Some(name)) => {
-            let until = d.cert_expires.map(crate::util::date).unwrap_or_default();
-            if name.starts_with("*.") {
-                format!("Wildcard {name}, until {until}, renewed automatically.")
+    }
+}
+
+#[component]
+fn DomainRow(d: DomainStatus, show_app: bool, show_node: bool) -> impl IntoView {
+    let points_to = match dns_state(&d) {
+        Check::Ok => {
+            let ip = d.expected_ip.clone().unwrap_or_else(|| "resolves".into());
+            let how = if d.managed {
+                "record kept up to date by façade"
             } else {
-                format!("Until {until}, renewed automatically.")
+                "record set by hand"
+            };
+            view! {
+                <span class="badge badge-good" title=how>
+                    <span class="badge-icon" aria-hidden="true">"●"</span><code>{ip}</code>
+                </span>
             }
+            .into_any()
         }
-        (None, None) => "Requested once the DNS record points to the node.".into(),
+        state => {
+            let (class, icon, label) = match state {
+                Check::Failed if d.dns_error.is_some() => ("critical", "✕", "error"),
+                Check::Failed => ("critical", "✕", "missing"),
+                _ => ("busy", "◐", "propagating"),
+            };
+            view! {
+                <span class=format!("badge badge-{class}")>
+                    <span class="badge-icon" aria-hidden="true">{icon}</span>{label}
+                </span>
+                <div class="small check-detail">{dns_problem(&d)}</div>
+            }
+            .into_any()
+        }
     };
+    let certificate = match (&d.cert_error, &d.certificate) {
+        (None, Some(name)) => {
+            let label = if name.starts_with("*.") {
+                name.clone()
+            } else {
+                "its own".into()
+            };
+            // Where the table is too narrow for an Expires column, the date goes here.
+            let until = d
+                .cert_expires
+                .map(|at| format!("until {}", crate::util::date(at)));
+            view! {
+                <span class="badge badge-good" title=format!("Certificate for {name}")>
+                    <span class="badge-icon" aria-hidden="true">"●"</span>{label}
+                </span>
+                {until.map(|u| view! { <div class="small muted cert-until">{u}</div> })}
+            }
+            .into_any()
+        }
+        (error, _) => {
+            let (class, icon, label, detail) = match error {
+                Some(e) => ("critical", "✕", "failed", e.clone()),
+                None => (
+                    "busy",
+                    "◐",
+                    "pending",
+                    "Requested once the DNS record points to the node.".to_string(),
+                ),
+            };
+            view! {
+                <span class=format!("badge badge-{class}")>
+                    <span class="badge-icon" aria-hidden="true">{icon}</span>{label}
+                </span>
+                <div class="small check-detail">{detail}</div>
+            }
+            .into_any()
+        }
+    };
+    let expires = match (d.cert_error.is_none(), d.cert_expires) {
+        (true, Some(at)) => Some(crate::util::date(at)),
+        _ => None,
+    };
+    let expires_class = if expires.is_some() {
+        "num expires-cell"
+    } else {
+        "num expires-cell expires-none"
+    };
+    let expires = expires.unwrap_or_else(|| "—".into());
     let app = d.app.clone();
     view! {
         <tr>
@@ -286,20 +372,13 @@ fn DomainRow(d: DomainStatus, show_app: bool) -> impl IntoView {
                         None => view! { <span class="muted">"façade itself"</span> }.into_any(),
                     }}
                 </td>
-                <td class="muted">{d.node.clone()}</td>
             })}
-            <td class="check-cell">
-                <span class=format!("badge badge-{dns_class}")>
-                    <span class="badge-icon" aria-hidden="true">{dns_icon}</span>{dns_label}
-                </span>
-                <div class="small check-detail">{dns_detail}</div>
-            </td>
-            <td class="check-cell">
-                <span class=format!("badge badge-{cert_class}")>
-                    <span class="badge-icon" aria-hidden="true">{cert_icon}</span>{cert_label}
-                </span>
-                <div class="small check-detail">{cert_detail}</div>
-            </td>
+            {show_node.then(|| view! { <td class="muted node-cell">{d.node.clone()}</td> })}
+            // On a phone the row is lines: the name, its app, then the checks.
+            <td class="row-break" aria-hidden="true"></td>
+            <td class="check-cell">{points_to}</td>
+            <td class="check-cell">{certificate}</td>
+            <td class=expires_class>{expires}</td>
         </tr>
     }
 }

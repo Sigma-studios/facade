@@ -1041,9 +1041,20 @@ select.filter-select { width: auto; appearance: none; -webkit-appearance: none; 
 
 .domain-table td { vertical-align: top; }
 .domain-table { margin-bottom: 24px; }
-.domain-table .domain-cell, .domain-table .app-cell { white-space: nowrap; }
+.domain-table .domain-cell { overflow-wrap: break-word; }
+.domain-table .app-cell { overflow-wrap: break-word; }
+.domain-table .row-break, .domain-table .cert-until { display: none; }
+/* Too narrow for an Expires column (but not a phone): the date goes under the certificate. */
+@media (min-width: 761px) and (max-width: 1180px) {
+  .domain-table th:last-child, .domain-table .expires-cell { display: none; }
+  .domain-table .cert-until { display: block; margin-top: 4px; }
+}
 .domain-table .domain-name { word-break: normal; }
-.domain-table .check-cell { min-width: 220px; }
+.domain-table .check-cell { max-width: 300px; }
+.domain-table .badge { white-space: nowrap; }
+.domain-table .expires-cell { white-space: nowrap; }
+.domain-table .badge code { font-size: inherit; background: none; padding: 0; }
+.table-note { margin: -16px 0 24px; }
 .check-detail { margin-top: 4px; color: var(--text-secondary); word-break: break-word; }
 a.tab { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
 .tab-count { line-height: 16px; padding: 0 6px; }
@@ -1056,12 +1067,16 @@ a.tab { display: inline-flex; align-items: center; gap: 6px; text-decoration: no
 /* On a phone each domain is a block: its checks matter more than the columns. */
 @media (max-width: 760px) {
   .domain-table thead { display: none; }
-  .domain-table table, .domain-table tbody, .domain-table tr, .domain-table td { display: block; }
-  .domain-table tr { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .domain-table table, .domain-table tbody { display: block; }
+  .domain-table tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
   .domain-table tr:last-child { border-bottom: 0; }
-  .domain-table td { padding: 2px 0; border: 0; min-width: 0; }
-  .domain-table .app-cell, .domain-table .app-cell + td { display: inline-block; margin-right: 10px; }
-  .domain-table .check-cell { margin-top: 6px; }
+  .domain-table td { display: block; padding: 0; border: 0; min-width: 0; }
+  .domain-table .domain-cell { flex-basis: 100%; }
+  .domain-table .row-break { display: block; flex-basis: 100%; height: 2px; }
+  .domain-table .check-cell { max-width: 100%; }
+  .domain-table .expires-cell { text-align: left; }
+  .domain-table .expires-cell::before { content: "until "; color: var(--text-secondary); }
+  .domain-table .expires-none { display: none; }
 }
 
 /* ---------------------------------------------------------------- image layers */
