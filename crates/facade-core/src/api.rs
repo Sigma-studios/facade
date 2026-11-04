@@ -98,6 +98,16 @@ pub struct AppView {
     /// From the node's last storage report (every 15 minutes).
     #[serde(default)]
     pub disk: Option<AppDiskView>,
+    /// CPU throttling and disk activity over the last five minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent: Option<crate::resources::ResourcePoint>,
+}
+
+/// A volume's size over time: `(at, bytes)`, oldest first.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeSizes {
+    pub volume: String,
+    pub points: Vec<(u64, u64)>,
 }
 
 /// What an app takes on its node's disk.
@@ -605,6 +615,12 @@ pub struct UsagePoint {
     /// Client connections open through the entry point, on average.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connections: Option<f64>,
+    /// CPU throttling, disk activity, pressure (see [`crate::resources`]).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::resources::ResourcePoint::is_empty"
+    )]
+    pub resources: crate::resources::ResourcePoint,
 }
 
 impl UsagePoint {

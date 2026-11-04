@@ -44,6 +44,7 @@ impl NodeSampler {
             uptime: System::uptime(),
             net_rx: traffic.0,
             net_tx: traffic.1,
+            resources: super::resources::node_resources(),
         }
     }
 }

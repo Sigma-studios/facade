@@ -2610,6 +2610,7 @@ impl Runtime {
             net_tx: 0,
             restarts: 0,
             traffic: None,
+            resources: Default::default(),
         };
         if w.spec.is_static() {
             stats.state = match (w.spec.enabled, self.static_root(w).is_ok()) {
@@ -2653,7 +2654,14 @@ impl Runtime {
                 one_shot: false,
             }),
         );
-        if let Some(Ok(s)) = stream.next().await {
+        let sample = stream.next().await.and_then(Result::ok);
+        stats.resources = super::resources::app_resources(
+            state.pid,
+            w.spec.limits.cpus.is_some(),
+            sample.as_ref(),
+            state.health.as_ref(),
+        );
+        if let Some(s) = sample {
             let cpu = s.cpu_stats.unwrap_or_default();
             let pre = s.precpu_stats.unwrap_or_default();
             let total = |c: &bollard::models::ContainerCpuStats| {

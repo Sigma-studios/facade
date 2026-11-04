@@ -613,6 +613,12 @@ pub struct NodeStats {
     pub net_rx: u64,
     #[serde(default)]
     pub net_tx: u64,
+    /// Pressure, disk activity and time waiting on disk (older agents send none).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::resources::NodeResources::is_empty"
+    )]
+    pub resources: crate::resources::NodeResources,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -629,6 +635,13 @@ pub struct AppStats {
     /// routes to it (no domain) or the entry point cannot tell (an older one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic: Option<Traffic>,
+    /// CPU throttling, disk activity, processes, health checks (older agents
+    /// send none).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::resources::AppResources::is_empty"
+    )]
+    pub resources: crate::resources::AppResources,
 }
 
 /// Upper bounds, in milliseconds, of the buckets response times are counted

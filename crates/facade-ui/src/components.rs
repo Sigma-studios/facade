@@ -195,7 +195,7 @@ pub struct Sample {
 }
 
 impl Sample {
-    fn known(&self) -> bool {
+    pub fn known(&self) -> bool {
         !self.value.is_nan()
     }
 }
@@ -230,7 +230,9 @@ fn runs(points: &[Sample], gap: u64) -> Vec<Vec<Sample>> {
 /// `bare`: only the plot, for a row that already names it and gives its value
 /// (with the time axis below if `axis`). `extra`: a second series drawn over
 /// the first in the alert colour (errors among requests), named `extra_label`;
-/// in a second series colour if `calm`.
+/// in a second series colour if `calm`; `label` then names the first in the
+/// legend. `limit`: a dashed line at that value (a memory limit). `bands`:
+/// periods `(from, to)` shaded behind the lines (CPU throttling).
 #[component]
 pub fn Sparkline(
     title: &'static str,
@@ -246,9 +248,15 @@ pub fn Sparkline(
     /// The second series is another figure, not an alarm (a second colour).
     #[prop(optional)]
     calm: bool,
+    #[prop(optional)] label: &'static str,
+    #[prop(optional, into)] limit: Option<Signal<Option<f64>>>,
+    #[prop(optional, into)] bands: Option<Signal<Vec<(u64, u64)>>>,
+    #[prop(optional)] bands_label: &'static str,
 ) -> impl IntoView {
     let hover = RwSignal::new(None::<usize>);
     let extra = extra.unwrap_or_else(|| Signal::stored(Vec::new()));
+    let limit = limit.unwrap_or_else(|| Signal::stored(None));
+    let bands = bands.unwrap_or_else(|| Signal::stored(Vec::new()));
     let scale = move || {
         let top = |p: &Vec<Sample>| {
             p.iter()
@@ -257,7 +265,11 @@ pub fn Sparkline(
                 .fold(0.0_f64, f64::max)
         };
         let data_max = points.with(top).max(extra.with(top));
-        max.get().unwrap_or(0.0).max(data_max).max(1e-9)
+        max.get()
+            .unwrap_or(0.0)
+            .max(limit.get().unwrap_or(0.0))
+            .max(data_max)
+            .max(1e-9)
     };
     let x_of = move |at: u64| {
         let (start, end) = span.get();
@@ -336,8 +348,14 @@ pub fn Sparkline(
                         </Show>
                         <Show when=move || extra.with(|e| e.iter().any(Sample::known))>
                             <span class="spark-key">
+                                {(!label.is_empty()).then(|| view! {
+                                    <span class="spark-key-avg"></span>{label}
+                                })}
                                 <span class="spark-key-extra"></span>{extra_label}
                             </span>
+                        </Show>
+                        <Show when=move || bands.with(|b| !b.is_empty())>
+                            <span class="spark-key"><span class="spark-key-band"></span>{bands_label}</span>
                         </Show>
                     </span>
                     <span class="spark-now">{move || current().unwrap_or_else(|| "—".into())}</span>
@@ -350,8 +368,21 @@ pub fn Sparkline(
                 <div class="spark-plot" on:mousemove=on_move on:mouseleave=move |_| hover.set(None)>
                     <svg viewBox=format!("0 0 {SPARK_W} {SPARK_H}") preserveAspectRatio="none"
                         role="img" aria-label=title>
+                        {move || bands.get().into_iter().map(|(from, to)| {
+                            let (x0, x1) = (x_of(from), x_of(to));
+                            view! {
+                                <rect class="spark-band" x=x0 y="0" width=(x1 - x0).max(2.0) height=SPARK_H/>
+                            }
+                        }).collect_view()}
                         <line class="spark-base" x1="0" x2=SPARK_W y1=SPARK_H y2=SPARK_H
                             vector-effect="non-scaling-stroke"/>
+                        {move || limit.get().map(|l| {
+                            let y = y_of(l);
+                            view! {
+                                <line class="spark-limit" x1="0" x2=SPARK_W y1=y y2=y
+                                    vector-effect="non-scaling-stroke"/>
+                            }
+                        })}
                         <path class="spark-area" d=move || path(|s| s.value, true)/>
                         <Show when=has_peaks>
                             <path class="spark-peak" d=move || path(|s| s.peak, false)
@@ -380,16 +411,26 @@ pub fn Sparkline(
                                 .find(|e| e.at == s.at && e.known())
                                 .map(|e| format!("{extra_label} {}", format(e.value)))
                         });
+                        let banded = bands
+                            .with(|b| b.iter().any(|(from, to)| (*from..=*to).contains(&s.at)))
+                            .then_some(bands_label);
                         view! {
                             <div class="spark-tip" style=format!("left: {left:.1}%")>
                                 <strong>{format(s.value)}</strong>
                                 {peak.map(|p| view! { <span>{p}</span> })}
                                 {also.map(|a| view! { <span class="spark-tip-extra">{a}</span> })}
+                                {banded.map(|b| view! { <span>{b}</span> })}
                                 <span>{stamp(s.at)}</span>
                             </div>
                         }
                     })}
                     <div class="spark-scale">{move || format(scale())}</div>
+                    // Named where it is drawn: no legend line for it.
+                    {move || limit.get().map(|l| view! {
+                        <div class="spark-limit-label" style=format!("top: {:.1}%", y_of(l) / SPARK_H * 100.0)>
+                            "limit"
+                        </div>
+                    })}
                 </div>
                 {(!bare || axis).then(|| view! {
                     <div class="spark-axis">
@@ -472,6 +513,17 @@ pub struct UsageFeed {
     pub p50: Signal<Vec<Sample>>,
     /// Client connections open through the entry point.
     pub connections: Signal<Vec<Sample>>,
+    /// The periods the CPU limit held it back in, as bands.
+    pub throttle_bands: Signal<Vec<(u64, u64)>>,
+    /// Disk bytes per second read and written.
+    pub disk_read: Signal<Vec<Sample>>,
+    pub disk_write: Signal<Vec<Sample>>,
+    /// A node's pressure: percent of the time tasks waited for CPU, memory,
+    /// disk; and CPU time idle waiting on disk.
+    pub pressure_cpu: Signal<Vec<Sample>>,
+    pub pressure_mem: Signal<Vec<Sample>>,
+    pub pressure_io: Signal<Vec<Sample>>,
+    pub io_wait: Signal<Vec<Sample>>,
     pub span: Signal<(u64, u64)>,
     pub gap: Signal<u64>,
 }
@@ -530,12 +582,20 @@ pub fn UsageCharts(
         errors,
         p95,
         p50,
+        throttle_bands,
+        disk_read,
+        disk_write,
         span,
         gap,
         ..
     } = feed;
     let traffic = feed.has_traffic();
     let none = Signal::stored(None);
+    // Containers whose disk activity the agent cannot read show no chart.
+    let disk_known = Signal::derive(move || {
+        disk_read.with(|d| d.iter().any(Sample::known))
+            || disk_write.with(|d| d.iter().any(Sample::known))
+    });
 
     view! {
         <Show when=move || resources.get() || traffic.get()>
@@ -545,10 +605,16 @@ pub fn UsageCharts(
             </div>
             <div class="charts charts-app">
                 <Show when=move || resources.get()>
-                    <Sparkline title="CPU" points=cpu span=span gap=gap max=cpu_max format=|v| format!("{v:.1} %")/>
-                    <Sparkline title="Memory" points=mem span=span gap=gap max=mem_max format=|v| bytes(v as u64)/>
+                    <Sparkline title="CPU" points=cpu span=span gap=gap max=cpu_max format=|v| format!("{v:.1} %")
+                        bands=throttle_bands bands_label="held back"/>
+                    <Sparkline title="Memory" points=mem span=span gap=gap max=mem_max format=|v| bytes(v as u64)
+                        limit=mem_max/>
                     <Sparkline title="Network in" points=net_in span=span gap=gap max=none format=byte_rate
                         extra=net_out extra_label="out" calm=true/>
+                    <Show when=move || disk_known.get()>
+                        <Sparkline title="Disk activity" points=disk_read span=span gap=gap max=none format=byte_rate
+                            extra=disk_write label="read" extra_label="write" calm=true/>
+                    </Show>
                 </Show>
                 <Show when=move || traffic.get()>
                     <Sparkline title="Requests" points=requests span=span gap=gap max=none format=per_second
@@ -650,6 +716,29 @@ pub fn usage_feed(url: Signal<String>, range: Signal<Range>) -> UsageFeed {
     let p95 = rates(|p| p.p95_ms);
     let p50 = rates(|p| p.p50_ms);
     let connections = rates(|p| p.connections);
+    let throttled = rates(|p| p.resources.throttled);
+    let disk_read = rates(|p| p.resources.disk_read);
+    let disk_write = rates(|p| p.resources.disk_write);
+    let pressure_cpu = rates(|p| p.resources.pressure_cpu);
+    let pressure_mem = rates(|p| p.resources.pressure_mem);
+    let pressure_io = rates(|p| p.resources.pressure_io);
+    let io_wait = rates(|p| p.resources.io_wait);
+    // Each point covers the step before it: runs of throttled points become
+    // one band.
+    let throttle_bands = Signal::derive(move || {
+        let step = range.get().step();
+        let mut bands: Vec<(u64, u64)> = Vec::new();
+        throttled.with(|t| {
+            for s in t.iter().filter(|s| s.value >= THROTTLE_SHOWN) {
+                let from = s.at.saturating_sub(step);
+                match bands.last_mut() {
+                    Some(last) if last.1 + step / 2 >= from => last.1 = s.at,
+                    _ => bands.push((from, s.at)),
+                }
+            }
+        });
+        bands
+    });
     let span = Signal::derive(move || {
         let now = crate::util::now();
         (now.saturating_sub(range.get().secs()), now)
@@ -666,10 +755,21 @@ pub fn usage_feed(url: Signal<String>, range: Signal<Range>) -> UsageFeed {
         p95,
         p50,
         connections,
+        throttle_bands,
+        disk_read,
+        disk_write,
+        pressure_cpu,
+        pressure_mem,
+        pressure_io,
+        io_wait,
         span,
         gap,
     }
 }
+
+/// Percent of its periods an app must be held back in to be called throttled:
+/// less is noise (a burst at start-up).
+pub const THROTTLE_SHOWN: f64 = 1.0;
 
 /// A page's tabs; `active` is the key of the one shown.
 #[component]

@@ -16,6 +16,7 @@ mod inspect;
 mod monitor;
 mod registry;
 mod release;
+mod resources;
 pub mod secrets;
 mod settings;
 mod stack;
@@ -432,6 +433,7 @@ impl Server {
     pub fn record_report(&self, node: &str, report: facade_core::proto::NodeReport) {
         let at = facade_core::now();
         let mut live = self.live.write();
+        let mut pending = resources::Pending::new(&report);
         let mut usage = Vec::new();
         // What the apps' counters grew by since their last readings, and
         // whether one started again (a new entry point): what it counted in
@@ -474,6 +476,7 @@ impl Server {
             if app.state != AppState::Building {
                 app.state = stats.state;
             }
+            pending.app(&stats, app.history.back());
             app.stats = Some(stats.clone());
             push_capped(&mut app.history, AppMetric { at, stats });
         }
@@ -502,6 +505,7 @@ impl Server {
             total.open = added.open;
             total.clone()
         });
+        let node_resources = report.node.resources.clone();
         let node_usage = UsageSample {
             name: node.to_string(),
             cpu: report.node.cpu_percent,
@@ -520,6 +524,7 @@ impl Server {
             },
         );
         drop(live);
+        pending.store(self, at, node, &node_resources);
         if let Err(e) = self
             .store
             .record_usage(UsageOf::App, at, &usage)

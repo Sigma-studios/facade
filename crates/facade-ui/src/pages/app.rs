@@ -4,9 +4,10 @@ use facade_core::api::{
     AppDiskView, AppView, AutoDeployMethod, AutoDeployView, BackupReport, BackupRequest,
     BackupView, CommitView, DeployRequest, DeploymentStatus, DeploymentView, DomainStatus,
     EnvPatch, EnvView, ImageUpdateCheck, NodeView, SetEnv, SetOwner, UpdateCheck, UserView,
-    VolumeView, WRITTEN_WARNING,
+    VolumeSizes, VolumeView, WRITTEN_WARNING,
 };
 use facade_core::proto::AppState;
+use facade_core::resources::{HealthCheck, failing_streak};
 use facade_core::{Build, Source};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -17,7 +18,10 @@ use uuid::Uuid;
 use super::domains::DomainTable;
 use super::spec_form::{SpecFields, SpecForm};
 use crate::api;
-use crate::components::{ErrorNote, Loading, Menu, Modal, StateBadge, TabBar, UsageCharts};
+use crate::components::{
+    ErrorNote, Loading, Menu, Modal, StateBadge, THROTTLE_SHOWN, TabBar, UsageCharts,
+};
+use crate::gauges::{HealthStrip, LimitBar, VolumeTrend};
 use crate::util::{
     Polled, ago, bytes, clock, cpus, date, me, percent, polled, run, short_hash, strip_ansi, toasts,
 };
@@ -698,6 +702,38 @@ fn OverviewTab(
             .map(|m| (m * 1024 * 1024) as f64)
     });
     let is_static = move || spec().is_some_and(|s| s.is_static());
+    let mem_limit = move || {
+        spec()
+            .and_then(|s| s.limits.memory_mb)
+            .map(|m| m * 1024 * 1024)
+    };
+    let mem_share = Signal::derive(move || match (stats(), mem_limit()) {
+        (Some(s), Some(limit)) => percent(s.mem_used, limit),
+        _ => 0.0,
+    });
+    // Over the last five minutes, when it is held back at all.
+    let throttled = move || {
+        app.get()
+            .and_then(|a| a.recent)
+            .and_then(|r| r.throttled)
+            .filter(|t| *t >= THROTTLE_SHOWN)
+    };
+    let pids = move || stats().and_then(|s| s.resources.pids_warning());
+    // The check's last runs, as Docker keeps them: failing when the last did.
+    let health = move || stats().map(|s| s.resources.health).unwrap_or_default();
+    let failing = move || {
+        let checks = health();
+        let streak = failing_streak(&checks);
+        (streak > 0).then(|| {
+            let last = checks.last().map(|c| c.output.clone()).unwrap_or_default();
+            let times = if streak == 1 {
+                "once".to_string()
+            } else {
+                format!("{streak} times in a row")
+            };
+            format!("Failed {times}. {last}").trim().to_string()
+        })
+    };
     let domains = polled(Some(Duration::from_secs(30)), || async {
         api::get::<Vec<DomainStatus>>("/api/domains").await
     });
@@ -710,16 +746,57 @@ fn OverviewTab(
                 {move || disk().filter(|d| d.files > 0).map(|d| format!(" Its files take {}.", bytes(d.files)))}
             </p>
         }>
+            <Show when=move || failing().is_some() || pids().is_some()>
+                <div class="overview-warnings">
+                    {move || failing().map(|why| view! {
+                        <A href=info_href attr:class="badge badge-critical" attr:title=why>
+                            <span class="badge-icon" aria-hidden="true">"✕"</span>
+                            "health check failing"
+                        </A>
+                    })}
+                    {move || pids().map(|(now, limit)| view! {
+                        <span class="badge badge-serious"
+                            title="Processes and threads running now, against its limit (--pids): at the limit it cannot start more">
+                            <span class="badge-icon" aria-hidden="true">"▲"</span>
+                            {format!("{now} of {limit} processes")}
+                        </span>
+                    })}
+                </div>
+            </Show>
             <div class="tiles">
                 <div class="tile">
                     <span class="tile-label">"CPU"</span>
                     <span class="tile-value">{move || stats().map(|s| format!("{:.1} %", s.cpu_percent)).unwrap_or_else(|| "—".into())}</span>
                     <span class="tile-sub">{move || spec().and_then(|s| s.limits.cpus).map(|c| format!("limit {} CPU", cpus(c))).unwrap_or_else(|| "no limit".into())}</span>
+                    {move || throttled().map(|t| view! {
+                        <span class="tile-sub tile-serious"
+                            title="Over the last 5 minutes: the share of its CPU limit's 100 ms periods in which it used its whole quota and had to wait">
+                            <span aria-hidden="true">"▲ "</span>
+                            {format!("held back {t:.0} % of the time")}
+                        </span>
+                    })}
                 </div>
                 <div class="tile">
                     <span class="tile-label">"Memory"</span>
-                    <span class="tile-value">{move || stats().filter(|s| s.mem_used > 0).map(|s| bytes(s.mem_used)).unwrap_or_else(|| "—".into())}</span>
-                    <span class="tile-sub">{move || spec().and_then(|s| s.limits.memory_mb).map(|m| format!("limit {m} MB")).unwrap_or_else(|| "no limit".into())}</span>
+                    {move || match (stats().filter(|s| s.mem_used > 0), mem_limit()) {
+                        (Some(s), Some(limit)) => view! {
+                            <span class="tile-value">
+                                <span class="tile-num">{bytes(s.mem_used)}</span>
+                                // A space to wrap at on a narrow tile.
+                                {" "}
+                                <span class="tile-of">{format!("of {}", bytes(limit))}</span>
+                            </span>
+                            <LimitBar label="Memory against its limit" percent=mem_share/>
+                        }.into_any(),
+                        (None, Some(m)) => view! {
+                            <span class="tile-value">"—"</span>
+                            <span class="tile-sub">{format!("limit {}", bytes(m))}</span>
+                        }.into_any(),
+                        (s, None) => view! {
+                            <span class="tile-value">{s.map(|s| bytes(s.mem_used)).unwrap_or_else(|| "—".into())}</span>
+                            <span class="tile-sub">"no limit"</span>
+                        }.into_any(),
+                    }}
                 </div>
                 <div class="tile">
                     <span class="tile-label">"Restarts"</span>
@@ -860,6 +937,20 @@ fn InfoTab(#[prop(into)] app: Signal<Option<AppView>>) -> impl IntoView {
     let spec = move || app.get().map(|a| a.spec);
     let commit = move || app.get().and_then(|a| a.commit);
     let disk = move || app.get().and_then(|a| a.disk);
+    let name = Memo::new(move |_| app.with(|a| a.as_ref().map(|a| a.spec.name.clone())));
+    let checks = polled(Some(Duration::from_secs(30)), move || {
+        let name = name.get();
+        async move {
+            match name {
+                Some(name) => {
+                    api::get::<Vec<HealthCheck>>(&format!("/api/apps/{name}/health-checks")).await
+                }
+                None => Ok(Vec::new()),
+            }
+        }
+    });
+    let checks = Signal::derive(move || checks.data.get().unwrap_or_default());
+    let has_checks = move || checks.with(|c| !c.is_empty());
     view! {
         <section class="card details">
             <h2 class="section-title">"Configuration"</h2>
@@ -922,8 +1013,15 @@ fn InfoTab(#[prop(into)] app: Signal<Option<AppView>>) -> impl IntoView {
                         <dd>{if h.is_disabled() {
                             view! { <span>"off (the image's own too)"</span> }.into_any()
                         } else {
-                            view! { <code>{h.command()}</code> }.into_any()
+                            view! { <code>{h.command()}</code> <HealthStrip checks/> }.into_any()
                         }}</dd>
+                    })}
+                    // The image's own HEALTHCHECK runs too.
+                    {s.healthcheck.is_none().then(|| view! {
+                        <Show when=has_checks>
+                            <dt>"Health check"</dt>
+                            <dd><span>"the image's own"</span> <HealthStrip checks/></dd>
+                        </Show>
                     })}
                     {(!s.redirects.is_empty()).then(|| view! {
                         <dt>"Redirects"</dt>
@@ -1648,6 +1746,21 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
         let name = name.get();
         async move { api::get::<Vec<BackupView>>(&format!("/api/backups?app={name}")).await }
     });
+    // Measured with the node's storage report, every 15 minutes, kept hourly.
+    let sizes = polled(Some(Duration::from_secs(300)), move || {
+        let name = name.get();
+        async move { api::get::<Vec<VolumeSizes>>(&format!("/api/apps/{name}/volume-sizes")).await }
+    });
+    let trend = move |volume: &str| {
+        let points = sizes.data.with(|s| {
+            s.as_ref()?
+                .iter()
+                .find(|v| v.volume == volume)
+                .map(|v| v.points.clone())
+        })?;
+        let now = crate::util::now();
+        Some(view! { <VolumeTrend points span=(now.saturating_sub(30 * 86400), now)/> })
+    };
 
     let backing_up = RwSignal::new(false);
     let back_up = move |_| {
@@ -1756,6 +1869,7 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
                             <th>"Volume"</th>
                             <th>"Mounted at"</th>
                             <th class="num">"Size"</th>
+                            <th class="volume-trend-head" title="Its size over the last 30 days">"30 days"</th>
                             <th>"Last backup"</th>
                             <th></th>
                         </tr>
@@ -1777,6 +1891,10 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
                                             None => view! { <span class="muted">"not used any more"</span> }.into_any(),
                                         }}</td>
                                         <td class="num">{v.size.map(bytes).unwrap_or_else(|| "—".into())}</td>
+                                        <td class="volume-trend-cell">{
+                                            let volume = v.volume.clone();
+                                            move || trend(&volume)
+                                        }</td>
                                         <td class="muted">{v.last_backup.map(ago).unwrap_or_else(|| "never".into())}</td>
                                         <td class="row-actions">
                                             <button class="link-button"

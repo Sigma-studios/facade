@@ -1177,3 +1177,59 @@ a.tab { display: inline-flex; align-items: center; gap: 6px; text-decoration: no
 .layer-fill { display: block; height: 100%; background: var(--series-1); border-radius: 4px; }
 .layer-size { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
 .layer-step { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 12.5px; }
+
+/* ---------------------------------------------------------------- resources */
+
+/* The reference palette's "serious" status, between warning and critical: an
+   app close to a limit. Like the others, always with an icon and words. */
+:root {
+  --serious: #ec835a;
+  --serious-text: #a8461d;
+  --serious-soft: #fdeee6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --serious-text: #f2a07e;
+    --serious-soft: #3a2519;
+  }
+}
+.badge-serious { background: var(--serious-soft); color: var(--serious-text); }
+.badge-serious .badge-icon { color: var(--serious); }
+.tile-serious { color: var(--serious-text); }
+.tile-num { white-space: nowrap; }
+.tile-of { font-size: 12.5px; font-weight: 400; color: var(--text-muted); letter-spacing: 0; white-space: nowrap; }
+.overview-warnings { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+a.badge:hover { text-decoration: none; filter: brightness(0.97); }
+
+/* A thin bar against a limit: orange past 80 %, red past 95 %. */
+.limit-bar { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.limit-track { flex: 1; height: 4px; background: var(--surface-2); border-radius: 2px; overflow: hidden; }
+.limit-fill { height: 100%; background: var(--series-1); border-radius: 2px; transition: width 0.4s ease; }
+.limit-serious .limit-fill { background: var(--serious); }
+.limit-critical .limit-fill { background: var(--critical); }
+.limit-icon { font-size: 11px; line-height: 1; color: var(--serious-text); }
+.limit-critical .limit-icon { color: var(--critical); }
+.mem-cell-bar { width: 72px; margin-left: auto; }
+.mem-cell-bar .limit-bar { margin-top: 3px; }
+
+/* On charts: a dashed line at a limit, shaded periods behind the lines. */
+.spark-limit { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 5 4; }
+.spark-band { fill: var(--serious); fill-opacity: 0.2; }
+.spark-limit-label { position: absolute; right: 0; transform: translateY(-100%); font-size: 11px; color: var(--text-muted); pointer-events: none; }
+.spark-key-band { display: inline-block; width: 10px; height: 10px; background: var(--serious); opacity: 0.35; border-radius: 2px; margin-left: 4px; }
+.spark-key-calm { border-top-color: var(--series-2); }
+.spark-legend { display: flex; align-items: center; gap: 5px; margin-top: 2px; }
+.metric-sub-split { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+/* Pressure: three short lines in one panel. */
+.pressure-panel .spark-bare .spark-plot, .pressure-panel .spark-bare .spark-empty { height: 34px; }
+
+/* Health checks, one square each, oldest first. */
+.health-strip { display: flex; flex-wrap: wrap; gap: 2px; margin: 6px 0 2px; max-width: 620px; }
+.health-check { width: 8px; height: 8px; border-radius: 2px; }
+.health-ok { background: var(--good); }
+.health-failed { background: var(--critical); box-shadow: inset 0 0 0 1.5px var(--critical-text); }
+
+/* A volume's size over 30 days. */
+.volume-trend { display: block; width: 120px; height: 24px; }
+.volume-trend svg { width: 100%; height: 100%; display: block; overflow: visible; }
+@media (max-width: 760px) { .volume-trend-head, .volume-trend-cell { display: none; } }
