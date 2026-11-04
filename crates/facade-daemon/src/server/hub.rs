@@ -247,8 +247,13 @@ pub async fn listen(server: Arc<Server>) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding node listener {}", server.cfg.node_listen))?;
     info!("node listener on {}", server.cfg.node_listen);
-    let acceptor =
-        tokio_rustls::TlsAcceptor::from(tls::single_cert_server(server.identity.key.clone()));
+    let mut config = (*tls::single_cert_server(server.identity.key.clone())).clone();
+    // Agents never resume sessions. A ticket sent to an agent that only writes
+    // (a volume export) stays unread in its socket, and closing a socket with
+    // unread data resets the connection instead of ending it: the server then
+    // loses what it had not read yet (the end of the export).
+    config.send_tls13_tickets = 0;
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     loop {
         let (tcp, peer) = listener.accept().await?;
         let server = server.clone();
