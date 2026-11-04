@@ -623,7 +623,8 @@ cache. `facade node prune <node> [--aggressive]` (or the Nodes page) does it now
 
 `facade node disk <node>` (or the Nodes page) breaks the disk down: images, build
 cache, volumes (sized ones measured by their own filesystem), what containers wrote,
-facade's own files, backups (on the server's node, with the apps taking the most), and
+facade's own files, backups (on the server's node, with the apps taking the most:
+each app's chunks counted once, those several apps hold split between them), and
 the rest of the system; then each app's share. An app's Overview tab (and `facade app
 show`) shows its own, with the largest layers of the image it runs.
 What an app writes inside its container, outside volumes, is lost on redeploy: past
@@ -678,6 +679,18 @@ database and master key. They are on the server's disk: take copies elsewhere wi
 the key to its secrets, in one file). `facade backup run [app]` backs up now and
 `facade backup restore <app> <volume> <id>` puts a backup back. A failed backup is
 an alert.
+
+Backups are incremental: the volume's tar is cut into chunks (512 KiB on average,
+cut where the contents say, so an insertion only moves the cuts around it), and
+each chunk is stored once, compressed, however many backups hold it. A backup
+takes what changed since the others: `facade backup ls` shows `2.0 GB, 14 MB new`
+(what a full copy would take, and what it added), and, for admins, what the store
+takes in all. Chunks no backup holds any more are deleted after each run.
+`facade backup check` reads every chunk back and checks it against its hash; a
+damaged one is deleted, so that the next backup stores it again. Downloads are
+still `.tar.gz`, reassembled on the fly. Full copies from before incremental
+backups stay listed, downloadable and restorable, and count towards the 7: one
+goes with each new backup.
 
 Pausing captures files at one instant, which is not enough for a program that
 keeps part of its state in memory (a game server writing its world now and then).
@@ -819,8 +832,8 @@ the server; older ones need the server's `facaded` installed by hand.
 ## Not there yet
 
 * Links across nodes: a database and the apps using it share a node.
-* Backups to somewhere other than the server's disk (S3 and the like), and
-  incremental backups: each run is a full compressed copy of every volume.
+* Backups to somewhere other than the server's disk (S3 and the like). Chunks and
+  manifests never change once written, so a copy would only send the new ones.
 * Webhooks from forges other than GitHub (GitLab, Gitea…): their repositories are
   polled.
 * Zero downtime for apps that cannot overlap (published ports, the node's network,
