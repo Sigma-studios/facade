@@ -818,7 +818,11 @@ fn backups_hint(storage: &StorageReport) -> String {
     let mut hint =
         "Volume backups of every node's apps, and copies of the server's database.".to_string();
     if !named.is_empty() {
-        hint += &format!(" Largest: {}.", named.join(", "));
+        // Backups share chunks: each app's count once, those of several apps split.
+        hint += &format!(
+            " Largest: {} (a chunk several apps' backups hold is split between them).",
+            named.join(", ")
+        );
     }
     hint
 }

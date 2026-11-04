@@ -159,6 +159,24 @@ impl Hub {
         create: Option<facade_core::proto::NewVolume>,
         path: &std::path::Path,
     ) -> anyhow::Result<()> {
+        let file = tokio::fs::File::open(path).await?;
+        let size = file.metadata().await?.len();
+        self.import_volume_from(node, app, volume, create, file, size)
+            .await
+    }
+
+    /// Replaces the volume's contents with the `size` bytes of archive read from
+    /// `archive`. The agent receives them all before touching the volume, so an
+    /// archive failing to read midway changes nothing.
+    pub async fn import_volume_from(
+        &self,
+        node: &str,
+        app: &str,
+        volume: &str,
+        create: Option<facade_core::proto::NewVolume>,
+        mut archive: impl tokio::io::AsyncRead + Unpin,
+        size: u64,
+    ) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt;
         let (a, v) = (app.to_string(), volume.to_string());
         let mut stream = self
@@ -169,10 +187,11 @@ impl Hub {
                 create,
             })
             .await?;
-        let mut file = tokio::fs::File::open(path).await?;
-        let size = file.metadata().await?.len();
         stream.write_all(format!("{size}\n").as_bytes()).await?;
-        tokio::io::copy(&mut file, &mut stream).await?;
+        let sent = tokio::io::copy(&mut archive, &mut stream).await?;
+        if sent != size {
+            bail!("the archive ended after {sent} of {size} bytes");
+        }
         stream.flush().await?;
         let answer = read_line_unbuffered(&mut stream)
             .await
@@ -224,8 +243,13 @@ pub async fn listen(server: Arc<Server>) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding node listener {}", server.cfg.node_listen))?;
     info!("node listener on {}", server.cfg.node_listen);
-    let acceptor =
-        tokio_rustls::TlsAcceptor::from(tls::single_cert_server(server.identity.key.clone()));
+    let mut config = (*tls::single_cert_server(server.identity.key.clone())).clone();
+    // Agents never resume sessions. A ticket sent to an agent that only writes
+    // (a volume export) stays unread in its socket, and closing a socket with
+    // unread data resets the connection instead of ending it: the server then
+    // loses what it had not read yet (the end of the export).
+    config.send_tls13_tickets = 0;
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
     loop {
         let (tcp, peer) = listener.accept().await?;
         let server = server.clone();

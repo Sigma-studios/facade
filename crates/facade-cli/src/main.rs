@@ -582,6 +582,9 @@ enum BackupCommand {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Read back every chunk of every incremental backup and check it is intact
+    /// (damaged ones are deleted, so the next backup stores them again).
+    Check,
     /// Download the server's database and master key (everything facade knows,
     /// secrets included: keep it safe).
     Server {
@@ -3482,6 +3485,8 @@ fn backups_note(s: &facade_core::proto::StorageReport) -> String {
         if top.len() > named.len() {
             note += &format!(", {} more", top.len() - named.len());
         }
+        // Each app's chunks count once; a chunk several apps hold is split.
+        note += " (shared chunks split)";
     }
     note
 }
@@ -3730,10 +3735,37 @@ async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()>
                         b.volume.clone(),
                         b.id.to_string(),
                         output::date(b.id),
-                        bytes(b.size),
+                        backup_size(b),
                     ]
                 }),
             );
+            // Admins only: it covers every app's backups.
+            if let Ok(store) = api.get::<BackupStoreView>("/api/backups/store").await
+                && store.snapshots + store.full_copies > 0
+            {
+                println!();
+                println!("{}", store_summary(&store));
+            }
+        }
+        BackupCommand::Check => {
+            let report: BackupCheckReport = api
+                .json(api.request(Method::POST, "/api/backups/check"))
+                .await?;
+            if json {
+                return print_json(&report);
+            }
+            println!(
+                "{} chunk(s) read back intact, {} problem(s)",
+                report.verified,
+                report.problems.len()
+            );
+            for problem in &report.problems {
+                println!("  {problem}");
+            }
+            println!("{}", store_summary(&report.store));
+            if !report.problems.is_empty() {
+                bail!("the backup store has problems");
+            }
         }
         BackupCommand::Run { app } => {
             let report: BackupReport = api
@@ -3750,7 +3782,7 @@ async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()>
                     "saved {}/{} ({}), id {}",
                     b.app,
                     b.volume,
-                    bytes(b.size),
+                    backup_size(b),
                     b.id
                 );
             }
@@ -3820,6 +3852,33 @@ async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+/// `2.0 GB, 14 MB new` for an incremental backup (what a full copy would take,
+/// and what it added to the store); `1.6 GB, full copy` for the others.
+fn backup_size(b: &BackupView) -> String {
+    match b.added {
+        Some(added) => format!("{}, {} new", bytes(b.size), bytes(added)),
+        None => format!("{}, full copy", bytes(b.size)),
+    }
+}
+
+fn store_summary(s: &BackupStoreView) -> String {
+    let mut line = format!(
+        "backup store: {} on disk for {} incremental backup(s) ({} as full copies)",
+        bytes(s.chunk_bytes),
+        s.snapshots,
+        bytes(s.snapshot_bytes)
+    );
+    if s.full_copies > 0 {
+        line += &format!(
+            ", {} for {} full cop{}",
+            bytes(s.full_copy_bytes),
+            s.full_copies,
+            if s.full_copies == 1 { "y" } else { "ies" }
+        );
+    }
+    line
 }
 
 async fn user(api: &Api, cmd: UserCommand, json: bool) -> anyhow::Result<()> {

@@ -678,7 +678,7 @@ fn disk_detail(d: AppDiskView) -> String {
     }
     if d.backups > 0 {
         lines.push(format!(
-            "Backups, on the server's disk: {}",
+            "Backups, on the server's disk: {} (chunks shared with other apps split)",
             bytes(d.backups)
         ));
     }
@@ -1403,7 +1403,7 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
                             <tr>
                                 <th>"Taken"</th>
                                 <th>"Volume"</th>
-                                <th class="num">"Size"</th>
+                                <th class="num" title="What a full copy of the volume takes, compressed">"Size"</th>
                                 <th></th>
                             </tr>
                         </thead>
@@ -1422,7 +1422,23 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
                                                 <span class="muted small">{format!(" · {}", ago(b.id))}</span>
                                             </td>
                                             <td><code>{b.volume.clone()}</code></td>
-                                            <td class="num">{bytes(b.size)}</td>
+                                            <td class="num">
+                                                {bytes(b.size)}
+                                                {match b.added {
+                                                    Some(added) => view! {
+                                                        <span class="muted small"
+                                                            title="What this backup added to the store; the rest it shares with other backups.">
+                                                            {format!(" · {} new", bytes(added))}
+                                                        </span>
+                                                    }.into_any(),
+                                                    None => view! {
+                                                        <span class="muted small"
+                                                            title="A full copy, from before incremental backups.">
+                                                            " · full copy"
+                                                        </span>
+                                                    }.into_any(),
+                                                }}
+                                            </td>
                                             <td class="row-actions">
                                                 <button class="link-button"
                                                     on:click=move |_| download(path.clone(), fallback.clone())>"Download"</button>

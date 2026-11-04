@@ -164,6 +164,8 @@ pub fn router(server: Arc<Server>) -> Router {
             put(set_registry_login).delete(delete_registry_login),
         )
         .route("/api/backups", get(list_backups).post(run_backups))
+        .route("/api/backups/store", get(backup_store))
+        .route("/api/backups/check", post(check_backups))
         .route("/api/backups/{app}/{volume}/{id}", get(download_backup))
         .route(
             "/api/backups/{app}/{volume}/{id}/restore",
@@ -2854,10 +2856,22 @@ async fn download_backup(
     Path((app, volume, id)): Path<(String, String, u64)>,
 ) -> ApiResult<Response> {
     load_app_for(&server, &user, &app)?;
-    let path = super::backups::path(&server, &app, &volume, id).map_err(not_found)?;
-    let file = tokio::fs::File::open(&path)
-        .await
-        .context("opening backup")?;
+    let body = match super::backups::find(&server, &app, &volume, id).map_err(not_found)? {
+        super::backups::Stored::Full(path) => {
+            let file = tokio::fs::File::open(&path)
+                .await
+                .context("opening backup")?;
+            Body::from_stream(tokio_util::io::ReaderStream::new(file))
+        }
+        // Gzipped on the fly, like the full copies. A damaged chunk ends the
+        // download with an error, before the gzip trailer.
+        super::backups::Stored::Snapshot(path) => {
+            let (_, tar) = super::backups::snapshot_stream(&server, &path, true)
+                .await
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Body::from_stream(tar)
+        }
+    };
     Ok((
         [
             (header::CONTENT_TYPE, "application/gzip".to_string()),
@@ -2866,9 +2880,26 @@ async fn download_backup(
                 format!("attachment; filename=\"{app}-{volume}-{id}.tar.gz\""),
             ),
         ],
-        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+        body,
     )
         .into_response())
+}
+
+/// What volume backups take on the server's disk, every app's together.
+async fn backup_store(State(server): S, user: User) -> ApiResult<Json<BackupStoreView>> {
+    user.require_admin()?;
+    Ok(Json(super::backups::store_view(&server).await?))
+}
+
+async fn check_backups(State(server): S, user: User) -> ApiResult<Json<BackupCheckReport>> {
+    user.require_admin()?;
+    let report = super::backups::check(&server).await?;
+    if report.problems.is_empty() {
+        info!(chunks = report.verified, "backup store checked");
+    } else {
+        warn!(problems = ?report.problems, "backup store checked");
+    }
+    Ok(Json(report))
 }
 
 async fn restore_backup(
