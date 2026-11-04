@@ -484,12 +484,15 @@ impl Ingress {
         let mut retiring = self.retiring.subscribe();
         // That app counts it as open until it closes (or turns into a
         // WebSocket, which counts on its own).
-        let open = Arc::new(OnceLock::<Open>::new());
+        // One reference to clone per request, as before bytes were counted.
+        let conn = Arc::new((OnceLock::<Open>::new(), tally));
         let service = hyper::service::service_fn(move |req| {
             let ingress = self.clone();
-            let open = open.clone();
-            let tally = tally.clone();
-            async move { Ok::<_, Infallible>(ingress.handle(req, peer, tls, &open, &tally).await) }
+            let conn = conn.clone();
+            async move {
+                let (open, tally) = &*conn;
+                Ok::<_, Infallible>(ingress.handle(req, peer, tls, open, tally).await)
+            }
         });
         let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
         let conn = builder.serve_connection_with_upgrades(io, service);
