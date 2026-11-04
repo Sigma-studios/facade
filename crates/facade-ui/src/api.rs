@@ -147,6 +147,10 @@ pub async fn delete(path: &str) -> Result<(), String> {
         .map(|_| ())
 }
 
+pub async fn delete_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
+    decode(call(Method::DELETE, path, Body::None, None).await?).await
+}
+
 /// Uploads a file as an executable artifact.
 pub async fn upload(file: &web_sys::File) -> Result<facade_core::api::ArtifactView, String> {
     let name = String::from(js_sys::encode_uri_component(&file.name()));
