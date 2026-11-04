@@ -4,6 +4,7 @@
 mod client;
 mod exec;
 mod output;
+mod resources;
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
@@ -3327,6 +3328,13 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
             if json {
                 return print_json(&metrics);
             }
+            let summary = resources::node_summary(&metrics);
+            for line in &summary {
+                println!("{line}");
+            }
+            if !summary.is_empty() {
+                println!();
+            }
             let counted = metrics.iter().any(|m| m.traffic.is_some());
             let mut headers = vec!["AT", "CPU", "LOAD", "MEMORY", "DISK"];
             if counted {
@@ -4353,8 +4361,14 @@ fn print_apps(apps: &[AppView]) {
 /// The samples of the last hour, newest first: what each report said, with
 /// what changed since the one before as rates.
 fn print_app_metrics(metrics: &[AppMetric]) {
-    if let Some(traffic) = traffic_summary(metrics) {
-        println!("last {} minutes: {traffic}\n", TRAFFIC_SUMMARY / 60);
+    let summaries = [traffic_summary(metrics), resources::app_summary(metrics)];
+    let summaries: Vec<String> = summaries.into_iter().flatten().collect();
+    if !summaries.is_empty() {
+        println!(
+            "last {} minutes: {}\n",
+            TRAFFIC_SUMMARY / 60,
+            summaries.join(" · ")
+        );
     }
     let counted = metrics.iter().any(|m| m.stats.traffic.is_some());
     let mut headers = vec!["AT", "STATE", "CPU", "MEMORY", "NET IN", "NET OUT"];
@@ -4647,6 +4661,9 @@ fn print_app_detail(view: &AppView) {
             bytes(s.mem_used),
             s.restarts
         );
+    }
+    if let Some(line) = resources::app_detail(view) {
+        println!("resources: {line}");
     }
     if let Some(d) = view.disk.as_ref().filter(|d| d.total() > 0) {
         let mut parts = vec![format!("{} images", bytes(d.images))];
