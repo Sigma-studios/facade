@@ -6,6 +6,7 @@ use leptos::task::spawn_local;
 use leptos_router::components::A;
 use leptos_router::hooks::{use_navigate, use_query_map};
 
+use super::insights::ReachBadge;
 use crate::api;
 use crate::components::{ErrorNote, FilterSelect, Loading, Sort, SortKey, SortTh};
 use crate::util::{me, polled, run, toasts};
@@ -93,7 +94,11 @@ pub fn Domains() -> impl IntoView {
     let problems = move || {
         shown.with(|d| {
             d.iter()
-                .filter(|d| dns_state(d) == Check::Failed || https_state(d) == Check::Failed)
+                .filter(|d| {
+                    dns_state(d) == Check::Failed
+                        || https_state(d) == Check::Failed
+                        || d.reach.as_ref().is_some_and(|r| !r.ok)
+                })
                 .count()
         })
     };
@@ -172,8 +177,8 @@ fn app_label(d: &DomainStatus) -> String {
     d.app.clone().unwrap_or_else(|| "façade itself".into())
 }
 
-/// Columns: domain, app, node, points to, certificate, expires. A check sorts
-/// worst first, then by its value.
+/// Columns: domain, app, node, points to, certificate, expires, reachable (shown
+/// before expires). A check sorts worst first, then by its value.
 fn sort_key(col: usize, d: &DomainStatus) -> SortKey {
     match col {
         0 => SortKey::text(&d.domain),
@@ -189,7 +194,13 @@ fn sort_key(col: usize, d: &DomainStatus) -> SortKey {
             https_state(d) as u8,
             d.certificate.as_deref().unwrap_or_default()
         )),
-        _ => SortKey::num(d.cert_expires.map(|t| t as f64)),
+        5 => SortKey::num(d.cert_expires.map(|t| t as f64)),
+        // Unreachable first (longest first), then the slowest.
+        _ => SortKey::num(d.reach.as_ref().map(|r| match r.down_since {
+            Some(since) => -1e12 + since as f64,
+            None if !r.ok => -1e11,
+            None => -f64::from(r.ms.unwrap_or(0)),
+        })),
     }
 }
 
@@ -236,6 +247,7 @@ pub fn DomainTable(
                         {move || show_node.get().then(|| view! { <SortTh sort=sort col=2 label="Node"/> })}
                         <SortTh sort=sort col=3 label="Points to"/>
                         <SortTh sort=sort col=4 label="Certificate"/>
+                        {show_app.then(|| view! { <SortTh sort=sort col=6 label="Reachable"/> })}
                         <SortTh sort=sort col=5 label="Expires" num=true/>
                     </tr></thead>
                     <tbody>
@@ -245,7 +257,7 @@ pub fn DomainTable(
                                 let node = show_node.get();
                                 rows.into_iter().map(|d| (d, node)).collect::<Vec<_>>()
                             }
-                            key=|(d, node)| (d.domain.clone(), d.app.clone(), d.dns_ok, d.certificate.clone(), d.cert_expires, d.dns_error.clone(), d.cert_error.clone(), d.resolved.clone(), d.expected_ip.clone(), d.managed, *node)
+                            key=|(d, node)| (d.domain.clone(), d.app.clone(), d.dns_ok, d.certificate.clone(), d.cert_expires, d.dns_error.clone(), d.cert_error.clone(), d.resolved.clone(), d.expected_ip.clone(), d.managed, *node, d.reach.as_ref().map(|r| (r.ok, r.ms, r.checked_at, r.down_since)))
                             let:row>
                             <DomainRow d=row.0 show_app=show_app show_node=row.1/>
                         </For>
@@ -360,10 +372,14 @@ fn DomainRow(d: DomainStatus, show_app: bool, show_node: bool) -> impl IntoView 
     };
     let expires = expires.unwrap_or_else(|| "—".into());
     let app = d.app.clone();
+    // The outside check: its own column on the Domains page, next to the name
+    // on an app's.
+    let reach = d.reach.clone();
     view! {
         <tr>
             <td class="domain-cell">
                 <a class="domain-name" href=format!("https://{}", d.domain) target="_blank" rel="noopener">{d.domain.clone()}</a>
+                {(!show_app).then(|| view! { " " <ReachBadge reach=reach.clone()/> })}
             </td>
             {show_app.then(|| view! {
                 <td class="app-cell">
@@ -378,6 +394,14 @@ fn DomainRow(d: DomainStatus, show_app: bool, show_node: bool) -> impl IntoView 
             <td class="row-break" aria-hidden="true"></td>
             <td class="check-cell">{points_to}</td>
             <td class="check-cell">{certificate}</td>
+            {show_app.then(|| view! {
+                <td class="check-cell reach-cell">
+                    {match reach {
+                        Some(r) => view! { <ReachBadge reach=Some(r)/> }.into_any(),
+                        None => view! { <span class="muted">"—"</span> }.into_any(),
+                    }}
+                </td>
+            })}
             <td class=expires_class>{expires}</td>
         </tr>
     }

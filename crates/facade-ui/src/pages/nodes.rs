@@ -552,6 +552,7 @@ fn NodeMetrics(
                 <div class="metric-sub">"Out"</div>
                 <Sparkline title="Sent" points=net_out span=span gap=gap max=Signal::stored(None)
                     format=rate bare=true axis=true/>
+                <super::insights::NodeMonth name=name.clone()/>
             </section>
             // Its apps' requests through its entry point, added up.
             <Show when=move || traffic.get()>

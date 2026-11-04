@@ -1177,3 +1177,48 @@ a.tab { display: inline-flex; align-items: center; gap: 6px; text-decoration: no
 .layer-fill { display: block; height: 100%; background: var(--series-1); border-radius: 4px; }
 .layer-size { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
 .layer-step { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 12.5px; }
+
+/* ---------------------------------------------------------------- availability, visitors, failed requests */
+
+/* The header's availability figure, and the 30-day bar it opens: a segment per
+   day, green when up, red where down, grey where stopped or unknown. */
+.uptime-figure { font-size: inherit; }
+.uptime { margin: -8px 0 20px; max-width: 760px; }
+.uptime-bar { display: flex; gap: 2px; height: 14px; }
+.uptime-day { position: relative; flex: 1; border-radius: 2px; overflow: hidden; background: var(--surface-2); }
+.uptime-day:hover { outline: 2px solid var(--border-strong); outline-offset: 1px; }
+.uptime-up, .uptime-cut { position: absolute; top: 0; bottom: 0; }
+.uptime-day > .uptime-up { left: 0; }
+.uptime-up { background: var(--good); }
+.uptime-down { background: var(--critical); }
+.uptime-none { background: var(--border-strong); }
+.uptime-axis { display: flex; justify-content: space-between; gap: 12px; margin: 6px 0 4px; font-size: 11.5px; color: var(--text-muted); }
+.uptime-key { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-content: center; }
+.uptime-swatch { position: static; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-left: 8px; }
+.uptime p { margin: 0; }
+
+.reach-badge { margin-left: 4px; vertical-align: 1px; }
+.domain-table .reach-cell .reach-badge { margin-left: 0; }
+
+/* Visitors per day: one thin bar each, today's darker. */
+.vchart { margin: 16px 0 0; }
+.vchart-plot { position: relative; height: 120px; padding-top: 16px; }
+.vbars { display: flex; align-items: flex-end; gap: 2px; height: 100%; border-bottom: 1px solid var(--border-strong); }
+.vbar-slot { flex: 1; height: 100%; display: flex; align-items: flex-end; cursor: crosshair; }
+.vbar { width: 100%; min-height: 1px; background: var(--series-1); border-radius: 4px 4px 0 0; opacity: 0.85; }
+.vbar-slot:hover .vbar, .vbar-on { opacity: 1; filter: brightness(1.15); }
+.vbar-today { opacity: 1; }
+.metric-month { font-size: 13px; font-variant-numeric: tabular-nums; }
+
+.errors { margin-bottom: 24px; }
+.errors .toolbar .segmented { align-self: center; }
+.errors-table .error-path code { word-break: break-all; }
+.status-code { font-variant-numeric: tabular-nums; font-weight: 600; }
+.status-5xx { color: var(--critical-text); }
+.status-4xx { color: var(--text-primary); }
+.table-more { margin-top: 8px; }
+.errors .table-note { margin: 8px 0 0; }
+@media (max-width: 760px) {
+  .errors .table th, .errors .table td { padding: 8px 10px; }
+  .errors .table-filter { width: 100%; }
+}

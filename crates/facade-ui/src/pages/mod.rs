@@ -5,6 +5,7 @@ pub mod auto_deploy;
 pub mod builds;
 pub mod domains;
 pub mod git;
+pub mod insights;
 pub mod nodes;
 pub mod overview;
 pub mod settings;

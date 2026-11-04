@@ -15,6 +15,9 @@ use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
 use uuid::Uuid;
 
 use super::domains::DomainTable;
+use super::insights::{
+    AvailabilityBar, AvailabilityFigure, ErrorsSection, TrafficSection, VisitorsTile,
+};
 use super::spec_form::{SpecFields, SpecForm};
 use crate::api;
 use crate::components::{ErrorNote, Loading, Menu, Modal, StateBadge, TabBar, UsageCharts};
@@ -138,6 +141,10 @@ pub fn AppPage() -> impl IntoView {
             )
         }
     };
+
+    // Availability, visitors, bandwidth: the header, the Overview and Info.
+    let insights = super::insights::app_insights(name);
+    let uptime_open = RwSignal::new(false);
 
     let busy = RwSignal::new(false);
     let checking = RwSignal::new(false);
@@ -439,6 +446,7 @@ pub fn AppPage() -> impl IntoView {
                                 .filter(|_| me.is_admin())
                                 .map(|o| format!(" · owned by {o}"))
                         }}
+                        <AvailabilityFigure insights open=uptime_open/>
                     </div>
                 </div>
                 <div class="actions">
@@ -471,6 +479,9 @@ pub fn AppPage() -> impl IntoView {
                     </Show>
                 </div>
             </header>
+            <Show when=move || uptime_open.get()>
+                <AvailabilityBar insights/>
+            </Show>
             <ErrorNote error=app.error/>
             {move || view_of().and_then(|a| {
                 let stack = a.spec.stack.clone()?;
@@ -524,7 +535,7 @@ pub fn AppPage() -> impl IntoView {
                             })/>
                     }.into_any(),
                     "volumes" => view! { <VolumesTab name=name app=Signal::derive(move || app.data.get())/> }.into_any(),
-                    "info" => view! { <InfoTab app=Signal::derive(move || app.data.get())/> }.into_any(),
+                    "info" => view! { <InfoTab app=Signal::derive(move || app.data.get()) insights/> }.into_any(),
                     // Stacks are managed by admins; members edit a service as a plain app.
                     "settings" => match stack_service.get().filter(|_| me.is_admin()) {
                         Some((stack, service)) => view! {
@@ -539,7 +550,7 @@ pub fn AppPage() -> impl IntoView {
                         }.into_any(),
                     },
                     _ => view! {
-                        <OverviewTab name=name app=Signal::derive(move || app.data.get()) deployments/>
+                        <OverviewTab name=name app=Signal::derive(move || app.data.get()) deployments insights/>
                     }.into_any(),
                 }}
             </Show>
@@ -683,6 +694,7 @@ fn OverviewTab(
     name: Memo<String>,
     #[prop(into)] app: Signal<Option<AppView>>,
     deployments: Polled<Vec<DeploymentView>>,
+    insights: Polled<facade_core::insights::AppInsights>,
 ) -> impl IntoView {
     let spec = move || app.get().map(|a| a.spec);
     let stats = move || app.get().and_then(|a| a.stats);
@@ -703,6 +715,7 @@ fn OverviewTab(
 
     view! {
         <Show when=move || !is_static() fallback=move || view! {
+            <div class="tiles"><VisitorsTile insights/></div>
             <p class="muted">
                 "Static sites are served by the agent directly; they have no container to measure."
                 {move || disk().filter(|d| d.files > 0).map(|d| format!(" Its files take {}.", bytes(d.files)))}
@@ -749,6 +762,7 @@ fn OverviewTab(
                     <span class="tile-value">{move || stats().map(|s| format!("↓ {}", bytes(s.net_rx))).unwrap_or_else(|| "—".into())}</span>
                     <span class="tile-sub">{move || stats().map(|s| format!("↑ {} sent", bytes(s.net_tx))).unwrap_or_default()}</span>
                 </div>
+                <VisitorsTile insights/>
                 {move || open().map(|open| view! {
                     <div class="tile" title="Kept-alive HTTP, WebSockets and TLS ports, through the entry point">
                         <span class="tile-label">"Connections"</span>
@@ -773,6 +787,7 @@ fn OverviewTab(
                 }) show_app=false/>
             </section>
         </Show>
+        <ErrorsSection name=name/>
     }
 }
 
@@ -853,7 +868,10 @@ fn LatestDeployment(
 /// What the app is and what it takes: its configuration as it runs, and its
 /// disk with the largest layers of its image.
 #[component]
-fn InfoTab(#[prop(into)] app: Signal<Option<AppView>>) -> impl IntoView {
+fn InfoTab(
+    #[prop(into)] app: Signal<Option<AppView>>,
+    insights: Polled<facade_core::insights::AppInsights>,
+) -> impl IntoView {
     let spec = move || app.get().map(|a| a.spec);
     let commit = move || app.get().and_then(|a| a.commit);
     let disk = move || app.get().and_then(|a| a.disk);
@@ -949,6 +967,7 @@ fn InfoTab(#[prop(into)] app: Signal<Option<AppView>>) -> impl IntoView {
                 }
             })}
         </section>
+        <TrafficSection insights/>
         {move || disk().map(|d| {
             let written_class = if d.written >= WRITTEN_WARNING { "tile-warn" } else { "" };
             view! {
