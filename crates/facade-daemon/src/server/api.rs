@@ -2047,18 +2047,38 @@ async fn app_usage(
         live.apps
             .get(&name)
             .map(|a| {
+                let mut before: Option<&AppMetric> = None;
                 a.history
                     .iter()
-                    .filter(|m| m.stats.state == AppState::Running)
-                    .map(|m| UsagePoint {
-                        at: m.at,
-                        cpu: m.stats.cpu_percent,
-                        cpu_peak: m.stats.cpu_percent,
-                        mem: m.stats.mem_used,
-                        mem_peak: m.stats.mem_used,
-                        disk: None,
-                        net_rx: None,
-                        net_tx: None,
+                    // A crashed app's errors are worth showing too.
+                    .filter(|m| m.stats.state == AppState::Running || m.stats.traffic.is_some())
+                    .map(|m| {
+                        let mut point = UsagePoint {
+                            at: m.at,
+                            cpu: m.stats.cpu_percent,
+                            cpu_peak: m.stats.cpu_percent,
+                            mem: m.stats.mem_used,
+                            mem_peak: m.stats.mem_used,
+                            connections: m.stats.traffic.as_ref().map(|t| t.open as f64),
+                            ..Default::default()
+                        };
+                        if let Some(b) = before {
+                            point.net_rx = facade_core::api::byte_rate(
+                                (b.at, b.stats.net_rx),
+                                (m.at, m.stats.net_rx),
+                            );
+                            point.net_tx = facade_core::api::byte_rate(
+                                (b.at, b.stats.net_tx),
+                                (m.at, m.stats.net_tx),
+                            );
+                            if let (Some(t0), Some(t1)) = (&b.stats.traffic, &m.stats.traffic)
+                                && let Some(span) = TrafficSpan::between((b.at, t0), (m.at, t1))
+                            {
+                                point.set_traffic(&span);
+                            }
+                        }
+                        before = Some(m);
+                        point
                     })
                     .collect()
             })
@@ -2089,7 +2109,7 @@ async fn node_usage(
                                 )
                             })
                         };
-                        let point = UsagePoint {
+                        let mut point = UsagePoint {
                             at: m.at,
                             cpu: m.stats.cpu_percent,
                             cpu_peak: m.stats.cpu_percent,
@@ -2098,7 +2118,15 @@ async fn node_usage(
                             disk: Some(m.stats.disk_used),
                             net_rx: rate(|s| s.net_rx),
                             net_tx: rate(|s| s.net_tx),
+                            connections: m.traffic.as_ref().map(|t| t.open as f64),
+                            ..Default::default()
                         };
+                        if let Some(b) = before
+                            && let (Some(t0), Some(t1)) = (&b.traffic, &m.traffic)
+                            && let Some(span) = TrafficSpan::between((b.at, t0), (m.at, t1))
+                        {
+                            point.set_traffic(&span);
+                        }
                         before = Some(m);
                         point
                     })

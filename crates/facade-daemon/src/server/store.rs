@@ -1,14 +1,16 @@
 //! SQLite persistence. Queries are tiny, so a single mutex-guarded connection is
 //! plenty and keeps the API synchronous.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Context;
 use facade_core::AppSpec;
 use facade_core::api::{
     DeploymentStatus, DeploymentView, GitCredentialKind, StackDeploymentService,
-    StackDeploymentView, UsagePoint,
+    StackDeploymentView, TrafficSpan, UsagePoint,
 };
+use facade_core::proto::Traffic;
 use facade_core::stack::StackSpec;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -182,10 +184,23 @@ pub struct UsageSample {
     pub cpu: f32,
     pub mem: u64,
     pub disk: u64,
-    /// A node's byte counters since boot (0 when unknown); a bucket keeps the
-    /// last ones, and rates come from one bucket to the next.
+    /// Byte counters (a node's since boot, an app's since its container
+    /// started; 0 when unknown); a bucket keeps the last ones, and rates come
+    /// from one bucket to the next.
     pub net_rx: u64,
     pub net_tx: u64,
+    /// Traffic counters through the entry point, kept the same way, with the
+    /// connections open now (averaged).
+    pub traffic: Option<Traffic>,
+}
+
+/// The counters a bucket ended with, and its connections on average.
+#[derive(Default)]
+struct Counters {
+    net: (u64, u64),
+    /// `None` when no report in it had any.
+    traffic: Option<Traffic>,
+    connections: Option<f64>,
 }
 
 /// The owner id of logins and credentials shared by every admin.
@@ -344,6 +359,18 @@ impl Store {
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "node_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;
         add_column(&conn, "node_usage", "net_tx", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "app_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "app_usage", "net_tx", "INTEGER NOT NULL DEFAULT 0")?;
+        for table in ["app_usage", "node_usage"] {
+            // Traffic counters through the entry point: the bucket's last
+            // reading (`t_since` tells whose), and how many readings it had,
+            // which the average of open connections is over.
+            for column in ["t_since", "requests", "req_4xx", "req_5xx", "t_samples"] {
+                add_column(&conn, table, column, "INTEGER NOT NULL DEFAULT 0")?;
+            }
+            add_column(&conn, table, "latency", "TEXT NOT NULL DEFAULT ''")?;
+            add_column(&conn, table, "conns", "REAL NOT NULL DEFAULT 0")?;
+        }
         add_column(&conn, "apps", "commit_sha", "TEXT")?;
         add_column(&conn, "deployments", "commit_sha", "TEXT")?;
         add_column(&conn, "deployments", "commit_title", "TEXT")?;
@@ -811,37 +838,67 @@ impl Store {
             // The app table has no disk column: its value is bound and unused.
             let (disk_col, disk_val, disk_set) = match of {
                 UsageOf::App => ("", "", ""),
-                // The last counters of the bucket (0 from agents that send none
-                // leaves what an earlier report said).
                 UsageOf::Node => (
-                    ", disk, net_rx, net_tx",
-                    ", ?5, ?6, ?7",
-                    ", disk = (disk * samples + excluded.disk) / (samples + 1),
-                    net_rx = CASE WHEN excluded.net_rx > 0 THEN excluded.net_rx ELSE net_rx END,
-                    net_tx = CASE WHEN excluded.net_tx > 0 THEN excluded.net_tx ELSE net_tx END",
+                    ", disk",
+                    ", ?14",
+                    ", disk = (disk * samples + excluded.disk) / (samples + 1)",
                 ),
             };
+            // The last counters of the bucket: a report with none (0, or no
+            // traffic) leaves what an earlier one said. SQLite computes every
+            // new value from the row as it was.
+            let traffic = |column: &str| {
+                format!(
+                    "{column} = CASE WHEN excluded.t_samples > 0 THEN excluded.{column} ELSE {column} END"
+                )
+            };
+            let traffic_set = ["t_since", "requests", "req_4xx", "req_5xx", "latency"]
+                .map(traffic)
+                .join(",\n");
             let mut stmt = tx.prepare_cached(&format!(
-                "INSERT INTO {table} ({key}, at, samples, cpu, cpu_peak, mem, mem_peak{disk_col})
-                 VALUES (?1, ?2, 1, ?3, ?3, ?4, ?4{disk_val})
+                "INSERT INTO {table} ({key}, at, samples, cpu, cpu_peak, mem, mem_peak,
+                    net_rx, net_tx, t_since, requests, req_4xx, req_5xx, latency, conns,
+                    t_samples{disk_col})
+                 VALUES (?1, ?2, 1, ?3, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13{disk_val})
                  ON CONFLICT ({key}, at) DO UPDATE SET
                     cpu = (cpu * samples + excluded.cpu) / (samples + 1),
                     cpu_peak = max(cpu_peak, excluded.cpu),
                     mem = (mem * samples + excluded.mem) / (samples + 1),
                     mem_peak = max(mem_peak, excluded.mem_peak){disk_set},
+                    net_rx = CASE WHEN excluded.net_rx > 0 THEN excluded.net_rx ELSE net_rx END,
+                    net_tx = CASE WHEN excluded.net_tx > 0 THEN excluded.net_tx ELSE net_tx END,
+                    {traffic_set},
+                    conns = CASE WHEN excluded.t_samples > 0
+                        THEN (conns * t_samples + excluded.conns) / (t_samples + 1)
+                        ELSE conns END,
+                    t_samples = t_samples + excluded.t_samples,
                     samples = samples + 1"
             ))?;
             for s in samples {
+                let t = s.traffic.clone().unwrap_or_default();
+                let latency = t
+                    .latency
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
                 let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
                     Box::new(s.name.clone()),
                     Box::new(bucket as i64),
                     Box::new(f64::from(s.cpu)),
                     Box::new(s.mem as i64),
+                    Box::new(s.net_rx as i64),
+                    Box::new(s.net_tx as i64),
+                    Box::new(t.since as i64),
+                    Box::new(t.requests as i64),
+                    Box::new(t.client_errors as i64),
+                    Box::new(t.server_errors as i64),
+                    Box::new(latency),
+                    Box::new(t.open as f64),
+                    Box::new(i64::from(s.traffic.is_some())),
                 ];
                 if of == UsageOf::Node {
                     values.push(Box::new(s.disk as f64));
-                    values.push(Box::new(s.net_rx as i64));
-                    values.push(Box::new(s.net_tx as i64));
                 }
                 stmt.execute(rusqlite::params_from_iter(values.iter()))?;
             }
@@ -860,54 +917,97 @@ impl Store {
         step: u64,
     ) -> anyhow::Result<Vec<UsagePoint>> {
         let (table, key, disk) = of.sql();
-        let net = match of {
-            UsageOf::App => "0, 0",
-            UsageOf::Node => "MAX(net_rx), MAX(net_tx)",
-        };
         let step = step.max(USAGE_BUCKET) as i64;
         let conn = self.0.lock();
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT at / ?3 * ?3 AS b, SUM(cpu * samples) / SUM(samples), MAX(cpu_peak),
                     SUM(mem * samples) / SUM(samples), MAX(mem_peak),
-                    SUM({disk} * samples) / SUM(samples), {net}
+                    SUM({disk} * samples) / SUM(samples)
              FROM {table} WHERE {key} = ?1 AND at >= ?2 GROUP BY b ORDER BY b"
         ))?;
-        let mut counters = Vec::new();
         let mut rows: Vec<UsagePoint> = stmt
             .query_map(params![name, since as i64, step], |r| {
-                Ok((
-                    UsagePoint {
-                        at: r.get::<_, i64>(0)? as u64,
-                        cpu: r.get::<_, f64>(1)? as f32,
-                        cpu_peak: r.get::<_, f64>(2)? as f32,
-                        mem: r.get::<_, f64>(3)? as u64,
-                        mem_peak: r.get::<_, i64>(4)? as u64,
-                        disk: (of == UsageOf::Node)
-                            .then(|| r.get::<_, f64>(5).unwrap_or(0.0) as u64),
-                        net_rx: None,
-                        net_tx: None,
-                    },
-                    (r.get::<_, i64>(6)? as u64, r.get::<_, i64>(7)? as u64),
-                ))
-            })?
-            .map(|row| {
-                row.map(|(point, c)| {
-                    counters.push(c);
-                    point
+                Ok(UsagePoint {
+                    at: r.get::<_, i64>(0)? as u64,
+                    cpu: r.get::<_, f64>(1)? as f32,
+                    cpu_peak: r.get::<_, f64>(2)? as f32,
+                    mem: r.get::<_, f64>(3)? as u64,
+                    mem_peak: r.get::<_, i64>(4)? as u64,
+                    disk: (of == UsageOf::Node).then(|| r.get::<_, f64>(5).unwrap_or(0.0) as u64),
+                    ..Default::default()
                 })
-            })
+            })?
             .collect::<Result<_, _>>()?;
-        if of == UsageOf::Node {
-            // A bucket's counters are its last reading: the traffic of a period is
-            // what they grew by since the period before, if that one is adjacent.
-            for i in 1..rows.len() {
-                let (t0, t1) = (rows[i - 1].at, rows[i].at);
-                if t1 - t0 > step as u64 * 2 {
-                    continue;
-                }
-                let (a, b) = (counters[i - 1], counters[i]);
-                rows[i].net_rx = facade_core::api::byte_rate((t0, a.0), (t1, b.0));
-                rows[i].net_tx = facade_core::api::byte_rate((t0, a.1), (t1, b.1));
+
+        // Each period's last counters: the last of its buckets that has them.
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT at / ?3 * ?3, net_rx, net_tx, t_since, requests, req_4xx, req_5xx, latency,
+                    conns, t_samples
+             FROM {table} WHERE {key} = ?1 AND at >= ?2 ORDER BY at"
+        ))?;
+        let mut counters: HashMap<u64, Counters> = HashMap::new();
+        // Readings of open connections in each period, and their sum.
+        let mut connections: HashMap<u64, (f64, f64)> = HashMap::new();
+        let buckets = stmt.query_map(params![name, since as i64, step], |r| {
+            let readings = r.get::<_, i64>(9)?;
+            let traffic = (readings > 0).then(|| -> rusqlite::Result<Traffic> {
+                Ok(Traffic {
+                    since: r.get::<_, i64>(3)? as u64,
+                    requests: r.get::<_, i64>(4)? as u64,
+                    client_errors: r.get::<_, i64>(5)? as u64,
+                    server_errors: r.get::<_, i64>(6)? as u64,
+                    latency: r
+                        .get::<_, String>(7)?
+                        .split(',')
+                        .filter_map(|n| n.parse().ok())
+                        .collect(),
+                    open: 0,
+                })
+            });
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64),
+                traffic.transpose()?,
+                (readings as f64, r.get::<_, f64>(8)?),
+            ))
+        })?;
+        for bucket in buckets {
+            let (period, net, traffic, (readings, conns)) = bucket?;
+            let c = counters.entry(period).or_default();
+            if net.0 > 0 || net.1 > 0 {
+                c.net = net;
+            }
+            if traffic.is_some() {
+                c.traffic = traffic;
+                let sum = connections.entry(period).or_default();
+                sum.0 += readings;
+                sum.1 += conns * readings;
+            }
+        }
+        for (period, (readings, sum)) in connections {
+            if let Some(c) = counters.get_mut(&period) {
+                c.connections = Some(sum / readings);
+            }
+        }
+
+        // The traffic of a period is what the counters grew by since the period
+        // before, if that one is adjacent.
+        let none = Counters::default();
+        for i in 0..rows.len() {
+            let t1 = rows[i].at;
+            let b = counters.get(&t1).unwrap_or(&none);
+            rows[i].connections = b.connections;
+            if i == 0 || t1 - rows[i - 1].at > step as u64 * 2 {
+                continue;
+            }
+            let t0 = rows[i - 1].at;
+            let a = counters.get(&t0).unwrap_or(&none);
+            rows[i].net_rx = facade_core::api::byte_rate((t0, a.net.0), (t1, b.net.0));
+            rows[i].net_tx = facade_core::api::byte_rate((t0, a.net.1), (t1, b.net.1));
+            if let (Some(a), Some(b)) = (&a.traffic, &b.traffic)
+                && let Some(span) = TrafficSpan::between((t0, a), (t1, b))
+            {
+                rows[i].set_traffic(&span);
             }
         }
         Ok(rows)
@@ -1974,6 +2074,7 @@ mod tests {
             disk: mem * 10,
             net_rx: 0,
             net_tx: 0,
+            traffic: None,
         };
         let app = UsageOf::App;
         // Two samples in one 5-minute bucket, one in the next.
@@ -2037,6 +2138,7 @@ mod tests {
             disk: 1,
             net_rx: rx,
             net_tx: tx,
+            traffic: None,
         };
         let record = |at: u64, s: UsageSample| store.record_usage(UsageOf::Node, at, &[s]).unwrap();
         // An agent counting nothing (0) leaves the bucket's last counters.
@@ -2057,5 +2159,67 @@ mod tests {
                 (Some(100.0), Some(10.0)),
             ]
         );
+    }
+
+    #[test]
+    fn app_traffic_comes_from_counters_and_restarts_leave_gaps() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let buckets = facade_core::proto::LATENCY_BUCKETS;
+        let reading = |since: u64, requests: u64, errors: u64, slow: u64, open: u64| {
+            let mut latency = vec![0; buckets];
+            latency[0] = requests - slow;
+            // 100 to 150 ms
+            latency[13] = slow;
+            Some(Traffic {
+                since,
+                requests,
+                client_errors: errors,
+                server_errors: errors,
+                latency,
+                open,
+            })
+        };
+        let app = |traffic: Option<Traffic>| UsageSample {
+            name: "a".into(),
+            cpu: 1.0,
+            mem: 1,
+            disk: 0,
+            net_rx: 0,
+            net_tx: 0,
+            traffic,
+        };
+        let record = |at: u64, s: UsageSample| store.record_usage(UsageOf::App, at, &[s]).unwrap();
+        record(600, app(reading(1, 100, 0, 0, 2)));
+        // A report without traffic (an older entry point) changes nothing.
+        record(650, app(None));
+        record(700, app(reading(1, 200, 0, 0, 4)));
+        // 300 requests in 300 s, 30 of them 4xx and 30 5xx, all slow.
+        record(900, app(reading(1, 500, 30, 300, 1)));
+        // A new entry point: its counters start again, past the old ones even.
+        record(1200, app(reading(1150, 900, 0, 0, 0)));
+        record(1500, app(reading(1150, 1200, 0, 0, 0)));
+        let points = store.usage(UsageOf::App, "a", 0, USAGE_BUCKET).unwrap();
+        let figures: Vec<_> = points
+            .iter()
+            .map(|p| (p.requests, p.errors_4xx, p.errors_5xx, p.connections))
+            .collect();
+        assert_eq!(
+            figures,
+            vec![
+                (None, None, None, Some(3.0)),
+                (Some(1.0), Some(0.1), Some(0.1), Some(1.0)),
+                (None, None, None, Some(0.0)),
+                (Some(1.0), Some(0.0), Some(0.0), Some(0.0)),
+            ]
+        );
+        let p50 = points[1].p50_ms.unwrap();
+        assert!((100.0..=150.0).contains(&p50), "{p50}");
+        assert!(points[3].p95_ms.unwrap() <= 1.0);
+        // Merged into longer periods, the last counters of each still compare.
+        record(1800, app(reading(1150, 1500, 0, 0, 0)));
+        let merged = store.usage(UsageOf::App, "a", 0, 600).unwrap();
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].requests, None, "the restart");
+        assert_eq!(merged[2].requests, Some(0.5));
     }
 }

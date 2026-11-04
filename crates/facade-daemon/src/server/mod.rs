@@ -105,6 +105,9 @@ pub struct NodeLive {
     pub arch: Option<String>,
     /// The protocol its agent speaks, as said when it last connected.
     pub protocol: u32,
+    /// Its apps' traffic added up since the server started, from what each of
+    /// their readings adds to the one before (`since` is when it started).
+    pub traffic: Option<facade_core::proto::Traffic>,
 }
 
 pub struct AppLive {
@@ -426,41 +429,44 @@ impl Server {
     pub fn record_report(&self, node: &str, report: facade_core::proto::NodeReport) {
         let at = facade_core::now();
         let mut live = self.live.write();
-        let entry = live.nodes.entry(node.to_string()).or_default();
-        entry.stats = Some(report.node.clone());
-        if report.storage.is_some() {
-            entry.storage = report.storage;
-        }
-        entry.listeners = report.listeners;
-        entry.ingress_errors = report.ingress_errors;
-        let node_usage = UsageSample {
-            name: node.to_string(),
-            cpu: report.node.cpu_percent,
-            mem: report.node.mem_used,
-            disk: report.node.disk_used,
-            net_rx: report.node.net_rx,
-            net_tx: report.node.net_tx,
-        };
-        push_capped(
-            &mut entry.history,
-            NodeMetric {
-                at,
-                stats: report.node,
-            },
-        );
         let mut usage = Vec::new();
+        // What the apps' counters grew by since their last readings, and
+        // whether one started again (a new entry point): what it counted in
+        // between is not known.
+        let mut added: Option<facade_core::proto::Traffic> = None;
+        let mut restarted = false;
         for stats in report.apps {
-            if stats.state == AppState::Running {
+            // A crashed app's visitors get errors: worth keeping too.
+            if stats.state == AppState::Running || stats.traffic.is_some() {
                 usage.push(UsageSample {
                     name: stats.app.clone(),
                     cpu: stats.cpu_percent,
                     mem: stats.mem_used,
                     disk: 0,
-                    net_rx: 0,
-                    net_tx: 0,
+                    net_rx: stats.net_rx,
+                    net_tx: stats.net_tx,
+                    traffic: stats.traffic.clone(),
                 });
             }
             let app = live.apps.entry(stats.app.clone()).or_default();
+            if let Some(now) = &stats.traffic {
+                let sum = added.get_or_insert_with(Default::default);
+                sum.open += now.open;
+                let before = app
+                    .history
+                    .back()
+                    .and_then(|m| Some((m.at, m.stats.traffic.as_ref()?)));
+                if let Some(before) = before {
+                    match facade_core::api::TrafficSpan::between(before, (at, now)) {
+                        Some(span) => {
+                            sum.requests += span.requests;
+                            sum.client_errors += span.client_errors;
+                            sum.server_errors += span.server_errors;
+                        }
+                        None => restarted = true,
+                    }
+                }
+            }
             // A build in progress is more informative than "the old container runs".
             if app.state != AppState::Building {
                 app.state = stats.state;
@@ -468,6 +474,48 @@ impl Server {
             app.stats = Some(stats.clone());
             push_capped(&mut app.history, AppMetric { at, stats });
         }
+        let entry = live.nodes.entry(node.to_string()).or_default();
+        entry.stats = Some(report.node.clone());
+        if report.storage.is_some() {
+            entry.storage = report.storage;
+        }
+        entry.listeners = report.listeners;
+        entry.ingress_errors = report.ingress_errors;
+        let traffic = added.map(|added| {
+            // The node's counters start again with its apps': a gap in its
+            // figures rather than a dip that did not happen.
+            if restarted {
+                entry.traffic = None;
+            }
+            let total = entry
+                .traffic
+                .get_or_insert_with(|| facade_core::proto::Traffic {
+                    since: at,
+                    ..Default::default()
+                });
+            total.requests += added.requests;
+            total.client_errors += added.client_errors;
+            total.server_errors += added.server_errors;
+            total.open = added.open;
+            total.clone()
+        });
+        let node_usage = UsageSample {
+            name: node.to_string(),
+            cpu: report.node.cpu_percent,
+            mem: report.node.mem_used,
+            disk: report.node.disk_used,
+            net_rx: report.node.net_rx,
+            net_tx: report.node.net_tx,
+            traffic: traffic.clone(),
+        };
+        push_capped(
+            &mut entry.history,
+            NodeMetric {
+                at,
+                stats: report.node,
+                traffic,
+            },
+        );
         drop(live);
         if let Err(e) = self
             .store

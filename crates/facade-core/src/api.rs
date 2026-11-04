@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::proto::{AppState, AppStats, BuildState, ImageLayer, NodeStats, StorageReport};
+use crate::proto::{AppState, AppStats, BuildState, ImageLayer, NodeStats, StorageReport, Traffic};
 use crate::spec::{AppSpec, Build};
 use crate::stack::StackSpec;
 
@@ -550,6 +550,10 @@ pub struct Candidate {
 pub struct NodeMetric {
     pub at: u64,
     pub stats: NodeStats,
+    /// The node's apps' traffic added up, counted by the server from what each
+    /// report adds (no latency); `None` when none of its apps' is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<Traffic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,7 +565,7 @@ pub struct AppMetric {
 /// Resource use over a span of time starting at `at`: averages and peaks. CPU is
 /// in percent (of one core for an app, of the whole machine for a node), memory
 /// and disk in bytes; only nodes report their disk.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsagePoint {
     pub at: u64,
     pub cpu: f32,
@@ -570,13 +574,42 @@ pub struct UsagePoint {
     pub mem_peak: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<u64>,
-    /// A node's network traffic over the point's period, in bytes per second
-    /// received and sent; `None` where it is not known (the first point, a
-    /// reboot, an agent that does not count it).
+    /// Network traffic over the point's period, in bytes per second received
+    /// and sent (a node's cards, an app's container); `None` where it is not
+    /// known (the first point, a reboot or a new container, nothing counted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net_rx: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net_tx: Option<f64>,
+    /// Requests through the entry point per second, and those answered 4xx and
+    /// 5xx; `None` where not known (no domain, a new entry point's first
+    /// period). A node's add up its apps'.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errors_4xx: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errors_5xx: Option<f64>,
+    /// Median and 95th percentile time to response headers, in milliseconds,
+    /// over the period's requests (`None` without any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<f64>,
+    /// Client connections open through the entry point, on average.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<f64>,
+}
+
+impl UsagePoint {
+    /// The point's traffic figures, from what the counters grew by over it.
+    pub fn set_traffic(&mut self, span: &TrafficSpan) {
+        self.requests = Some(span.per_sec(span.requests));
+        self.errors_4xx = Some(span.per_sec(span.client_errors));
+        self.errors_5xx = Some(span.per_sec(span.server_errors));
+        self.p50_ms = span.percentile_ms(0.5);
+        self.p95_ms = span.percentile_ms(0.95);
+    }
 }
 
 /// Bytes per second between two readings of a counter of bytes since boot;
@@ -584,6 +617,89 @@ pub struct UsagePoint {
 pub fn byte_rate(before: (u64, u64), after: (u64, u64)) -> Option<f64> {
     let ((t0, b0), (t1, b1)) = (before, after);
     (b0 > 0 && b1 >= b0 && t1 > t0).then(|| (b1 - b0) as f64 / (t1 - t0) as f64)
+}
+
+/// What an app's traffic counters grew by between two readings.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrafficSpan {
+    pub secs: u64,
+    pub requests: u64,
+    pub client_errors: u64,
+    pub server_errors: u64,
+    pub latency: Vec<u64>,
+}
+
+impl TrafficSpan {
+    /// Between readings `before` and `after` (with their times); `None` when the
+    /// counters started again in between (a new entry point) or time did not pass.
+    pub fn between(before: (u64, &Traffic), after: (u64, &Traffic)) -> Option<Self> {
+        let ((t0, a), (t1, b)) = (before, after);
+        if a.since != b.since || t1 <= t0 || b.requests < a.requests {
+            return None;
+        }
+        let latency = if a.latency.len() == b.latency.len() {
+            b.latency
+                .iter()
+                .zip(&a.latency)
+                .map(|(b, a)| b.saturating_sub(*a))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(Self {
+            secs: t1 - t0,
+            requests: b.requests - a.requests,
+            client_errors: b.client_errors.saturating_sub(a.client_errors),
+            server_errors: b.server_errors.saturating_sub(a.server_errors),
+            latency,
+        })
+    }
+
+    /// The span from the first reading at most `window` seconds before the last
+    /// one counting since the same moment, to that last one.
+    pub fn recent<'a>(
+        mut readings: impl DoubleEndedIterator<Item = (u64, &'a Traffic)> + Clone,
+        window: u64,
+    ) -> Option<Self> {
+        let (t1, last) = readings.clone().next_back()?;
+        let (t0, first) = readings.find(|(at, t)| at + window >= t1 && t.since == last.since)?;
+        Self::between((t0, first), (t1, last))
+    }
+
+    pub fn per_sec(&self, count: u64) -> f64 {
+        count as f64 / self.secs.max(1) as f64
+    }
+
+    /// The `q` quantile (0.5 for the median) of response times, in milliseconds,
+    /// interpolated within its bucket; `None` without requests.
+    pub fn percentile_ms(&self, q: f64) -> Option<f64> {
+        latency_percentile(&self.latency, q)
+    }
+}
+
+/// The `q` quantile of a histogram of response times (per
+/// [`crate::proto::LATENCY_BOUNDS_MS`]), in milliseconds.
+pub fn latency_percentile(histogram: &[u64], q: f64) -> Option<f64> {
+    use crate::proto::LATENCY_BOUNDS_MS as BOUNDS;
+    let total: u64 = histogram.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let target = q.clamp(0.0, 1.0) * total as f64;
+    let mut below = 0.0;
+    for (i, &count) in histogram.iter().enumerate() {
+        let count = count as f64;
+        if count > 0.0 && below + count >= target {
+            let low = if i == 0 { 0.0 } else { BOUNDS[i - 1] };
+            // Slower than the last bound: say the last bound.
+            let Some(&high) = BOUNDS.get(i) else {
+                return Some(low);
+            };
+            return Some(low + (high - low) * ((target - below) / count));
+        }
+        below += count;
+    }
+    BOUNDS.last().copied()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -729,6 +845,57 @@ mod tests {
         assert_eq!("<@!42>".parse(), Ok(Mention::User(42)));
         assert_eq!("<@&7>".parse(), Ok(Mention::Role(7)));
         assert!("bob".parse::<Mention>().is_err());
+    }
+
+    fn reading(since: u64, requests: u64, errors: u64, latency: Vec<u64>) -> Traffic {
+        Traffic {
+            since,
+            requests,
+            client_errors: 0,
+            server_errors: errors,
+            latency,
+            open: 0,
+        }
+    }
+
+    #[test]
+    fn traffic_spans_restart_with_their_counters() {
+        let buckets = crate::proto::LATENCY_BUCKETS;
+        let mut lat = vec![0; buckets];
+        let a = reading(100, 10, 1, lat.clone());
+        // 100 requests between 50 and 75 ms (bucket 11), 10 between 0 and 1 ms.
+        lat[11] = 100;
+        lat[0] = 10;
+        let b = reading(100, 120, 21, lat);
+        let span = TrafficSpan::between((1000, &a), (1010, &b)).unwrap();
+        assert_eq!(
+            (span.secs, span.requests, span.server_errors),
+            (10, 110, 20)
+        );
+        assert_eq!(span.per_sec(span.requests), 11.0);
+        let p50 = span.percentile_ms(0.5).unwrap();
+        assert!((50.0..=75.0).contains(&p50), "{p50}");
+        assert!(span.percentile_ms(0.05).unwrap() <= 1.0);
+        assert!(span.percentile_ms(0.95).unwrap() > p50);
+        // A new entry point: its counters do not compare with the old one's.
+        let c = reading(1005, 3, 0, vec![0; buckets]);
+        assert_eq!(TrafficSpan::between((1010, &b), (1020, &c)), None);
+        // Nor do counters that went back.
+        assert_eq!(TrafficSpan::between((1010, &b), (1020, &a)), None);
+        // The window starts after the restart.
+        let d = reading(1005, 13, 0, vec![0; buckets]);
+        let readings = [(1000, &a), (1010, &b), (1020, &c), (1030, &d)];
+        let recent = TrafficSpan::recent(readings.iter().copied(), 300).unwrap();
+        assert_eq!((recent.secs, recent.requests), (10, 10));
+        assert_eq!(recent.percentile_ms(0.5), None, "no latency counted");
+    }
+
+    #[test]
+    fn slow_requests_read_as_the_last_bound() {
+        let mut lat = vec![0; crate::proto::LATENCY_BUCKETS];
+        *lat.last_mut().unwrap() = 5;
+        assert_eq!(latency_percentile(&lat, 0.5), Some(30_000.0));
+        assert_eq!(latency_percentile(&[], 0.5), None);
     }
 }
 
