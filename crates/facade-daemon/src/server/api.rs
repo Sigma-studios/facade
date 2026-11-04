@@ -100,6 +100,7 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/apps/{name}/stop", post(stop_app))
         .route("/api/apps/{name}/env", get(get_env).patch(patch_env))
         .route("/api/apps/{name}/logs", get(logs))
+        .route("/api/apps/{name}/exec", get(exec_app))
         .route("/api/apps/{name}/metrics", get(app_metrics))
         .route("/api/apps/{name}/usage", get(app_usage))
         .route("/api/apps/{name}/deployments", get(list_deployments))
@@ -208,7 +209,7 @@ pub async fn serve_direct(server: Arc<Server>) -> anyhow::Result<()> {
             let service = hyper_util::service::TowerToHyperService::new(app);
             let _ =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), service)
                     .await;
         });
     }
@@ -1859,6 +1860,103 @@ async fn logs(
         body,
     )
         .into_response())
+}
+
+/// `facade exec`: switches the connection to the `facade-exec` protocol, reads
+/// the command, and splices the connection to the agent running it (see
+/// `facade_core::exec`). Admins, and members for the apps they manage.
+async fn exec_app(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+    mut req: axum::extract::Request,
+) -> ApiResult<Response> {
+    use facade_core::exec::{ExecRequest, Frame, UPGRADE};
+    use tokio::io::AsyncWriteExt;
+    let row = match load_app_for(&server, &user, &name) {
+        Err(_) if user.is_admin() && server.store.get_stack(&name)?.is_some() => {
+            return Err(not_found(format!(
+                "{name} is a stack: commands run in one of its services, named {name}.<service> (facade stack show {name})"
+            )));
+        }
+        other => other?,
+    };
+    let wants = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case(UPGRADE));
+    if !wants {
+        return Err(bad_request(format!(
+            "this endpoint takes `Upgrade: {UPGRADE}` (use `facade exec`)"
+        )));
+    }
+    if row.spec.is_static() {
+        return Err(bad_request(format!(
+            "{name} is a static site: it has no container to run commands in"
+        )));
+    }
+    if row.revision == 0 {
+        return Err(conflict(format!("{name} is not deployed yet")));
+    }
+    let node = row.spec.node.clone();
+    if !server.hub.is_connected(&node) {
+        return Err(unavailable(format!("node {node} is offline")));
+    }
+    let protocol = server
+        .live
+        .read()
+        .nodes
+        .get(&node)
+        .map_or(0, |n| n.protocol);
+    if protocol < facade_core::proto::EXEC_STREAM_PROTOCOL {
+        return Err(unavailable(format!(
+            "node {node} runs an older agent, which cannot run commands for facade exec: it updates itself to the server's build when it reconnects"
+        )));
+    }
+    let upgrade = hyper::upgrade::on(&mut req);
+    let who = user.username.clone();
+    tokio::spawn(async move {
+        let Ok(upgraded) = upgrade.await else { return };
+        let mut client = hyper_util::rt::TokioIo::new(upgraded);
+        let request = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::framing::read_line_unbuffered(&mut client),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("no command came"))
+        .and_then(|line| line)
+        .and_then(|line| Ok(serde_json::from_str::<ExecRequest>(&line)?));
+        let result = match request {
+            Ok(request) => {
+                info!(
+                    user = %who,
+                    app = %name,
+                    "exec `{}`",
+                    facade_core::join_command(&request.command)
+                );
+                server.hub.open_exec(&node, &name, request).await
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(mut agent) => {
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut agent).await;
+            }
+            Err(e) => {
+                let _ = client
+                    .write_all(&Frame::Error(format!("{e:#}")).encode())
+                    .await;
+                let _ = client.shutdown().await;
+            }
+        }
+    });
+    Ok(Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, UPGRADE)
+        .body(Body::empty())
+        .map_err(|e| anyhow::anyhow!(e))?)
 }
 
 async fn app_metrics(

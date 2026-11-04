@@ -276,6 +276,7 @@ template in `lang::generated_dockerfile`.
 | `facade status` / `facade alerts` | nodes, apps, CPU/memory, firing alerts |
 | `facade alerts config --webhook URL --mention @here` / `facade alerts test` | Discord notifications |
 | `facade logs <app> -f` | container logs |
+| `facade exec <app> -- <cmd…>` / `exec -it <app> -- sh` | run a command (or a shell) in the app's container; its exit code is facade's |
 | `facade deployments <app> [--id ID]` | build history and logs |
 | `facade updates <app>` | commits on the app's branch since its deployed one |
 | `facade metrics <app>` / `facade node metrics <node>` | last hour of samples |
@@ -690,7 +691,7 @@ secrets still to set. Applying is idempotent and never deletes anything.
 
 Servers and agents speak a versioned protocol; when it changes (it did with commit
 pinning and the build queue, then with stop settings, volume sizes and cgroup
-delegation, then with build variables), agents one version behind are updated by
+delegation, then with build variables, then with `facade exec`), agents one version behind are updated by
 the server; older ones need the server's `facaded` installed by hand.
 
 ## Not there yet

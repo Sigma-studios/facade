@@ -2,6 +2,7 @@
 //! for machine-readable output, so scripts and AI agents can drive it.
 
 mod client;
+mod exec;
 mod output;
 
 use std::collections::BTreeMap;
@@ -113,6 +114,28 @@ enum Command {
     /// Stop an app, keeping its configuration.
     Stop {
         app: String,
+    },
+    /// Run a command in an app's running container.
+    ///
+    /// `facade exec blog -- ls /data`, or a shell: `facade exec -it blog -- sh`.
+    /// A stack's services are apps named `<stack>.<service>` (`facade exec
+    /// shop.db -- psql -U postgres`). Output comes as it is written, and facade
+    /// exits with the command's exit code. Closing facade (Ctrl-C without -t)
+    /// stops the command. Admins, and members for the apps they manage.
+    Exec {
+        app: String,
+        /// Pass your input to the command (what you type, or a pipe:
+        /// `facade exec -i db -- psql < dump.sql`).
+        #[arg(short, long)]
+        interactive: bool,
+        /// Give the command a terminal, for shells and programs that need one;
+        /// with -i, every key goes to it (Ctrl-C included).
+        #[arg(short, long)]
+        tty: bool,
+        /// The command and its arguments, after `--`. No shell is involved: use
+        /// `-- sh -c '…'` for pipes and variables.
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<String>,
     },
     /// Show container logs.
     Logs {
@@ -1977,6 +2000,15 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                     .await?;
                 eprintln!("{app} stopped");
             }
+        }
+        Command::Exec {
+            app,
+            interactive,
+            tty,
+            command,
+        } => {
+            let code = exec::run(api, &app, command, interactive, tty).await?;
+            std::process::exit(code);
         }
         Command::Logs { app, follow, tail } => {
             let resp = api

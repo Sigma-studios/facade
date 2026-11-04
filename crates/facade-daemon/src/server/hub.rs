@@ -184,6 +184,23 @@ impl Hub {
         }
     }
 
+    /// A connection to a command run in the app's container (see
+    /// `facade_core::exec`): frames both ways, from right after the request.
+    pub async fn open_exec(
+        &self,
+        node: &str,
+        app: &str,
+        request: facade_core::exec::ExecRequest,
+    ) -> anyhow::Result<DataStream> {
+        let app = app.to_string();
+        self.dial_back(node, |tunnel| AgentRequest::ExecStream {
+            tunnel,
+            app,
+            request,
+        })
+        .await
+    }
+
     pub async fn open_logs(
         &self,
         node: &str,
@@ -292,6 +309,7 @@ async fn accept(
                 version: agent_version,
                 binary,
                 arch,
+                protocol,
             };
             control(server, stream, peer, node, hostname, build).await
         }
@@ -303,6 +321,7 @@ struct AgentBuild {
     version: String,
     binary: Option<String>,
     arch: Option<String>,
+    protocol: u32,
 }
 
 async fn control(
@@ -317,6 +336,7 @@ async fn control(
         version: agent_version,
         binary,
         arch,
+        protocol,
     } = build;
     let (read, mut write) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(256);
@@ -355,6 +375,7 @@ async fn control(
         entry.offline_since = None;
         entry.binary = binary.clone();
         entry.arch = arch.clone();
+        entry.protocol = protocol;
     }
     info!(%node, %peer, %hostname, "node connected");
 

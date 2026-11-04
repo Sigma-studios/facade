@@ -1024,6 +1024,7 @@ dependencies = [
  "dirs",
  "facade-core",
  "futures-util",
+ "libc",
  "reqwest",
  "rpassword",
  "rustls",

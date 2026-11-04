@@ -59,7 +59,7 @@ struct Inner {
     token: JoinToken,
 }
 
-fn container(app: &str) -> String {
+pub(super) fn container(app: &str) -> String {
     format!("facade-{app}")
 }
 

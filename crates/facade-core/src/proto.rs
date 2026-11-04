@@ -21,7 +21,11 @@ use crate::spec::AppSpec;
 /// sizes, and agents run commands in containers (backup hooks).
 /// 5: workloads name the variables their builds get (`build_env`), which an older
 /// agent would drop without a word.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// 6: agents run commands for `facade exec` over a data connection
+/// ([`AgentRequest::ExecStream`]); the server asks only agents speaking 6.
+pub const PROTOCOL_VERSION: u32 = 6;
+/// The first protocol with [`AgentRequest::ExecStream`].
+pub const EXEC_STREAM_PROTOCOL: u32 = 6;
 /// The oldest agent protocol the server still talks to. Agents in between are
 /// sent the server's binary and update themselves.
 pub const MIN_AGENT_PROTOCOL: u32 = 3;
@@ -262,6 +266,13 @@ pub enum AgentRequest {
         app: String,
         command: String,
         timeout_secs: u32,
+    },
+    /// Dial a data connection for `tunnel` and run `request` in the app's
+    /// container, with its input and output in [`crate::exec::Frame`]s on it.
+    ExecStream {
+        tunnel: Uuid,
+        app: String,
+        request: crate::exec::ExecRequest,
     },
 }
 

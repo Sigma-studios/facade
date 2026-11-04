@@ -4,6 +4,7 @@
 pub(crate) mod build;
 mod cgroups;
 mod compress;
+mod exec;
 mod layers;
 mod maintenance;
 mod ports;
@@ -464,6 +465,16 @@ impl Agent {
             } => {
                 let timeout = Duration::from_secs(u64::from(timeout_secs));
                 self.runtime.exec(&app, &command, timeout).await?;
+            }
+            AgentRequest::ExecStream {
+                tunnel,
+                app,
+                request,
+            } => {
+                let stream = self.dial_data(tunnel).await?;
+                let docker = self.runtime.docker().clone();
+                let container = runtime::container(&app);
+                tokio::spawn(exec::session(docker, app, container, request, stream));
             }
         }
         Ok(None)
