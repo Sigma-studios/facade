@@ -160,14 +160,19 @@ pub async fn show(api: &Api, app: &str, json: bool) -> anyhow::Result<()> {
             day_text(d.day),
             d.percent().map(percent_text).unwrap_or_else(|| "-".into()),
             visitors.get(&d.day).copied().unwrap_or(0).to_string(),
-            if down.is_empty() {
-                String::new()
-            } else {
-                format!("down {} (UTC)", down.join(", "))
+            {
+                let mut notes = Vec::new();
+                if !down.is_empty() {
+                    notes.push(format!("down {} (UTC)", down.join(", ")));
+                }
+                if d.stopped > 0 {
+                    notes.push(format!("stopped {} min", d.stopped));
+                }
+                notes.join("; ")
             },
         ]
     });
-    table(&["DAY", "UP", "VISITORS", "OUTAGES"], rows);
+    table(&["DAY", "UP", "VISITORS", "NOTES"], rows);
     Ok(())
 }
 

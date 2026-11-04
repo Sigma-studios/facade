@@ -496,12 +496,18 @@ pub fn availability(server: &Server, app: &facade_core::AppSpec, now: u64) -> Av
         .collect();
     let days: Vec<DayUptime> = (from..=today)
         .map(|day| {
+            let minutes = stored.get(&day).map(Vec::as_slice);
             let len = if day == today {
-                ((now % DAY) / 60 + 1) as usize
+                // Up to now: the current minute once it is recorded.
+                let current = ((now % DAY) / 60) as usize;
+                let recorded = minutes
+                    .and_then(|m| m.get(current))
+                    .is_some_and(|m| *m != UNKNOWN);
+                current + usize::from(recorded)
             } else {
                 1440
             };
-            summarize(day, stored.get(&day).map(Vec::as_slice), len)
+            summarize(day, minutes, len)
         })
         .collect();
     let (up, down) = days.iter().fold((0, 0), |(u, d), day| {
