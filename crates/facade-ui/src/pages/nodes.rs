@@ -10,7 +10,8 @@ use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
 use crate::api;
 use crate::components::{
     CopyField, DiskMeter, ErrorNote, Loading, Menu, Meter, Modal, OnlineBadge, Range, RangePicker,
-    Sort, SortKey, SortTh, Sparkline, TabBar, UsageFeed, usage_feed,
+    Sort, SortKey, SortTh, Sparkline, TabBar, UsageFeed, byte_rate as rate, latest as last,
+    per_second, usage_feed,
 };
 use crate::util::{Polled, ago, bytes, me, percent, polled, run, toasts};
 
@@ -446,18 +447,23 @@ fn NodeMetrics(
     storage: Signal<Option<StorageReport>>,
 ) -> impl IntoView {
     let range = RwSignal::new(if connected { Range::Hour } else { Range::Day });
+    let feed = usage_feed(
+        Signal::stored(format!("/api/nodes/{name}/usage")),
+        range.into(),
+    );
     let UsageFeed {
         cpu,
         mem,
         disk,
         net_in,
         net_out,
+        requests,
+        errors,
         span,
         gap,
-    } = usage_feed(
-        Signal::stored(format!("/api/nodes/{name}/usage")),
-        range.into(),
-    );
+        ..
+    } = feed;
+    let traffic = feed.has_traffic();
     let (cores, mem_total, disk_total) = (totals.cpus, totals.mem_total, totals.disk_total);
     let now = Signal::derive(move || live.get().unwrap_or_else(|| totals.clone()));
     let cpu_share = Signal::derive(move || now.get().cpu_percent as f64);
@@ -547,18 +553,42 @@ fn NodeMetrics(
                 <Sparkline title="Sent" points=net_out span=span gap=gap max=Signal::stored(None)
                     format=rate bare=true axis=true/>
             </section>
+            // Its apps' requests through its entry point, added up.
+            <Show when=move || traffic.get()>
+                <section class="metric-panel">
+                    <div class="metric-label">"Traffic"</div>
+                    {figure(
+                        Signal::derive(move || last(requests).map(per_second).unwrap_or_else(|| "—".into())),
+                        "requests".into(),
+                    )}
+                    <div class="metric-sub">{move || {
+                        // Points are evenly spaced: their rates add up as their counts do.
+                        let total = |s: Signal<Vec<crate::components::Sample>>| {
+                            s.with(|s| s.iter().map(|s| s.value).filter(|v| !v.is_nan()).sum::<f64>())
+                        };
+                        let (r, e) = (total(requests), total(errors));
+                        if r > 0.0 {
+                            format!("{} answered 5xx over the period", share(e / r))
+                        } else {
+                            "No requests over the period".into()
+                        }
+                    }}</div>
+                    <Sparkline title="Requests" points=requests span=span gap=gap max=Signal::stored(None)
+                        format=per_second bare=true axis=true extra=errors extra_label="5xx"/>
+                </section>
+            </Show>
         </div>
     }
 }
 
-/// The latest figure of a series.
-fn last(series: Signal<Vec<crate::components::Sample>>) -> Option<f64> {
-    series.with(|s| s.last().map(|s| s.value))
-}
-
-/// Bytes per second, as people read them.
-fn rate(v: f64) -> String {
-    format!("{}/s", bytes(v.max(0.0) as u64))
+/// A share (0 to 1) in percent, with a decimal when small.
+fn share(v: f64) -> String {
+    let percent = v * 100.0;
+    if percent > 0.0 && percent < 1.0 {
+        format!("{percent:.1} %")
+    } else {
+        format!("{percent:.0} %")
+    }
 }
 
 /// Why apps on the node cannot be reached over the web, if they cannot.

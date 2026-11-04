@@ -184,7 +184,9 @@ pub fn Trend(
 const SPARK_W: f64 = 600.0;
 const SPARK_H: f64 = 120.0;
 
-/// One point of a [`Sparkline`]: the average over its span and the peak.
+/// One point of a [`Sparkline`]: the average over its span and the peak. A
+/// value that is not a number is a break: what came before and after is not
+/// joined (counters that started again, say).
 #[derive(Clone, Copy, PartialEq)]
 pub struct Sample {
     pub at: u64,
@@ -192,12 +194,43 @@ pub struct Sample {
     pub peak: f64,
 }
 
+impl Sample {
+    fn known(&self) -> bool {
+        !self.value.is_nan()
+    }
+}
+
+/// Runs of points close enough in time (and with no break between them) to be
+/// joined.
+fn runs(points: &[Sample], gap: u64) -> Vec<Vec<Sample>> {
+    let mut runs: Vec<Vec<Sample>> = Vec::new();
+    let mut broken = true;
+    for s in points {
+        if !s.known() {
+            broken = true;
+            continue;
+        }
+        match runs.last_mut() {
+            Some(run)
+                if !broken && run.last().is_some_and(|l| s.at.saturating_sub(l.at) <= gap) =>
+            {
+                run.push(*s)
+            }
+            _ => runs.push(vec![*s]),
+        }
+        broken = false;
+    }
+    runs
+}
+
 /// One series over `span` (start, end), with a hover crosshair and tooltip. Points
 /// further apart than `gap` seconds are not joined (the app was not running). A
 /// faint line shows the peaks when they differ from the averages. `max` fixes the
 /// top of the scale (a memory limit, a CPU limit); the data can raise it.
 /// `bare`: only the plot, for a row that already names it and gives its value
-/// (with the time axis below if `axis`).
+/// (with the time axis below if `axis`). `extra`: a second series drawn over
+/// the first in the alert colour (errors among requests), named `extra_label`;
+/// in a second series colour if `calm`.
 #[component]
 pub fn Sparkline(
     title: &'static str,
@@ -208,14 +241,22 @@ pub fn Sparkline(
     format: fn(f64) -> String,
     #[prop(optional)] bare: bool,
     #[prop(optional)] axis: bool,
+    #[prop(optional, into)] extra: Option<Signal<Vec<Sample>>>,
+    #[prop(optional)] extra_label: &'static str,
+    /// The second series is another figure, not an alarm (a second colour).
+    #[prop(optional)]
+    calm: bool,
 ) -> impl IntoView {
     let hover = RwSignal::new(None::<usize>);
+    let extra = extra.unwrap_or_else(|| Signal::stored(Vec::new()));
     let scale = move || {
-        let data_max = points.with(|p| {
+        let top = |p: &Vec<Sample>| {
             p.iter()
+                .filter(|s| s.known())
                 .map(|s| s.peak.max(s.value))
                 .fold(0.0_f64, f64::max)
-        });
+        };
+        let data_max = points.with(top).max(extra.with(top));
         max.get().unwrap_or(0.0).max(data_max).max(1e-9)
     };
     let x_of = move |at: u64| {
@@ -225,25 +266,9 @@ pub fn Sparkline(
     };
     let y_of = move |v: f64| SPARK_H - (v / scale()) * (SPARK_H - 8.0) - 2.0;
     let has_peaks = move || points.with(|p| p.iter().any(|s| s.peak > s.value * 1.05 + 1e-9));
-    // Runs of points close enough in time to be joined.
-    let runs = move || {
-        let gap = gap.get();
-        points.with(|p| {
-            let mut runs: Vec<Vec<Sample>> = Vec::new();
-            for s in p {
-                match runs.last_mut() {
-                    Some(run) if run.last().is_some_and(|l| s.at.saturating_sub(l.at) <= gap) => {
-                        run.push(*s)
-                    }
-                    _ => runs.push(vec![*s]),
-                }
-            }
-            runs
-        })
-    };
-    let path = move |pick: fn(&Sample) -> f64, close: bool| {
+    let draw = move |series: Signal<Vec<Sample>>, pick: fn(&Sample) -> f64, close: bool| {
         let mut d = String::new();
-        for run in runs() {
+        for run in series.with(|p| runs(p, gap.get())) {
             for (i, s) in run.iter().enumerate() {
                 let (x, y) = (x_of(s.at), y_of(pick(s)));
                 d.push_str(&format!("{}{x:.1},{y:.1} ", if i == 0 { "M" } else { "L" }));
@@ -258,7 +283,9 @@ pub fn Sparkline(
         }
         d
     };
-    let current = move || points.with(|p| p.last().map(|s| format(s.value)));
+    let path = move |pick: fn(&Sample) -> f64, close: bool| draw(points, pick, close);
+    let current =
+        move || points.with(|p| p.iter().rev().find(|s| s.known()).map(|s| format(s.value)));
     let long = move || {
         let (start, end) = span.get();
         end.saturating_sub(start) >= 86400
@@ -284,6 +311,7 @@ pub fn Sparkline(
         let nearest = points.with(|p| {
             p.iter()
                 .enumerate()
+                .filter(|(_, s)| s.known())
                 .min_by(|(_, a), (_, b)| (x_of(a.at) - x).abs().total_cmp(&(x_of(b.at) - x).abs()))
                 .map(|(i, _)| i)
         });
@@ -295,7 +323,7 @@ pub fn Sparkline(
     };
 
     view! {
-        <figure class="spark" class:spark-bare=bare>
+        <figure class="spark" class:spark-bare=bare class:spark-calm=calm>
             {(!bare).then(|| view! {
                 <figcaption class="spark-head">
                     <span class="spark-title">
@@ -306,12 +334,17 @@ pub fn Sparkline(
                                 <span class="spark-key-peak"></span>"peak"
                             </span>
                         </Show>
+                        <Show when=move || extra.with(|e| e.iter().any(Sample::known))>
+                            <span class="spark-key">
+                                <span class="spark-key-extra"></span>{extra_label}
+                            </span>
+                        </Show>
                     </span>
                     <span class="spark-now">{move || current().unwrap_or_else(|| "—".into())}</span>
                 </figcaption>
             })}
             <Show
-                when=move || points.with(|p| !p.is_empty())
+                when=move || points.with(|p| p.iter().any(Sample::known))
                 fallback=|| view! { <div class="spark-empty">"No samples over this period yet"</div> }
             >
                 <div class="spark-plot" on:mousemove=on_move on:mouseleave=move |_| hover.set(None)>
@@ -326,6 +359,9 @@ pub fn Sparkline(
                         </Show>
                         <path class="spark-line" d=move || path(|s| s.value, false)
                             vector-effect="non-scaling-stroke"/>
+                        <path class="spark-extra-area" d=move || draw(extra, |s| s.value, true)/>
+                        <path class="spark-extra" d=move || draw(extra, |s| s.value, false)
+                            vector-effect="non-scaling-stroke"/>
                         {move || hovered().map(|s| {
                             let (x, y) = (x_of(s.at), y_of(s.value));
                             view! {
@@ -339,10 +375,16 @@ pub fn Sparkline(
                     {move || hovered().map(|s| {
                         let left = (x_of(s.at) / SPARK_W * 100.0).clamp(12.0, 88.0);
                         let peak = (s.peak > s.value * 1.05 + 1e-9).then(|| format!("peak {}", format(s.peak)));
+                        let also = extra.with(|e| {
+                            e.iter()
+                                .find(|e| e.at == s.at && e.known())
+                                .map(|e| format!("{extra_label} {}", format(e.value)))
+                        });
                         view! {
                             <div class="spark-tip" style=format!("left: {left:.1}%")>
                                 <strong>{format(s.value)}</strong>
                                 {peak.map(|p| view! { <span>{p}</span> })}
+                                {also.map(|a| view! { <span class="spark-tip-extra">{a}</span> })}
                                 <span>{stamp(s.at)}</span>
                             </div>
                         }
@@ -411,17 +453,44 @@ impl Range {
 }
 
 /// What a `…/usage` endpoint said over the chosen period, as chart series.
+/// Figures that are not always known (rates from counters) are breaks where
+/// they are not (see [`Sample`]).
 #[derive(Clone, Copy)]
 pub struct UsageFeed {
     pub cpu: Signal<Vec<Sample>>,
     pub mem: Signal<Vec<Sample>>,
     pub disk: Signal<Vec<Sample>>,
-    /// A node's traffic in bytes per second, received and sent (points with no
-    /// figure left out).
+    /// Network traffic in bytes per second, received and sent.
     pub net_in: Signal<Vec<Sample>>,
     pub net_out: Signal<Vec<Sample>>,
+    /// Requests through the entry point per second, and those answered 5xx.
+    pub requests: Signal<Vec<Sample>>,
+    pub errors: Signal<Vec<Sample>>,
+    /// Time to response headers, in milliseconds: the 95th percentile (its
+    /// peak the same), and the median.
+    pub p95: Signal<Vec<Sample>>,
+    pub p50: Signal<Vec<Sample>>,
+    /// Client connections open through the entry point.
+    pub connections: Signal<Vec<Sample>>,
     pub span: Signal<(u64, u64)>,
     pub gap: Signal<u64>,
+}
+
+impl UsageFeed {
+    /// Whether the entry point counted anything for it over the period: no
+    /// domain, nothing to show (rather than zeros).
+    pub fn has_traffic(&self) -> Signal<bool> {
+        let (requests, connections) = (self.requests, self.connections);
+        Signal::derive(move || {
+            requests.with(|r| r.iter().any(Sample::known))
+                || connections.with(|c| c.iter().any(Sample::known))
+        })
+    }
+}
+
+/// The latest known figure of a series.
+pub fn latest(series: Signal<Vec<Sample>>) -> Option<f64> {
+    series.with(|s| s.iter().rev().find(|s| s.known()).map(|s| s.value))
 }
 
 /// The period buttons above usage charts.
@@ -439,37 +508,83 @@ pub fn RangePicker(range: RwSignal<Range>) -> impl IntoView {
     }
 }
 
-/// CPU and memory (and disk, for a node) charts over a chosen period, from a
-/// `…/usage` endpoint. The maxima fix the top of each scale (limits, totals).
+/// An app's charts over a chosen period, from its `…/usage` endpoint: CPU,
+/// memory and network (what its container uses: not for a static site, see
+/// `resources`), then requests and response times when its entry point counts
+/// any. The maxima fix the top of the CPU and memory scales (its limits).
 #[component]
 pub fn UsageCharts(
     #[prop(into)] url: Signal<String>,
     #[prop(into)] cpu_max: Signal<Option<f64>>,
     #[prop(into)] mem_max: Signal<Option<f64>>,
-    #[prop(optional, into)] disk_max: Option<Signal<Option<f64>>>,
+    #[prop(into)] resources: Signal<bool>,
 ) -> impl IntoView {
     let range = RwSignal::new(Range::Hour);
+    let feed = usage_feed(url, range.into());
     let UsageFeed {
         cpu,
         mem,
-        disk,
+        net_in,
+        net_out,
+        requests,
+        errors,
+        p95,
+        p50,
         span,
         gap,
         ..
-    } = usage_feed(url, range.into());
+    } = feed;
+    let traffic = feed.has_traffic();
+    let none = Signal::stored(None);
 
     view! {
-        <div class="charts-head">
-            <h2 class="section-title">"Usage"</h2>
-            <RangePicker range/>
-        </div>
-        <div class="charts">
-            <Sparkline title="CPU" points=cpu span=span gap=gap max=cpu_max format=|v| format!("{v:.1} %")/>
-            <Sparkline title="Memory" points=mem span=span gap=gap max=mem_max format=|v| bytes(v as u64)/>
-            {disk_max.map(|disk_max| view! {
-                <Sparkline title="Disk" points=disk span=span gap=gap max=disk_max format=|v| bytes(v as u64)/>
-            })}
-        </div>
+        <Show when=move || resources.get() || traffic.get()>
+            <div class="charts-head">
+                <h2 class="section-title">"Usage"</h2>
+                <RangePicker range/>
+            </div>
+            <div class="charts charts-app">
+                <Show when=move || resources.get()>
+                    <Sparkline title="CPU" points=cpu span=span gap=gap max=cpu_max format=|v| format!("{v:.1} %")/>
+                    <Sparkline title="Memory" points=mem span=span gap=gap max=mem_max format=|v| bytes(v as u64)/>
+                    <Sparkline title="Network in" points=net_in span=span gap=gap max=none format=byte_rate
+                        extra=net_out extra_label="out" calm=true/>
+                </Show>
+                <Show when=move || traffic.get()>
+                    <Sparkline title="Requests" points=requests span=span gap=gap max=none format=per_second
+                        extra=errors extra_label="5xx"/>
+                    <Sparkline title="Response p95" points=p95 span=span gap=gap max=none format=millis
+                        extra=p50 extra_label="p50" calm=true/>
+                </Show>
+            </div>
+        </Show>
+    }
+}
+
+/// Bytes per second, as people read them.
+pub fn byte_rate(v: f64) -> String {
+    format!("{}/s", bytes(v.max(0.0) as u64))
+}
+
+/// A rate of events per second, with the digits that matter.
+pub fn per_second(v: f64) -> String {
+    if v >= 10.0 {
+        format!("{v:.0}/s")
+    } else if v >= 1.0 {
+        format!("{v:.1}/s")
+    } else {
+        format!("{v:.2}/s")
+    }
+}
+
+/// A response time in milliseconds, as people read them.
+pub fn millis(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{:.1} s", ms / 1000.0)
+    } else if ms >= 10.0 {
+        format!("{ms:.0} ms")
+    } else {
+        format!("{ms:.1} ms")
     }
 }
 
@@ -515,12 +630,13 @@ pub fn usage_feed(url: Signal<String>, range: Signal<Range>) -> UsageFeed {
             usage.data.with(|u| match u {
                 Some((u, r, points)) if *r == range.get() && *u == url.get() => points
                     .iter()
-                    .filter_map(|p| {
-                        f(p).map(|value| Sample {
+                    .map(|p| {
+                        let value = f(p).unwrap_or(f64::NAN);
+                        Sample {
                             at: p.at,
                             value,
                             peak: value,
-                        })
+                        }
                     })
                     .collect(),
                 _ => Vec::new(),
@@ -529,6 +645,11 @@ pub fn usage_feed(url: Signal<String>, range: Signal<Range>) -> UsageFeed {
     };
     let net_in = rates(|p| p.net_rx);
     let net_out = rates(|p| p.net_tx);
+    let requests = rates(|p| p.requests);
+    let errors = rates(|p| p.errors_5xx);
+    let p95 = rates(|p| p.p95_ms);
+    let p50 = rates(|p| p.p50_ms);
+    let connections = rates(|p| p.connections);
     let span = Signal::derive(move || {
         let now = crate::util::now();
         (now.saturating_sub(range.get().secs()), now)
@@ -540,6 +661,11 @@ pub fn usage_feed(url: Signal<String>, range: Signal<Range>) -> UsageFeed {
         disk,
         net_in,
         net_out,
+        requests,
+        errors,
+        p95,
+        p50,
+        connections,
         span,
         gap,
     }

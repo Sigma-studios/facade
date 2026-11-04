@@ -278,9 +278,9 @@ p { margin: 0 0 12px; }
   border-radius: var(--radius);
   padding: 14px 16px 12px;
 }
-.spark-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+.spark-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
 .spark-title { font-size: 12.5px; color: var(--text-secondary); font-weight: 500; }
-.spark-now { font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.spark-now { font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .spark-plot { position: relative; height: 120px; cursor: crosshair; }
 .spark-plot svg { width: 100%; height: 100%; display: block; overflow: visible; }
 .spark-base { stroke: var(--border-strong); stroke-width: 1; }
@@ -309,6 +309,18 @@ p { margin: 0 0 12px; }
   gap: 8px;
 }
 .spark-tip span { opacity: 0.75; }
+/* A second series over the first: errors among requests in the alert colour,
+   another figure (sent bytes, the median) in the second series colour. */
+.spark-extra { fill: none; stroke: var(--critical); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.spark-extra-area { fill: var(--critical); fill-opacity: 0.14; }
+.spark-calm .spark-extra { stroke: var(--series-2); }
+.spark-calm .spark-extra-area { fill: none; }
+.spark-key-extra { display: inline-block; width: 14px; height: 0; border-top: 2px solid var(--critical); margin-left: 4px; }
+.spark-calm .spark-key-extra { border-top-color: var(--series-2); }
+.spark-tip-extra::before { content: ""; display: inline-block; width: 10px; height: 0; border-top: 2px solid var(--critical); margin-right: 4px; vertical-align: middle; }
+.spark-calm .spark-tip-extra::before { border-top-color: var(--series-2); }
+/* An app's charts: up to five on one row on a wide screen. */
+.charts-app { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
 .spark-scale { position: absolute; top: 0; left: 0; font-size: 11px; color: var(--text-muted); pointer-events: none; }
 .spark-empty { height: 120px; display: grid; place-items: center; color: var(--text-muted); font-size: 12.5px; }
 

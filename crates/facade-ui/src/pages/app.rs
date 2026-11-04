@@ -687,6 +687,8 @@ fn OverviewTab(
     let spec = move || app.get().map(|a| a.spec);
     let stats = move || app.get().and_then(|a| a.stats);
     let disk = move || app.get().and_then(|a| a.disk);
+    // Counted by the entry point: nothing for an app without a domain.
+    let open = move || stats().and_then(|s| s.traffic).map(|t| t.open);
     let cpu_max = Signal::derive(move || spec().and_then(|s| s.limits.cpus).map(|c| c * 100.0));
     let mem_max = Signal::derive(move || {
         spec()
@@ -747,14 +749,19 @@ fn OverviewTab(
                     <span class="tile-value">{move || stats().map(|s| format!("↓ {}", bytes(s.net_rx))).unwrap_or_else(|| "—".into())}</span>
                     <span class="tile-sub">{move || stats().map(|s| format!("↑ {} sent", bytes(s.net_tx))).unwrap_or_default()}</span>
                 </div>
+                {move || open().map(|open| view! {
+                    <div class="tile" title="Kept-alive HTTP, WebSockets and TLS ports, through the entry point">
+                        <span class="tile-label">"Connections"</span>
+                        <span class="tile-value">{open}</span>
+                        <span class="tile-sub">"open now"</span>
+                    </div>
+                })}
             </div>
         </Show>
         <LatestDeployment name=name deployments
             auto_deploy=Signal::derive(move || spec().is_some_and(|s| s.stack.is_none()))/>
-        <Show when=move || !is_static()>
-            <UsageCharts url=Signal::derive(move || format!("/api/apps/{}/usage", name.get()))
-                cpu_max=cpu_max mem_max=mem_max/>
-        </Show>
+        <UsageCharts url=Signal::derive(move || format!("/api/apps/{}/usage", name.get()))
+            cpu_max=cpu_max mem_max=mem_max resources=Signal::derive(move || !is_static())/>
         <Show when=move || spec().is_some_and(|s| !s.domains.is_empty())>
             <section class="app-domains">
                 <h2 class="section-title">"Domains"</h2>
