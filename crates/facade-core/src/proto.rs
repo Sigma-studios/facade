@@ -23,9 +23,15 @@ use crate::spec::AppSpec;
 /// agent would drop without a word.
 /// 6: agents run commands for `facade exec` over a data connection
 /// ([`AgentRequest::ExecStream`]); the server asks only agents speaking 6.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// 7: agents list and remove the containers facade does not manage
+/// ([`AgentRequest::OtherContainers`], [`AgentRequest::RemoveOtherContainer`]).
+pub const PROTOCOL_VERSION: u32 = 7;
 /// The first protocol with [`AgentRequest::ExecStream`].
 pub const EXEC_STREAM_PROTOCOL: u32 = 6;
+/// The first protocol with [`AgentRequest::OtherContainers`] and
+/// [`AgentRequest::RemoveOtherContainer`]: older agents fail to parse them and
+/// drop the connection, so the server never sends them one.
+pub const OTHER_CONTAINERS_PROTOCOL: u32 = 7;
 /// The oldest agent protocol the server still talks to. Agents in between are
 /// sent the server's binary and update themselves.
 pub const MIN_AGENT_PROTOCOL: u32 = 3;
@@ -274,6 +280,19 @@ pub enum AgentRequest {
         app: String,
         request: crate::exec::ExecRequest,
     },
+    /// The node's containers without facade's labels. Answers
+    /// `Vec<OtherContainer>`.
+    OtherContainers,
+    /// Stop and remove one of those (by name or id), and its anonymous volumes
+    /// with `volumes`; with `image`, its image too when no other container uses
+    /// it. Named volumes are never touched. Answers [`RemovedContainer`].
+    RemoveOtherContainer {
+        container: String,
+        #[serde(default)]
+        volumes: bool,
+        #[serde(default)]
+        image: bool,
+    },
 }
 
 /// Stacks deploy in two phases: every service is built first (nothing changes if
@@ -444,6 +463,131 @@ impl Listener {
             _ => "another program".into(),
         }
     }
+}
+
+/// A container on a node that facade does not manage: started by hand, by
+/// docker compose, by another tool. Its ports are closed to apps, and nothing in
+/// facade stops or updates it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OtherContainer {
+    pub name: String,
+    /// The first 12 characters, as `docker ps` shows it.
+    pub id: String,
+    pub image: String,
+    /// `running`, `exited`, `restarting`…
+    pub state: String,
+    /// Docker's words: `Up 3 days`, `Exited (0) 2 hours ago`.
+    pub status: String,
+    pub created: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<ContainerPort>,
+    /// The docker compose project and service it was created for, from its
+    /// `com.docker.compose.*` labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_service: Option<String>,
+    /// Its restart policy: `always`, `unless-stopped`, `on-failure`; `None`
+    /// for `no`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<String>,
+    /// What it wrote outside its volumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+impl OtherContainer {
+    /// Its published ports, `3001→3000/tcp, 127.0.0.1:5432→5432/tcp`: the
+    /// address only when it is not every interface, each port once.
+    pub fn ports_text(&self) -> String {
+        let mut shown: Vec<String> = Vec::new();
+        for p in &self.ports {
+            let text = match p.address.as_str() {
+                "" | "0.0.0.0" | "::" => format!("{}→{}/{}", p.host, p.container, p.protocol),
+                _ => p.to_string(),
+            };
+            if !shown.contains(&text) {
+                shown.push(text);
+            }
+        }
+        shown.join(", ")
+    }
+
+    /// `notremodelesocial/web`, for a container docker compose created.
+    pub fn compose(&self) -> Option<String> {
+        let project = self.compose_project.as_ref()?;
+        Some(match &self.compose_service {
+            Some(service) => format!("{project}/{service}"),
+            None => project.clone(),
+        })
+    }
+
+    /// What to know before removing it: see [`container_warnings`].
+    pub fn warnings(&self) -> Vec<String> {
+        container_warnings(self.compose_project.as_deref(), self.restart.as_deref())
+    }
+}
+
+/// What may matter once a container is removed: something outside facade may
+/// create it again, or someone meant it to stay up.
+pub fn container_warnings(compose_project: Option<&str>, restart: Option<&str>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(project) = compose_project {
+        warnings.push(format!(
+            "it belongs to docker compose project {project}: whatever runs `docker compose up` for it (a CI job, a script) creates it again"
+        ));
+    }
+    if let Some(policy @ ("always" | "unless-stopped")) = restart {
+        warnings.push(format!(
+            "it restarts {policy}: someone meant it to stay up (removed, Docker no longer brings it back)"
+        ));
+    }
+    warnings
+}
+
+/// A port a container publishes on the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerPort {
+    pub protocol: crate::spec::Protocol,
+    /// The host address it is bound to (`0.0.0.0`, `::`, `127.0.0.1`).
+    pub address: String,
+    pub host: u16,
+    pub container: u16,
+}
+
+impl std::fmt::Display for ContainerPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let address = if self.address.contains(':') {
+            format!("[{}]", self.address)
+        } else {
+            self.address.clone()
+        };
+        write!(
+            f,
+            "{address}:{}→{}/{}",
+            self.host, self.container, self.protocol
+        )
+    }
+}
+
+/// What removing a container did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemovedContainer {
+    pub name: String,
+    pub id: String,
+    /// Anonymous volumes removed with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
+    /// The image removed with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Why the image stays, when it was asked for: another container uses it,
+    /// facade built it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_kept: Option<String>,
+    /// What [`OtherContainer::warnings`] says of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// What Docker and facade keep on a node's disk, and the last cleanup.
@@ -649,6 +793,41 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn describes_other_containers() {
+        let port = |address: &str, host, container| ContainerPort {
+            protocol: crate::spec::Protocol::Tcp,
+            address: address.into(),
+            host,
+            container,
+        };
+        let c = OtherContainer {
+            name: "notremodelesocial-web-1".into(),
+            id: "0123456789ab".into(),
+            image: "notremodelesocial-web".into(),
+            state: "running".into(),
+            status: "Up 3 days".into(),
+            created: 0,
+            ports: vec![
+                port("0.0.0.0", 3001, 3000),
+                port("::", 3001, 3000),
+                port("127.0.0.1", 5432, 5432),
+                port("::1", 6379, 6379),
+            ],
+            compose_project: Some("notremodelesocial".into()),
+            compose_service: Some("web".into()),
+            restart: Some("unless-stopped".into()),
+            size: None,
+        };
+        assert_eq!(
+            c.ports_text(),
+            "3001→3000/tcp, 127.0.0.1:5432→5432/tcp, [::1]:6379→6379/tcp"
+        );
+        assert_eq!(c.compose().as_deref(), Some("notremodelesocial/web"));
+        assert_eq!(c.warnings().len(), 2);
+        assert!(container_warnings(None, Some("on-failure")).is_empty());
+    }
 
     #[test]
     fn measured_docker_keeps_parts_within_the_disk() {
