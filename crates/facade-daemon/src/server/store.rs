@@ -16,6 +16,8 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+pub mod edge;
+
 pub struct Store(Mutex<Connection>);
 
 const SCHEMA: &str = r#"
@@ -356,6 +358,7 @@ impl Store {
         )?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(AUTO_DEPLOY_SCHEMA)?;
+        conn.execute_batch(edge::SCHEMA)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "node_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;
         add_column(&conn, "node_usage", "net_tx", "INTEGER NOT NULL DEFAULT 0")?;

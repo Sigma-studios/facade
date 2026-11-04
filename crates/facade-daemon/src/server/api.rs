@@ -66,6 +66,10 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/nodes/{name}/token", post(rotate_node_token))
         .route("/api/nodes/{name}/metrics", get(node_metrics))
         .route("/api/nodes/{name}/usage", get(node_usage))
+        .route(
+            "/api/nodes/{name}/insights",
+            get(super::edge::get_node_insights),
+        )
         .route("/api/nodes/{name}/ip", put(set_node_ip))
         .route("/api/nodes/{name}/prune", post(prune_node))
         .route("/api/nodes/{name}/ports", get(node_ports))
@@ -120,6 +124,11 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/apps/{name}/exec", get(exec_app))
         .route("/api/apps/{name}/metrics", get(app_metrics))
         .route("/api/apps/{name}/usage", get(app_usage))
+        .route(
+            "/api/apps/{name}/insights",
+            get(super::edge::get_app_insights),
+        )
+        .route("/api/apps/{name}/errors", get(super::edge::get_app_errors))
         .route("/api/apps/{name}/deployments", get(list_deployments))
         .route("/api/deployments", get(find_deployments))
         .route("/api/deployments/{id}", get(get_deployment))
@@ -846,7 +855,8 @@ async fn update_dns(
 }
 
 async fn domains(State(server): S, user: User) -> Json<Vec<DomainStatus>> {
-    let all = super::dns::statuses(&server).await;
+    let mut all = super::dns::statuses(&server).await;
+    server.reach.annotate(&mut all);
     Json(
         all.into_iter()
             .filter(|d| match &d.app {

@@ -219,6 +219,8 @@ fn conditions(server: &Server) -> HashMap<String, String> {
         }
     }
 
+    out.extend(super::reach::alerts(server));
+
     for (what, error) in server.backup_errors.read().iter() {
         out.insert(
             format!("backup:{what}"),

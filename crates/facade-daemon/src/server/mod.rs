@@ -8,11 +8,13 @@ pub mod backup_store;
 pub mod backups;
 mod compose;
 mod dns;
+mod edge;
 mod git;
 mod github;
 mod hub;
 mod inspect;
 mod monitor;
+mod reach;
 mod registry;
 mod release;
 pub mod secrets;
@@ -78,6 +80,10 @@ pub struct Server {
     pub releases: release::Releases,
     /// Apps and stacks deploying by themselves when their source changes.
     pub auto_deploy: autodeploy::AutoDeploy,
+    /// Bytes, failed requests and visitors from the entry points.
+    pub edge: edge::Edge,
+    /// The outside check of every domain, and apps' availability.
+    pub reach: reach::Reach,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -428,6 +434,7 @@ impl Server {
 
     pub fn record_report(&self, node: &str, report: facade_core::proto::NodeReport) {
         let at = facade_core::now();
+        self.edge.record(&self.store, node, at, &report);
         let mut live = self.live.write();
         let mut usage = Vec::new();
         // What the apps' counters grew by since their last readings, and
@@ -595,6 +602,8 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         upgrade_attempts: Default::default(),
         releases: Default::default(),
         auto_deploy: Default::default(),
+        edge: Default::default(),
+        reach: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -639,6 +648,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     }
     tasks.spawn(acme::run(server.clone()));
     tasks.spawn(monitor::run(server.clone()));
+    tasks.spawn(reach::run(server.clone()));
     tasks.spawn(artifacts::collect_garbage(server.clone()));
     tasks.spawn(backups::run(server.clone()));
     tokio::spawn(release::check_regularly(server.clone()));
