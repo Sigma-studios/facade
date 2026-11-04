@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{
-    AppSpec, BackupSpec, Build, HealthCheck, Limits, PortMap, Source, SpecError, StackRef, Volume,
-    validate_domain, validate_name,
+    AppSpec, BackupSpec, Build, DeployStrategy, HealthCheck, Limits, PortMap, Source, SpecError,
+    StackRef, Volume, validate_domain, validate_name,
 };
 
 fn err<T>(msg: impl Into<String>) -> Result<T, SpecError> {
@@ -77,6 +77,8 @@ pub struct ServiceSpec {
     pub delegate_cgroups: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<DeployStrategy>,
 }
 
 impl ServiceSpec {
@@ -106,7 +108,8 @@ impl ServiceSpec {
             stop_timeout_secs,
             stop_signal,
             delegate_cgroups,
-            backup
+            backup,
+            deploy
         );
         if self.limits.memory_mb.is_some() {
             out.limits.memory_mb = self.limits.memory_mb;
@@ -205,6 +208,7 @@ impl ServiceSpec {
             stop_timeout_secs: self.stop_timeout_secs,
             stop_signal: self.stop_signal.clone(),
             backup: self.backup.clone(),
+            deploy: self.deploy.unwrap_or_default(),
         };
         spec.validate()
             .map_err(|e| SpecError(format!("service {service}: {}", e.0)))?;

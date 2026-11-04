@@ -287,6 +287,7 @@ template in `lang::generated_dockerfile`.
 | `facade app update <app> --redirect www.example.com` | domains redirecting to the main one |
 | `facade app update <app> -v world:/data:20G` | a volume with a size of its own |
 | `facade app update <app> --stop-timeout 60 --stop-signal SIGINT --pids 8192` | how it stops, and how many processes it may run |
+| `facade app update <app> --deploy overlap` | deploys start the new container next to the old one (or `replace`, `auto`) |
 | `facade app update <app> --delegate-cgroups true` | let a process supervisor divide the app's limits |
 | `facade app update <app> --backup-before "…" --backup-after "…"` | commands making its files whole while backed up |
 | `facade deploy <app> [--commit REF] [--rebuild]` / `rollback` / `cancel` | deploys |
@@ -350,8 +351,34 @@ server writing its world, a queue draining) needs more:
 facade app update world --stop-timeout 120 --stop-signal SIGINT
 ```
 
-The old container stops before the new one starts, so a replaced app is down for as
-long as it takes to stop. Docker uses the same settings when the node reboots.
+Docker uses the same settings when the node reboots.
+
+### Deploys without downtime
+
+A deploy or a settings change replacing the container of an app reached through its
+node's entry point **overlaps**: the new container starts next to the running one,
+traffic moves to it once it is ready (its health check passes, or it stays up a few
+seconds, and it accepts connections on its ports), then the old one has its stop
+timeout for the requests and connections it still serves (WebSockets included) to
+end, and gets its stop signal. If the new one never gets ready, it is removed and the
+old one carries on: the deploy fails, nothing went down.
+
+Otherwise the old container stops before the new one starts, and the app is down
+meanwhile. That is the case of apps with published ports or on the node's network
+(two cannot bind the same ports), of apps no domain or TLS port routes to (workers,
+bots: there is no traffic to move, and two would do the work twice), and of apps with
+volumes (two copies writing at once can corrupt a SQLite file or a database). The
+deploy log says which way it went and why. An app that copes with two copies (a
+volume only read, or written by one of them) can ask for overlap, and any app can
+ask for the old way:
+
+```sh
+facade app update blog --deploy overlap      # or replace, or auto (the default)
+```
+
+While both run the node holds both in memory: if less is free than the app's memory
+limit, the old one stops first. Apps on the same node reaching the app by name may
+reach either copy until the old one stops.
 
 A container may run 4096 processes and threads at once; `--pids` changes that, for
 a JVM or a supervisor running many programs.
@@ -696,6 +723,7 @@ the server; older ones need the server's `facaded` installed by hand.
 * Users other than admins, and per-app permissions.
 * Links across nodes: a database and the apps using it share a node.
 * Backups to somewhere other than the server's disk (S3 and the like).
-* Zero-downtime deploys (the new container starting next to the old one) and deploys
-  on push (webhooks).
+* Deploys on push (webhooks).
+* Zero downtime for apps that cannot overlap (published ports, the node's network,
+  volumes), for `facade restart`, and for an app moving to another node.
 * Stacks and databases owned by members (admins create them for now).

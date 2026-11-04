@@ -93,6 +93,7 @@ pub fn database(
         stop_timeout_secs: Some(DATABASE_STOP_TIMEOUT),
         stop_signal: None,
         backup: None,
+        deploy: Default::default(),
     };
     spec.validate()?;
     Ok(Database {

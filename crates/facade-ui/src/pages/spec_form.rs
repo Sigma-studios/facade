@@ -53,6 +53,8 @@ pub struct SpecForm {
     backup_after: RwSignal<String>,
     stop_timeout: RwSignal<String>,
     stop_signal: RwSignal<String>,
+    /// `auto`, `overlap` or `replace`.
+    deploy: RwSignal<String>,
     enabled: RwSignal<bool>,
     /// The saved limits of a running app: they are freed when it changes, so they
     /// count as available in the owner's share.
@@ -118,6 +120,7 @@ impl SpecForm {
             backup_after: s(""),
             stop_timeout: s(""),
             stop_signal: s(""),
+            deploy: s("auto"),
             enabled: RwSignal::new(true),
             own_memory: None,
             own_cpus: None,
@@ -243,6 +246,7 @@ impl SpecForm {
         form.stop_timeout.set(opt_text(spec.stop_timeout_secs));
         form.stop_signal
             .set(spec.stop_signal.clone().unwrap_or_default());
+        form.deploy.set(spec.deploy.to_string());
         form.enabled.set(spec.enabled);
         if spec.enabled {
             form.own_memory = spec.limits.memory_mb.map(|m| m as f64);
@@ -587,6 +591,14 @@ impl SpecForm {
             stop_timeout_secs,
             stop_signal,
             backup,
+            deploy: if is_static {
+                Default::default()
+            } else {
+                self.deploy
+                    .get_untracked()
+                    .parse()
+                    .map_err(|e: facade_core::SpecError| e.0)?
+            },
         };
         spec.validate().map_err(|e| e.to_string())?;
         Ok(spec)
@@ -1183,6 +1195,21 @@ pub fn SpecFields(
                         <small>"For apps that save on another signal, like " <code>"SIGINT"</code> "."</small>
                     </label>
                 </div>
+                <label class="field">
+                    <span>"Deploys"</span>
+                    <select on:change=move |ev| f.deploy.set(event_target_value(&ev))
+                        prop:value=move || f.deploy.get()>
+                        <option value="auto" selected=move || f.deploy.with(|d| d == "auto")>"Automatic"</option>
+                        <option value="overlap" selected=move || f.deploy.with(|d| d == "overlap")>"Overlap: no downtime"</option>
+                        <option value="replace" selected=move || f.deploy.with(|d| d == "replace")>"Replace: stop, then start"</option>
+                    </select>
+                    <small>
+                        "Overlap starts the new version next to the running one and moves traffic to it once it is ready; "
+                        "the old one then has its stop timeout to finish its connections. If the new one fails, the old one stays. "
+                        "Automatic overlaps apps with a domain or TLS port and no volumes (two copies writing one volume can corrupt it, as with SQLite). "
+                        "Published ports and the host network always stop the old one first."
+                    </small>
+                </label>
             </fieldset>
 
             <fieldset class="form-section">

@@ -14,7 +14,7 @@ use clap::{Args, Parser, Subcommand};
 use facade_core::api::*;
 use facade_core::proto::Listener;
 use facade_core::stack::{ServiceSpec, StackSpec};
-use facade_core::{AppSpec, Build, Limits, Link, PortMap, Source, TlsPort, Volume};
+use facade_core::{AppSpec, Build, DeployStrategy, Limits, Link, PortMap, Source, TlsPort, Volume};
 use futures_util::StreamExt;
 use reqwest::Method;
 
@@ -361,6 +361,10 @@ struct ServiceArgs {
     /// services depending on it start once it passes ("" uses the default).
     #[arg(long, allow_hyphen_values = true)]
     health: Option<String>,
+    /// How deploys replace it: overlap (no downtime), replace (stop, then start)
+    /// or auto (overlap with a domain and no volumes).
+    #[arg(long)]
+    deploy: Option<DeployStrategy>,
 }
 
 /// `--health "cmd"`: a shell check, or none for "".
@@ -443,6 +447,9 @@ impl ServiceArgs {
         }
         if let Some(health) = &self.health {
             spec.healthcheck = health_check(health);
+        }
+        if let Some(deploy) = self.deploy {
+            spec.deploy = Some(deploy).filter(|d| !d.is_auto());
         }
         Ok(())
     }
@@ -876,6 +883,11 @@ struct SpecArgs {
     /// ready), e.g. "curl -fs localhost:8080/health". Deploys wait for it ("" removes it).
     #[arg(long, allow_hyphen_values = true)]
     health: Option<String>,
+    /// How deploys replace the running container: overlap (the new one starts
+    /// next to it, no downtime), replace (stop, then start) or auto (overlap for
+    /// apps with a domain or TLS port and no volumes).
+    #[arg(long)]
+    deploy: Option<DeployStrategy>,
 }
 
 impl SpecArgs {
@@ -1073,6 +1085,9 @@ impl SpecArgs {
         }
         if let Some(health) = &self.health {
             spec.healthcheck = health_check(health);
+        }
+        if let Some(deploy) = self.deploy {
+            spec.deploy = deploy;
         }
         Ok(())
     }
@@ -3286,6 +3301,7 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 stop_timeout_secs: None,
                 stop_signal: None,
                 backup: None,
+                deploy: Default::default(),
             };
             args.apply(&mut spec, None)?;
             if spec.command.is_empty() && !suggested_command.is_empty() {
@@ -4092,6 +4108,12 @@ fn print_app_detail(view: &AppView) {
             spec.stop_signal.as_deref().unwrap_or("image's signal"),
             spec.stop_wait_secs()
         );
+    }
+    if !spec.is_static() {
+        match spec.overlap() {
+            Ok(why) => println!("deploys:   overlap, no downtime ({why})"),
+            Err(why) => println!("deploys:   replace, the old one stops first ({why})"),
+        }
     }
     if let Some(s) = &view.stats {
         println!(

@@ -1,6 +1,12 @@
 //! Docker side of the agent. Every managed container is named `facade-<app>` and
 //! labelled with the app and a hash of the workload it was created from, so
 //! convergence is "compare hash, recreate if different".
+//!
+//! A replacement that overlaps (see [`facade_core::AppSpec::overlap`]) briefly
+//! runs two: the new one as `facade-<app>_next` until traffic moves to it, the
+//! old one as `facade-<app>_old` while its connections finish. Only the app's
+//! lock holder sees them; any left by an interrupted deploy are sorted out by the
+//! next convergence (see `recover`). `_` cannot appear in app names.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -57,11 +63,27 @@ struct Inner {
     /// Containers are labelled with `token.node`, so several agents sharing one
     /// Docker daemon never touch each other's apps.
     token: JoinToken,
+    /// Apps whose routes go to this container (an id) instead of the one named
+    /// after them, while an overlapping deploy renames its two containers.
+    routed: parking_lot::Mutex<HashMap<String, String>>,
 }
 
 fn container(app: &str) -> String {
     format!("facade-{app}")
 }
+
+/// The new container of an overlapping deploy, until it is ready.
+fn next_container(app: &str) -> String {
+    format!("{}_next", container(app))
+}
+
+/// The old container of an overlapping deploy, while it drains.
+fn old_container(app: &str) -> String {
+    format!("{}_old", container(app))
+}
+
+/// How long a new container has to listen on its ports once up (or healthy).
+const LISTEN_WAIT: Duration = Duration::from_secs(120);
 
 fn network(app: &str) -> String {
     format!("facade-{app}")
@@ -123,6 +145,8 @@ pub fn run_key(w: &Workload, image: &str) -> String {
         redirects: vec![],
         // Backup commands are the server's business: changing them restarts nothing.
         backup: None,
+        // Nor does how the next replacement will go.
+        deploy: Default::default(),
         ..w.spec.clone()
     };
     short_hash(&(&spec, &w.env, w.revision, &w.commit, image))
@@ -169,6 +193,23 @@ fn aliases(w: &Workload) -> Vec<String> {
     names.extend(w.aliases.iter().cloned());
     names.dedup();
     names
+}
+
+/// The host ports Docker publishes a container's ports on: where the entry
+/// point reaches it.
+fn loopback_ports(c: &bollard::models::ContainerInspectResponse) -> Vec<u16> {
+    c.network_settings
+        .as_ref()
+        .and_then(|n| n.ports.as_ref())
+        .map(|ports| {
+            ports
+                .values()
+                .flatten()
+                .flatten()
+                .filter_map(|b| b.host_port.as_ref()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Built images kept besides the running one, for rollbacks.
@@ -253,7 +294,12 @@ impl Runtime {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
-        Ok(Self(Arc::new(Inner { docker, dir, token })))
+        Ok(Self(Arc::new(Inner {
+            docker,
+            dir,
+            token,
+            routed: Default::default(),
+        })))
     }
 
     pub fn docker(&self) -> &Docker {
@@ -324,6 +370,7 @@ impl Runtime {
         log.begin();
         let run_key = run_key(w, &image);
         let name = container(app);
+        self.recover(app).await?;
         match self
             .docker()
             .inspect_container(&name, None::<InspectContainerOptions>)
@@ -349,10 +396,36 @@ impl Runtime {
                     }
                     return Ok(AppState::Running);
                 }
+                if w.spec.delegate_cgroups
+                    && let Some(why) = cgroups::unsupported()
+                {
+                    bail!("{app} asks for its cgroups, but {why}");
+                }
                 if log.is_deployment() {
                     self.release(w, &image, log).await?;
                 }
-                log.line("configuration changed, replacing container");
+                let serving =
+                    running && existing.state.as_ref().and_then(|s| s.restarting) != Some(true);
+                let overlap = if serving {
+                    self.plan_overlap(w).await
+                } else {
+                    Err("the old one is not running".into())
+                };
+                match overlap {
+                    Ok(why) => {
+                        log.line(format!(
+                            "strategy: overlap, the new container starts next to the running one ({why})"
+                        ));
+                        self.overlap(w, &image, &run_key, &existing, log).await?;
+                        if !matches!(w.spec.source, Source::Image { .. }) {
+                            self.prune_images(app, &image, KEEP_IMAGES).await;
+                        }
+                        return Ok(AppState::Running);
+                    }
+                    Err(why) => log.line(format!(
+                        "strategy: replace, the old container stops before the new one starts ({why})"
+                    )),
+                }
                 if running {
                     // Gives the app its stop timeout to shut down cleanly first.
                     self.stop(app).await?;
@@ -383,7 +456,7 @@ impl Runtime {
         if log.is_deployment() {
             self.wait_for_ports(w, log).await?;
         }
-        self.create(w, &image, &run_key).await?;
+        self.create(w, &image, &run_key, &name).await?;
         self.start(&name).await?;
         log.line(format!("started {name} from {image}"));
         if w.spec.delegate_cgroups {
@@ -393,8 +466,11 @@ impl Runtime {
                 Err(e) => log.line(format!("could not delegate its cgroups yet: {e:#}")),
             }
         }
-        if log.is_deployment() {
-            self.wait_ready(&name, log).await?;
+        if log.is_deployment()
+            && let Err(e) = self.wait_ready(&name, log).await
+        {
+            self.log_tail(&name, 20, log).await;
+            return Err(e);
         }
         if !matches!(w.spec.source, Source::Image { .. }) {
             self.prune_images(app, &image, KEEP_IMAGES).await;
@@ -631,7 +707,7 @@ impl Runtime {
             let restarts = state.restarting == Some(true);
             if state.running != Some(true) || restarts {
                 bail!(
-                    "the container stopped (exit code {}); its logs (facade logs) usually say why",
+                    "the container stopped (exit code {}); its last lines are above",
                     state.exit_code.unwrap_or(0)
                 );
             }
@@ -894,20 +970,360 @@ impl Runtime {
         })
     }
 
-    async fn create(&self, w: &Workload, image: &str, run_key: &str) -> anyhow::Result<()> {
+    async fn create(
+        &self,
+        w: &Workload,
+        image: &str,
+        run_key: &str,
+        name: &str,
+    ) -> anyhow::Result<()> {
         let app = &w.spec.name;
         let body = self.container_body(w, image, run_key).await?;
         self.docker()
             .create_container(
                 Some(CreateContainerOptions {
-                    name: Some(container(app)),
+                    name: Some(name.to_string()),
                     ..Default::default()
                 }),
                 body,
             )
             .await
             .with_context(|| format!("creating container for {app}"))?;
-        self.connect_networks(w, &container(app)).await
+        self.connect_networks(w, name).await
+    }
+
+    /// Whether a new container can start next to the running one, with why (see
+    /// [`facade_core::AppSpec::overlap`]), given what this node has.
+    async fn plan_overlap(&self, w: &Workload) -> Result<String, String> {
+        let why = w.spec.overlap()?;
+        if let Some(mb) = w.spec.limits.memory_mb {
+            let mut system = sysinfo::System::new();
+            system.refresh_memory();
+            let free = system.available_memory() / (1024 * 1024);
+            if free < mb {
+                return Err(format!(
+                    "{free} MB of memory is free, less than its {mb} MB limit: two would not fit"
+                ));
+            }
+        }
+        for volume in w.spec.volumes.iter().filter(|v| v.size_mb.is_some()) {
+            let name = w.spec.volume_name(volume);
+            let data = SizedVolume::new(&self.0.dir, &name).data();
+            let moves = self.docker().inspect_volume(&name).await.is_ok_and(|v| {
+                v.options.get("device") != Some(&data.to_string_lossy().to_string())
+            });
+            if moves {
+                return Err(format!(
+                    "volume {} moves to a filesystem of its own, which needs the old container stopped",
+                    volume.name
+                ));
+            }
+        }
+        Ok(why)
+    }
+
+    /// Replaces the running container `old` without a gap: the new one starts
+    /// next to it, traffic moves to the new one once it is ready, then the old one
+    /// gets its stop timeout for its open connections (WebSockets included) to end
+    /// before it is stopped as usual. If the new one does not become ready, it is
+    /// removed and the old one carries on.
+    async fn overlap(
+        &self,
+        w: &Workload,
+        image: &str,
+        run_key: &str,
+        old: &bollard::models::ContainerInspectResponse,
+        log: &DeployLog,
+    ) -> anyhow::Result<()> {
+        let app = &w.spec.name;
+        let (name, next, retired) = (container(app), next_container(app), old_container(app));
+        let old_id = old.id.clone().context("the running container has no id")?;
+        let created = self.create(w, image, run_key, &next).await;
+        let ready = async {
+            created?;
+            self.start(&next).await?;
+            log.line(format!("started {next} from {image}"));
+            if w.spec.delegate_cgroups {
+                match cgroups::delegate(self, &next).await {
+                    Ok(_) => log.line("delegated its cgroups (/sys/fs/cgroup is writable)"),
+                    Err(e) => log.line(format!("could not delegate its cgroups yet: {e:#}")),
+                }
+            }
+            self.wait_ready(&next, log).await?;
+            self.wait_listening(w, &next, log).await
+        }
+        .await;
+        if let Err(e) = ready {
+            self.log_tail(&next, 20, log).await;
+            self.discard(&next).await;
+            return Err(e.context("the new version did not become ready, the running one was kept"));
+        }
+        let new_id = self
+            .docker()
+            .inspect_container(&next, None::<InspectContainerOptions>)
+            .await?
+            .id
+            .context("the new container has no id")?;
+
+        // The switch: the entry point sends new requests and connections to the
+        // new container from the table published here on.
+        self.0.routed.lock().insert(app.clone(), new_id);
+        log.reroute().await;
+        log.line("traffic moved to the new container");
+        // The rest of the agent finds the app's container by name.
+        let renamed = async {
+            self.rename(&name, &retired).await?;
+            if let Err(e) = self.rename(&next, &name).await {
+                let _ = self.rename(&retired, &name).await;
+                return Err(e);
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        self.0.routed.lock().remove(app);
+        if let Err(e) = renamed {
+            // Back to the old one, which never stopped.
+            log.reroute().await;
+            self.discard(&next).await;
+            return Err(e.context("renaming the containers, the running one was kept"));
+        }
+
+        // Looked at again: restarted by Docker since (during a long release
+        // command, say), it listens on other local ports.
+        let old = self
+            .docker()
+            .inspect_container(&old_id, None::<InspectContainerOptions>)
+            .await
+            .unwrap_or_else(|_| old.clone());
+        let grace = old
+            .config
+            .as_ref()
+            .and_then(|c| c.stop_timeout)
+            .filter(|t| *t >= 0)
+            .map_or(u64::from(facade_core::DEFAULT_STOP_TIMEOUT), |t| t as u64);
+        self.drain(&loopback_ports(&old), Duration::from_secs(grace), log)
+            .await;
+        // Its stop signal, then its stop timeout, as for any stop.
+        match self
+            .docker_for_stops()
+            .stop_container(&old_id, None::<StopContainerOptions>)
+            .await
+        {
+            Ok(()) => {}
+            Err(e) if is_not_found(&e) || is_not_modified(&e) => {}
+            Err(e) => log.line(format!("stopping the old container: {e}")),
+        }
+        self.discard(&old_id).await;
+        log.line("stopped the old container");
+        Ok(())
+    }
+
+    /// Waits until the entry point has no request or connection open to `ports`
+    /// (the old container's), at most `grace`.
+    async fn drain(&self, ports: &[u16], grace: Duration, log: &DeployLog) {
+        let deadline = tokio::time::Instant::now() + grace;
+        // Requests routed just before the switch are counted by now.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut said = false;
+        loop {
+            let open = log.open_connections(ports).await;
+            if open == Some(0) {
+                if said {
+                    log.line("its connections ended");
+                }
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                log.line(match open {
+                    Some(n) => format!(
+                        "{n} connection{} still open after {}s, stopping it",
+                        if n == 1 { "" } else { "s" },
+                        grace.as_secs()
+                    ),
+                    None => format!("stopping it after {}s", grace.as_secs()),
+                });
+                return;
+            }
+            if !said {
+                log.line(match open {
+                    Some(n) => format!(
+                        "the old container finishes {n} open connection{} (at most {}s, its stop timeout)",
+                        if n == 1 { "" } else { "s" },
+                        grace.as_secs()
+                    ),
+                    // An entry point that cannot tell: the whole stop timeout.
+                    None => format!(
+                        "the old container gets {}s (its stop timeout) to finish its connections",
+                        grace.as_secs()
+                    ),
+                });
+                said = true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Waits until the container accepts connections on its HTTP and TLS ports,
+    /// so the entry point never sends traffic to a port nobody listens on yet.
+    /// Tried on its address on its network: the loopback port Docker publishes
+    /// accepts connections before the app does.
+    async fn wait_listening(
+        &self,
+        w: &Workload,
+        name: &str,
+        log: &DeployLog,
+    ) -> anyhow::Result<()> {
+        let mut ports: Vec<u16> = w.spec.http_port.into_iter().collect();
+        ports.extend(w.spec.tls_ports.iter().map(|t| t.container));
+        ports.dedup();
+        if ports.is_empty() || w.spec.host_network {
+            return Ok(());
+        }
+        let info = self
+            .docker()
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await?;
+        let ip = info
+            .network_settings
+            .and_then(|n| n.networks)
+            .and_then(|mut n| n.remove(&network(&w.spec.name)))
+            .and_then(|e| e.ip_address)
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
+        let Some(ip) = ip else {
+            log.line("its address is unknown: not checking that it listens");
+            return Ok(());
+        };
+        let deadline = tokio::time::Instant::now() + LISTEN_WAIT;
+        for port in ports {
+            let mut said = false;
+            loop {
+                let tried = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::net::TcpStream::connect((ip, port)),
+                )
+                .await;
+                match tried {
+                    Ok(Ok(_)) => break,
+                    Ok(Err(e))
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NetworkUnreachable
+                                | std::io::ErrorKind::HostUnreachable
+                        ) =>
+                    {
+                        log.line(format!(
+                            "this node cannot reach {ip}: not checking that it listens"
+                        ));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if !self.is_running(name).await {
+                    bail!("the container stopped");
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    bail!(
+                        "nothing listened on port {port} within {} seconds",
+                        LISTEN_WAIT.as_secs()
+                    );
+                }
+                if !said {
+                    log.line(format!("waiting for it to listen on port {port}"));
+                    said = true;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// The last lines a container wrote, into the deploy log: the container is
+    /// about to go, and its logs with it.
+    async fn log_tail(&self, name: &str, lines: u32, log: &DeployLog) {
+        let mut logs = self.docker().logs(
+            name,
+            Some(LogsOptions {
+                stdout: true,
+                stderr: true,
+                tail: lines.to_string(),
+                ..Default::default()
+            }),
+        );
+        let mut text = String::new();
+        while let Some(Ok(chunk)) = logs.next().await {
+            text.push_str(&String::from_utf8_lossy(&chunk.into_bytes()));
+        }
+        if !text.trim().is_empty() {
+            log.line(format!("last lines of {name}:"));
+            for line in text.lines() {
+                log.line(format!("  {line}"));
+            }
+        }
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.docker()
+            .rename_container(
+                from,
+                bollard::query_parameters::RenameContainerOptions {
+                    name: to.to_string(),
+                },
+            )
+            .await
+            .with_context(|| format!("renaming {from} to {to}"))
+    }
+
+    /// Removes a container at once, if it exists.
+    async fn discard(&self, name: &str) {
+        match self
+            .docker()
+            .remove_container(
+                name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(e) if is_not_found(&e) => {}
+            Err(e) => tracing::warn!("removing {name}: {e}"),
+        }
+    }
+
+    /// Sorts out containers an interrupted overlapping deploy left. Traffic
+    /// moves to the new one before the renames, so a new one standing alone is
+    /// the one serving; with the app's own container there, it was never
+    /// switched to (or the old one never finished draining).
+    async fn recover(&self, app: &str) -> anyhow::Result<()> {
+        let (name, next, retired) = (container(app), next_container(app), old_container(app));
+        let exists = |n: String| async move {
+            self.docker()
+                .inspect_container(&n, None::<InspectContainerOptions>)
+                .await
+                .is_ok()
+        };
+        if !exists(next.clone()).await && !exists(retired.clone()).await {
+            return Ok(());
+        }
+        if !exists(name.clone()).await {
+            if self.is_running(&next).await {
+                self.rename(&next, &name).await?;
+            } else if exists(retired.clone()).await {
+                self.rename(&retired, &name).await?;
+            }
+        }
+        if exists(retired.clone()).await {
+            tracing::info!("stopping {retired}, left by an interrupted deploy");
+            let _ = self
+                .docker_for_stops()
+                .stop_container(&retired, None::<StopContainerOptions>)
+                .await;
+        }
+        self.discard(&retired).await;
+        self.discard(&next).await;
+        Ok(())
     }
 
     /// Joins its stack's network, where it answers to its service name, and the
@@ -1420,7 +1836,12 @@ impl Runtime {
     /// `volumes` is set (otherwise its data stays for a later app of that name).
     pub async fn remove(&self, app: &str, volumes: bool) -> anyhow::Result<()> {
         self.stop(app).await?;
-        for name in [container(app), format!("{}-release", container(app))] {
+        for name in [
+            container(app),
+            format!("{}-release", container(app)),
+            next_container(app),
+            old_container(app),
+        ] {
             match self
                 .docker()
                 .remove_container(
@@ -1803,9 +2224,13 @@ impl Runtime {
         if w.spec.host_network {
             return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
         }
+        let routed = self.0.routed.lock().get(&w.spec.name).cloned();
         let info = self
             .docker()
-            .inspect_container(&container(&w.spec.name), None::<InspectContainerOptions>)
+            .inspect_container(
+                &routed.unwrap_or_else(|| container(&w.spec.name)),
+                None::<InspectContainerOptions>,
+            )
             .await
             .with_context(|| format!("{} has no container", w.spec.name))?;
         let host_port = info
