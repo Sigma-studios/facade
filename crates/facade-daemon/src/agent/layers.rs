@@ -121,7 +121,9 @@ mod tests {
     #[test]
     fn steps_read_like_the_dockerfile() {
         assert_eq!(
-            command("/bin/sh -c #(nop) ADD file:5d673d25da3a14ce1f6cf66e4c7fd4f4b85a3759a9d93efb3fd9ff852b5b56e4 in / "),
+            command(
+                "/bin/sh -c #(nop) ADD file:5d673d25da3a14ce1f6cf66e4c7fd4f4b85a3759a9d93efb3fd9ff852b5b56e4 in / "
+            ),
             "ADD file:5d673d25da3a… in /"
         );
         assert_eq!(
@@ -133,13 +135,12 @@ mod tests {
             "RUN pip install -r requirements.txt"
         );
         assert_eq!(
-            command("RUN |2 TARGETARCH=amd64 FEATURES=a b /bin/sh -c cargo build --release # buildkit"),
+            command(
+                "RUN |2 TARGETARCH=amd64 FEATURES=a b /bin/sh -c cargo build --release # buildkit"
+            ),
             "RUN cargo build --release"
         );
-        assert_eq!(
-            command("|1 VERSION=3 /bin/sh -c make"),
-            "RUN make"
-        );
+        assert_eq!(command("|1 VERSION=3 /bin/sh -c make"), "RUN make");
         assert_eq!(
             command("COPY /src/target/release/app /usr/local/bin/app # buildkit"),
             "COPY /src/target/release/app /usr/local/bin/app"

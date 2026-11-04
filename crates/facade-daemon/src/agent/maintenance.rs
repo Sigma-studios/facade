@@ -364,7 +364,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("blog/data")).unwrap();
         std::fs::create_dir_all(dir.join("_server/1700000000")).unwrap();
-        std::fs::write(dir.join("blog/data/1700000000.tar.gz"), vec![1u8; 64 * 1024]).unwrap();
+        std::fs::write(
+            dir.join("blog/data/1700000000.tar.gz"),
+            vec![1u8; 64 * 1024],
+        )
+        .unwrap();
         std::fs::write(dir.join("_server/1700000000/facade.db"), vec![1u8; 8192]).unwrap();
         let (total, by_app) = backups(&dir).await;
         assert_eq!(by_app.keys().collect::<Vec<_>>(), ["blog"]);

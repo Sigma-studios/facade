@@ -62,7 +62,9 @@ impl SizedVolume {
     /// What its image file takes on the node's disk (it is sparse).
     pub fn on_disk(&self) -> Option<u64> {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(self.image()).ok().map(|m| m.blocks() * 512)
+        std::fs::metadata(self.image())
+            .ok()
+            .map(|m| m.blocks() * 512)
     }
 
     /// Creates the filesystem, or grows it to `size_mb`, and mounts it. Its data
