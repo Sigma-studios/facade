@@ -59,7 +59,7 @@ pub fn Overview() -> impl IntoView {
                 </section>
             </Show>
             <Show when=move || !firing().is_empty()>
-                <A href="/alerts" attr:class="banner banner-critical">
+                <A href="/settings/alerts" attr:class="banner banner-critical">
                     <span aria-hidden="true">"⚠"</span>
                     <span>
                         <strong>{move || {
