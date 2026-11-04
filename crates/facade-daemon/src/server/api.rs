@@ -18,7 +18,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use facade_core::api::*;
 use facade_core::manifest::{AppManifest, EnvEntry, Manifest, NodeDecl};
-use facade_core::proto::{AgentRequest, AppState, Listener, StorageReport};
+use facade_core::proto::{
+    AgentRequest, AppState, Listener, OTHER_CONTAINERS_PROTOCOL, OtherContainer, RemovedContainer,
+    StorageReport,
+};
 use facade_core::{AppSpec, PortMap, validate_name};
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -69,6 +72,11 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/nodes/{name}/ip", put(set_node_ip))
         .route("/api/nodes/{name}/prune", post(prune_node))
         .route("/api/nodes/{name}/ports", get(node_ports))
+        .route("/api/nodes/{name}/containers", get(other_containers))
+        .route(
+            "/api/nodes/{name}/containers/{container}",
+            axum::routing::delete(remove_other_container),
+        )
         .route(
             "/api/nodes/{node}/volumes/{volume}",
             axum::routing::delete(delete_volume),
@@ -2568,6 +2576,93 @@ async fn node_ports(
             .map(|n| n.listeners.clone())
             .unwrap_or_default(),
     ))
+}
+
+// ---------------------------------------------------------------- other containers
+
+/// A node whose agent can list and remove the containers facade does not
+/// manage. Older agents would drop the connection on the request.
+fn other_containers_node(server: &Server, user: &User, name: &str) -> ApiResult<()> {
+    user.require_admin()?;
+    if !server.store.node_exists(name)? {
+        return Err(not_found(format!("no node named {name}")));
+    }
+    if !server.hub.is_connected(name) {
+        return Err(unavailable(format!("node {name} is offline")));
+    }
+    let protocol = server.live.read().nodes.get(name).map_or(0, |n| n.protocol);
+    if protocol < OTHER_CONTAINERS_PROTOCOL {
+        return Err(unavailable(format!(
+            "node {name} runs an older agent (protocol {protocol}, needs {OTHER_CONTAINERS_PROTOCOL}), which cannot list containers: it updates itself to the server's build when it reconnects (or restart it: systemctl restart facaded-agent)"
+        )));
+    }
+    Ok(())
+}
+
+/// An agent's refusal or failure; the node going away meanwhile is its own case.
+fn agent_error(server: &Server, node: &str, e: anyhow::Error) -> ApiError {
+    if server.hub.is_connected(node) {
+        conflict(format!("{e:#}"))
+    } else {
+        unavailable(format!("{e:#}"))
+    }
+}
+
+/// The containers on a node without facade's labels: started by hand, by
+/// docker compose, by another tool.
+async fn other_containers(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Vec<OtherContainer>>> {
+    other_containers_node(&server, &user, &name)?;
+    server
+        .hub
+        .query(&name, AgentRequest::OtherContainers)
+        .await
+        .map(Json)
+        .map_err(|e| agent_error(&server, &name, e))
+}
+
+#[derive(Deserialize)]
+struct RemoveContainerQuery {
+    #[serde(default)]
+    volumes: bool,
+    #[serde(default)]
+    image: bool,
+}
+
+/// Stops and removes one of those; the agent refuses facade's own.
+async fn remove_other_container(
+    State(server): S,
+    user: User,
+    Path((name, container)): Path<(String, String)>,
+    Query(q): Query<RemoveContainerQuery>,
+) -> ApiResult<Json<RemovedContainer>> {
+    other_containers_node(&server, &user, &name)?;
+    let removed: RemovedContainer = server
+        .hub
+        .query(
+            &name,
+            AgentRequest::RemoveOtherContainer {
+                container,
+                volumes: q.volumes,
+                image: q.image,
+            },
+        )
+        .await
+        .map_err(|e| agent_error(&server, &name, e))?;
+    info!(node = %name, by = %user.username, "removed container {} ({})", removed.name, removed.id);
+    // Its ports are free now: the ports list says so without waiting for the
+    // next report.
+    if let Ok(listeners) = server
+        .hub
+        .query::<Vec<Listener>>(&name, AgentRequest::Ports)
+        .await
+    {
+        server.live.write().nodes.entry(name).or_default().listeners = listeners;
+    }
+    Ok(Json(removed))
 }
 
 // ---------------------------------------------------------------- registry logins
