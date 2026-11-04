@@ -303,7 +303,6 @@ template in `lang::generated_dockerfile`.
 | `facade volume ls` / `export` / `import` / `rm` / `node disk` / `node prune` | volumes and disk space |
 | `facade backup ls` / `run` / `get` / `restore` / `server` | backups |
 | `facade node ports <node>` | what listens on a node, and who holds each port |
-| `facade node containers <node> [--remove NAME]` | Docker containers facade does not manage, and removing one |
 | `facade user add/ls/set/rm` / `app owner` / `app grant` / `whoami` | accounts and who manages what |
 | `facade server` / `server set` | the web UI's domain, ACME contact, direct API port |
 | `facade server update [--check]` | update facade to the latest build of main (see [Updating](#updating)) |
@@ -717,17 +716,6 @@ while the old one still serves, stop the old one once the build is done, and the
 new one starts within a second. With `--host-network true`, `--publish` declares
 the ports the app binds itself (no remapping), so they are checked too.
 
-**Containers facade does not manage** (started by hand, by `docker compose`, by
-another tool) hold ports and disk like any program. Admins see them with `facade node
-containers <node>` (or *Other containers* on the Nodes page, which the ports they
-hold link to): image, state, published ports, the compose project, the restart
-policy. `--remove <name>` stops and removes one (`--volumes`: its anonymous volumes
-too; named volumes always stay; `--image`: its image, unless another container uses
-it or facade built it). The agent refuses any container carrying facade's labels,
-checked right before it acts. A container of a compose project comes back if
-something outside facade (a CI job running `docker compose up`) creates it again:
-removal says so.
-
 If a node's HTTP(S) entry point cannot bind 80 or 443 (another web server holds
 them), it says so in `facade status` and as an alert, and retries every 5 seconds:
 stopping the other server is enough for facade to take over.
@@ -812,8 +800,7 @@ secrets still to set. Applying is idempotent and never deletes anything.
 
 Servers and agents speak a versioned protocol; when it changes (it did with commit
 pinning and the build queue, then with stop settings, volume sizes and cgroup
-delegation, then with build variables, then with `facade exec`, then with listing other
-containers), agents one version behind are updated by
+delegation, then with build variables, then with `facade exec`), agents one version behind are updated by
 the server; older ones need the server's `facaded` installed by hand.
 
 ## Not there yet

@@ -44,17 +44,13 @@ pub struct NodeConn {
 }
 
 /// How long an agent may take to answer `req`. Removing or restarting an app
-/// (or removing another container) waits for it to stop, which takes up to its
-/// stop timeout; commands and volume commands run in containers answer once they
-/// exit. Listing other containers has Docker size what each one wrote.
+/// waits for it to stop, which takes up to its stop timeout; commands and volume
+/// commands run in containers answer once they exit.
 fn answer_within(req: &AgentRequest) -> Duration {
     match req {
-        AgentRequest::Remove { .. }
-        | AgentRequest::Restart { .. }
-        | AgentRequest::RemoveOtherContainer { .. } => {
+        AgentRequest::Remove { .. } | AgentRequest::Restart { .. } => {
             REQUEST_TIMEOUT + Duration::from_secs(u64::from(MAX_STOP_TIMEOUT))
         }
-        AgentRequest::OtherContainers => REQUEST_TIMEOUT * 3,
         AgentRequest::Exec { timeout_secs, .. } => {
             REQUEST_TIMEOUT + Duration::from_secs(u64::from(*timeout_secs))
         }

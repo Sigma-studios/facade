@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use facade_core::api::*;
-use facade_core::proto::{Listener, OtherContainer, RemovedContainer};
+use facade_core::proto::Listener;
 use facade_core::stack::{ServiceSpec, StackSpec};
 use facade_core::{AppSpec, Build, DeployStrategy, Limits, Link, PortMap, Source, TlsPort, Volume};
 use futures_util::StreamExt;
@@ -731,22 +731,6 @@ enum NodeCommand {
     Ip { name: String, ip: String },
     /// Every listening port on the node, and which program or app holds it.
     Ports { name: String },
-    /// Docker containers on the node that facade does not manage (started by
-    /// hand, by docker compose…), or remove one with --remove.
-    Containers {
-        name: String,
-        /// Stop and remove this container (name or id). facade's own are refused.
-        #[arg(long, value_name = "CONTAINER")]
-        remove: Option<String>,
-        /// With --remove: its anonymous volumes too (named volumes always stay).
-        #[arg(long, requires = "remove")]
-        volumes: bool,
-        /// With --remove: its image too, unless another container uses it.
-        #[arg(long, requires = "remove")]
-        image: bool,
-        #[arg(long, short, requires = "remove")]
-        yes: bool,
-    },
     /// Free disk space now: old build cache and unused images. Also runs on its own
     /// every 6 hours, and when the disk is 85 % full.
     Prune {
@@ -3301,97 +3285,6 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
                     ]
                 }),
             );
-        }
-        NodeCommand::Containers {
-            name, remove: None, ..
-        } => {
-            let containers: Vec<OtherContainer> =
-                api.get(&format!("/api/nodes/{name}/containers")).await?;
-            if json {
-                return print_json(&containers);
-            }
-            if containers.is_empty() {
-                println!("no containers besides facade's on {name}");
-                return Ok(());
-            }
-            table(
-                &["NAME", "IMAGE", "STATE", "PORTS", "COMPOSE", "CREATED"],
-                containers.iter().map(|c| {
-                    vec![
-                        c.name.clone(),
-                        c.image.clone(),
-                        c.status.clone(),
-                        c.ports_text(),
-                        c.compose().unwrap_or_default(),
-                        output::ago(c.created),
-                    ]
-                }),
-            );
-        }
-        NodeCommand::Containers {
-            name,
-            remove: Some(target),
-            volumes,
-            image,
-            yes,
-        } => {
-            if !yes {
-                let containers: Vec<OtherContainer> =
-                    api.get(&format!("/api/nodes/{name}/containers")).await?;
-                // As Docker finds it: a name, or the start of an id.
-                let found = containers
-                    .iter()
-                    .find(|c| c.name == target)
-                    .or_else(|| containers.iter().find(|c| c.id.starts_with(&target)))
-                    .with_context(|| {
-                        format!("no container {target} on {name} besides facade's (`facade node containers {name}` lists them)")
-                    })?;
-                let mut what = format!("{} ({}, {})", found.name, found.image, found.status);
-                if !found.ports.is_empty() {
-                    what += &format!(", publishing {}", found.ports_text());
-                }
-                eprintln!("{what}");
-                for warning in found.warnings() {
-                    eprintln!("note: {warning}");
-                }
-                let also = match (volumes, image) {
-                    (false, false) => "",
-                    (true, false) => " and its anonymous volumes",
-                    (false, true) => " and its image",
-                    (true, true) => ", its anonymous volumes and its image",
-                };
-                if !confirm(&format!("Stop and remove {}{also} on {name}?", found.name))? {
-                    bail!("aborted");
-                }
-            }
-            let removed: RemovedContainer = api
-                .json(
-                    api.request(
-                        Method::DELETE,
-                        &format!("/api/nodes/{name}/containers/{target}"),
-                    )
-                    .query(&[("volumes", volumes), ("image", image)]),
-                )
-                .await?;
-            if json {
-                return print_json(&removed);
-            }
-            eprintln!("{} ({}) removed", removed.name, removed.id);
-            if !removed.volumes.is_empty() {
-                eprintln!("volumes removed: {}", removed.volumes.join(", "));
-            }
-            if let Some(image) = &removed.image {
-                eprintln!("image removed: {image}");
-            }
-            if let Some(why) = &removed.image_kept {
-                eprintln!("note: {why}");
-            }
-            // Without --yes, they came before the question.
-            if yes {
-                for warning in &removed.warnings {
-                    eprintln!("note: {warning}");
-                }
-            }
         }
         NodeCommand::Disk { name } => {
             let nodes: Vec<NodeView> = api.get("/api/nodes").await?;

@@ -46,9 +46,9 @@ use super::volumes;
 use crate::gitauth::Access;
 use crate::lang;
 
-pub(super) const LABEL_APP: &str = "facade.app";
+const LABEL_APP: &str = "facade.app";
 const LABEL_RUN: &str = "facade.run";
-pub(super) const LABEL_NODE: &str = "facade.node";
+const LABEL_NODE: &str = "facade.node";
 const LABEL_VOLUME: &str = "facade.volume";
 const LABEL_STACK: &str = "facade.stack";
 /// On the containers of apps that divide their own cgroup.
@@ -258,7 +258,7 @@ impl Drop for Scratch {
     }
 }
 
-pub(super) fn is_not_found(e: &bollard::errors::Error) -> bool {
+fn is_not_found(e: &bollard::errors::Error) -> bool {
     matches!(
         e,
         bollard::errors::Error::DockerResponseServerError {

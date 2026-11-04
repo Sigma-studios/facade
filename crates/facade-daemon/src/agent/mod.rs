@@ -7,7 +7,6 @@ mod compress;
 mod exec;
 mod layers;
 mod maintenance;
-mod others;
 mod ports;
 mod queue;
 mod routes;
@@ -480,22 +479,6 @@ impl Agent {
                 let docker = self.runtime.docker().clone();
                 let container = runtime::container(&app);
                 tokio::spawn(exec::session(docker, app, container, request, stream));
-            }
-            AgentRequest::OtherContainers => {
-                let list = others::list(self.runtime.docker()).await?;
-                return Ok(Some(serde_json::to_value(list)?));
-            }
-            AgentRequest::RemoveOtherContainer {
-                container,
-                volumes,
-                image,
-            } => {
-                let removed =
-                    others::remove(self.runtime.docker(), &container, volumes, image).await?;
-                // What it wrote and its volumes leave the disk figures.
-                let agent = self.clone();
-                tokio::spawn(async move { maintenance::refresh_report(&agent).await });
-                return Ok(Some(serde_json::to_value(removed)?));
             }
         }
         Ok(None)

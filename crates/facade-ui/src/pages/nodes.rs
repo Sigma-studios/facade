@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use facade_core::api::{CreateNode, CreatedNode, NodeView, SetNodeIp, UsagePoint, VolumeView};
-use facade_core::proto::{Listener, NodeStats, OtherContainer, RemovedContainer, StorageReport};
+use facade_core::proto::{Listener, NodeStats, StorageReport};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
@@ -15,8 +15,7 @@ use crate::components::{
 use crate::util::{Polled, ago, bytes, me, percent, polled, run, toasts};
 
 /// One node at a time: the one in the URL (`/nodes/eu-2`), else the first. Its
-/// card with the actions, its usage, its ports, the containers facade does not
-/// manage (admins) and its volumes.
+/// card with the actions, its usage, its ports and its volumes.
 #[component]
 pub fn Nodes() -> impl IntoView {
     // Members see the nodes but cannot change them.
@@ -173,9 +172,6 @@ pub fn Nodes() -> impl IntoView {
         });
         let has_notes = storage_notes_shown(storage, orphaned);
         let this = StoredValue::new(name.clone());
-        // Containers facade does not manage, by name: the ports they hold link
-        // to them.
-        let others = RwSignal::new(Vec::<String>::new());
         Some(view! {
             <section class="node-detail">
                 <div class="node-wrap">
@@ -224,10 +220,7 @@ pub fn Nodes() -> impl IntoView {
                 </p>
             </section>
             <NodeUsage name=name.clone() stats=live/>
-            <Ports node=name.clone() others/>
-            <Show when=move || connected && me.is_admin()>
-                <OtherContainers node=this.get_value() names=others/>
-            </Show>
+            <Ports node=name.clone()/>
             <NodeVolumes node=name volumes/>
         })
     };
@@ -522,9 +515,8 @@ fn listener_key(col: usize, l: &Listener) -> SortKey {
 }
 
 /// What listens on a node, and which app (or facade itself) holds each port.
-/// A port held by one of the `others` containers links to its row below.
 #[component]
-fn Ports(node: String, #[prop(into)] others: Signal<Vec<String>>) -> impl IntoView {
+fn Ports(node: String) -> impl IntoView {
     let listeners = polled(Some(Duration::from_secs(10)), move || {
         let node = node.clone();
         async move { api::get::<Vec<Listener>>(&format!("/api/nodes/{node}/ports")).await }
@@ -593,11 +585,6 @@ fn Ports(node: String, #[prop(into)] others: Signal<Vec<String>>) -> impl IntoVi
                                                     <A href=format!("/apps/{app}") attr:class="strong-link">{app.clone()}</A>
                                                     {what.map(|w| view! { <span class="muted small">{format!(" · {w}")}</span> })}
                                                 }.into_any(),
-                                                (None, Some(what)) if what
-                                                    .strip_prefix("container ")
-                                                    .is_some_and(|c| others.with(|o| o.iter().any(|n| n == c))) => view! {
-                                                    <a class="muted" href=format!("#container-{}", &what["container ".len()..])>{what.clone()}</a>
-                                                }.into_any(),
                                                 (None, what) => view! {
                                                     <span class="muted">{what.unwrap_or_else(|| "another program".into())}</span>
                                                 }.into_any(),
@@ -615,183 +602,6 @@ fn Ports(node: String, #[prop(into)] others: Signal<Vec<String>>) -> impl IntoVi
             </Show>
         </section>
     }
-}
-
-/// The Docker containers on a node that facade does not manage, removable
-/// one by one. Not there when there are none. Listed on demand only: Docker
-/// sizes what each container wrote.
-#[component]
-fn OtherContainers(node: String, names: RwSignal<Vec<String>>) -> impl IntoView {
-    let list_path = format!("/api/nodes/{node}/containers");
-    let containers = polled(None, move || {
-        let path = list_path.clone();
-        async move { api::get::<Vec<OtherContainer>>(&path).await }
-    });
-    Effect::new(move |_| {
-        names.set(containers.data.with(|c| {
-            c.iter()
-                .flatten()
-                .map(|c| c.name.clone())
-                .collect::<Vec<_>>()
-        }))
-    });
-    let any = move || {
-        containers
-            .data
-            .with(|c| c.as_ref().is_some_and(|c| !c.is_empty()))
-    };
-    let target = RwSignal::new(None::<OtherContainer>);
-    let open = RwSignal::new(false);
-    let with_volumes = RwSignal::new(false);
-    let with_image = RwSignal::new(false);
-    let busy = RwSignal::new(false);
-    let node = StoredValue::new(node);
-    let remove = move |_| {
-        let Some(c) = target.get_untracked() else {
-            return;
-        };
-        let path = format!(
-            "/api/nodes/{}/containers/{}?volumes={}&image={}",
-            node.get_value(),
-            c.name,
-            with_volumes.get_untracked(),
-            with_image.get_untracked()
-        );
-        busy.set(true);
-        spawn_local(async move {
-            match api::delete_json::<RemovedContainer>(&path).await {
-                Ok(r) => {
-                    toasts().ok(removed_message(&r));
-                    open.set(false);
-                    containers.reload();
-                }
-                Err(e) => toasts().err(e),
-            }
-            busy.try_set(false);
-        });
-    };
-    view! {
-        <Show when=move || any() || containers.error.with(Option::is_some)>
-            <section id="other-containers">
-                <h2 class="section-title">"Other containers"</h2>
-                <p class="muted small">"Docker containers on this node that façade does not manage: started by hand, by docker compose, by another tool. Their ports are closed to apps."</p>
-                <ErrorNote error=containers.error/>
-                <Show when=any>
-                    <div class="table-wrap">
-                        <table class="table">
-                            <thead><tr>
-                                <th>"Container"</th><th>"Image"</th><th>"State"</th><th>"Ports"</th>
-                                <th>"Compose"</th><th>"Created"</th><th></th>
-                            </tr></thead>
-                            <tbody>
-                                <For each=move || containers.data.get().unwrap_or_default()
-                                    key=|c| (c.id.clone(), c.status.clone())
-                                    let:c>
-                                    {
-                                        let pick = c.clone();
-                                        let ports = c.ports_text();
-                                        view! {
-                                            <tr id=format!("container-{}", c.name)>
-                                                <td>
-                                                    <code>{c.name.clone()}</code>
-                                                    <div class="muted small">{c.id.clone()}</div>
-                                                </td>
-                                                <td class="muted">{c.image.clone()}</td>
-                                                <td>
-                                                    {if c.state == "running" {
-                                                        view! { <span class="badge badge-good">{c.status.clone()}</span> }.into_any()
-                                                    } else {
-                                                        view! { <span class="muted small">{c.status.clone()}</span> }.into_any()
-                                                    }}
-                                                    {c.restart.clone().map(|r| view! { <div class="muted small">{format!("restarts {r}")}</div> })}
-                                                </td>
-                                                <td class="muted">{if ports.is_empty() { "—".to_string() } else { ports }}</td>
-                                                <td class="muted">{c.compose().unwrap_or_else(|| "—".into())}</td>
-                                                <td class="muted small">
-                                                    {ago(c.created)}
-                                                    {c.size.filter(|s| *s > 0).map(|s| view! { <div>{format!("wrote {}", bytes(s))}</div> })}
-                                                </td>
-                                                <td class="row-actions">
-                                                    <button class="link-button danger" on:click=move |_| {
-                                                        target.set(Some(pick.clone()));
-                                                        with_volumes.set(false);
-                                                        with_image.set(false);
-                                                        open.set(true);
-                                                    }>"Remove"</button>
-                                                </td>
-                                            </tr>
-                                        }
-                                    }
-                                </For>
-                            </tbody>
-                        </table>
-                    </div>
-                </Show>
-            </section>
-        </Show>
-
-        <Modal open title="Remove container">
-            {move || target.get().map(|c| {
-                let warnings = c.warnings();
-                let ports = (!c.ports.is_empty()).then(|| format!(", publishing {}", c.ports_text()));
-                view! {
-                    <p>
-                        "Stop and remove " <code>{c.name.clone()}</code>
-                        {format!(" ({}, {}{})? Named volumes stay. This cannot be undone.", c.image, c.status.to_lowercase(), ports.unwrap_or_default())}
-                    </p>
-                    {(!warnings.is_empty()).then(|| view! {
-                        <div class="note note-warning" role="status">
-                            <span aria-hidden="true">"⚠ "</span>
-                            {warnings.iter().map(|w| capitalized(w)).collect::<Vec<_>>().join(". ")}"."
-                        </div>
-                    })}
-                    <div class="checks">
-                        <label class="check">
-                            <input type="checkbox" bind:checked=with_volumes/>
-                            "Also its anonymous volumes"
-                        </label>
-                        <label class="check">
-                            <input type="checkbox" bind:checked=with_image/>
-                            "Also its image, unless another container uses it"
-                        </label>
-                    </div>
-                }
-            })}
-            <div class="form-actions">
-                <button class="button" on:click=move |_| open.set(false)>"Cancel"</button>
-                <button class="button button-danger" disabled=move || busy.get() on:click=remove>
-                    {move || if busy.get() { "Removing…" } else { "Remove" }}
-                </button>
-            </div>
-        </Modal>
-    }
-}
-
-/// What a removal did, for its toast.
-fn removed_message(r: &RemovedContainer) -> String {
-    let mut message = format!("{} removed", r.name);
-    if !r.volumes.is_empty() {
-        message += &format!(
-            " with {} volume{}",
-            r.volumes.len(),
-            if r.volumes.len() == 1 { "" } else { "s" }
-        );
-    }
-    if let Some(image) = &r.image {
-        message += &format!(", and image {image}");
-    }
-    if let Some(why) = &r.image_kept {
-        message += &format!("; {why}");
-    }
-    message
-}
-
-fn capitalized(s: &str) -> String {
-    let mut chars = s.chars();
-    chars
-        .next()
-        .map(|c| c.to_uppercase().chain(chars).collect())
-        .unwrap_or_default()
 }
 
 /// The volumes on a node, orphaned ones deletable.
