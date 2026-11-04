@@ -926,3 +926,155 @@ pub fn SortTh(
         </th>
     }
 }
+
+/// Click handler for a table row (or a `tbody` grouping a few) that leads where its
+/// main link (class `row-link-main`) does: a plain click follows it, a Ctrl/⌘ or
+/// middle click (`on:mouseup`) opens it in a new tab. The link stays the way in for
+/// the keyboard. Clicks on other links, buttons and fields of the row, and drags
+/// that select text, are left alone.
+pub fn follow_row(ev: leptos::ev::MouseEvent) {
+    use wasm_bindgen::JsCast;
+    let middle = ev.button() == 1;
+    if ev.default_prevented() || (ev.button() != 0 && !middle) {
+        return;
+    }
+    // A middle button's mouseup, or a left button's click: not both for one click.
+    if (ev.type_() == "mouseup") != middle {
+        return;
+    }
+    let (Some(target), Some(row)) = (
+        ev.target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok()),
+        ev.current_target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok()),
+    ) else {
+        return;
+    };
+    let inner = target
+        .closest("a, button, input, select, textarea, label, summary, [tabindex]")
+        .ok()
+        .flatten();
+    if inner.is_some_and(|el| row.contains(Some(&el))) {
+        return;
+    }
+    let window = window();
+    if window
+        .get_selection()
+        .ok()
+        .flatten()
+        .is_some_and(|s| !s.is_collapsed())
+    {
+        return;
+    }
+    let Some(link) = row.query_selector("a.row-link-main").ok().flatten() else {
+        return;
+    };
+    let link: web_sys::HtmlAnchorElement = link.unchecked_into();
+    if middle || ev.ctrl_key() || ev.meta_key() {
+        let _ = window.open_with_url_and_target(&link.href(), "_blank");
+    } else {
+        // Through the link, so the router handles it as any other; once this
+        // handler is done, as the page it belongs to goes away.
+        set_timeout(move || link.click(), std::time::Duration::ZERO);
+    }
+}
+
+/// A dropdown of checkboxes picking some of `options`; none picked means all of
+/// them. `noun` is the plural the button uses: "All apps", "3 apps".
+#[component]
+pub fn MultiSelect(
+    noun: &'static str,
+    #[prop(into)] options: Signal<Vec<String>>,
+    #[prop(into)] picked: Signal<Vec<String>>,
+    on_change: Callback<Vec<String>>,
+) -> impl IntoView {
+    let menu = NodeRef::<leptos::html::Details>::new();
+    let search = RwSignal::new(String::new());
+    let close = move || {
+        if let Some(menu) = menu.get_untracked() {
+            let _ = menu.remove_attribute("open");
+        }
+    };
+    // Closes on a click elsewhere, or Escape.
+    let outside = window_event_listener(leptos::ev::click, move |ev| {
+        use wasm_bindgen::JsCast;
+        let Some(menu) = menu.get_untracked() else {
+            return;
+        };
+        let inside = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+            .is_some_and(|t| menu.contains(Some(&t)));
+        if !inside {
+            let _ = menu.remove_attribute("open");
+        }
+    });
+    on_cleanup(move || outside.remove());
+    let summary = move || {
+        picked.with(|p| match p.len() {
+            0 => format!("All {noun}"),
+            1 | 2 => p.join(", "),
+            n => format!("{n} {noun}"),
+        })
+    };
+    let shown = move || {
+        let needle = search.get().trim().to_lowercase();
+        options
+            .get()
+            .into_iter()
+            .filter(|o| needle.is_empty() || o.to_lowercase().contains(&needle))
+            .collect::<Vec<_>>()
+    };
+    let toggle = move |option: String, on: bool| {
+        let mut now = picked.get_untracked();
+        now.retain(|p| *p != option);
+        if on {
+            now.push(option);
+        }
+        // In the options' order, so the button and the URL read the same each time.
+        let order = options.get_untracked();
+        now.sort_by_key(|p| order.iter().position(|o| o == p).unwrap_or(usize::MAX));
+        on_change.run(now);
+    };
+    view! {
+        <details class="multi-select" node_ref=menu
+            on:keydown=move |ev| if ev.key() == "Escape" { close() }>
+            <summary class="button multi-select-button"
+                class:multi-select-active=move || picked.with(|p| !p.is_empty())>
+                <span class="multi-select-label">{summary}</span>
+                <span class="multi-select-caret" aria-hidden="true">"▾"</span>
+            </summary>
+            <div class="multi-select-menu">
+                <Show when=move || options.with(|o| o.len() > 8)>
+                    <input type="text" class="multi-select-search" placeholder=format!("Find {noun}")
+                        aria-label=format!("Find {noun}") autocomplete="off" bind:value=search/>
+                </Show>
+                <div class="multi-select-options">
+                    <For each=shown key=|o| o.clone() let:option>
+                        {
+                            let checked = {
+                                let option = option.clone();
+                                move || picked.with(|p| p.contains(&option))
+                            };
+                            let value = option.clone();
+                            view! {
+                                <label class="check">
+                                    <input type="checkbox" prop:checked=checked
+                                        on:change=move |ev| toggle(value.clone(), event_target_checked(&ev))/>
+                                    {option}
+                                </label>
+                            }
+                        }
+                    </For>
+                    <Show when=move || shown().is_empty()>
+                        <span class="muted small">"No match"</span>
+                    </Show>
+                </div>
+                <Show when=move || picked.with(|p| !p.is_empty())>
+                    <button type="button" class="link-button multi-select-clear"
+                        on:click=move |_| { on_change.run(vec![]); close() }>{format!("All {noun}")}</button>
+                </Show>
+            </div>
+        </details>
+    }
+}

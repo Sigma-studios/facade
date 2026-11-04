@@ -285,9 +285,9 @@ fn StackServices(#[prop(into)] stack: Signal<Option<StackView>>) -> impl IntoVie
                                 let commit = a.commit.as_deref().map(short).unwrap_or_default();
                                 let domains = a.spec.domains.clone();
                                 view! {
-                                    <tr>
+                                    <tr class="row-link" on:click=follow_row on:mouseup=follow_row>
                                         <td>
-                                            <A href=format!("/apps/{}", a.spec.name) attr:class="strong-link">{service}</A>
+                                            <A href=format!("/apps/{}", a.spec.name) attr:class="strong-link row-link-main">{service}</A>
                                             {host.map(|h| view! { <div class="muted small">{format!("reached as {h}")}</div> })}
                                         </td>
                                         <td><StateBadge state=a.state/></td>
@@ -319,7 +319,7 @@ fn StackServices(#[prop(into)] stack: Signal<Option<StackView>>) -> impl IntoVie
     }
 }
 
-use crate::components::StateBadge;
+use crate::components::{StateBadge, follow_row};
 
 /// What deploying would do.
 #[component]
