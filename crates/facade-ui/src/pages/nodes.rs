@@ -13,6 +13,7 @@ use crate::components::{
     Sort, SortKey, SortTh, Sparkline, TabBar, UsageFeed, byte_rate as rate, latest as last,
     per_second, usage_feed,
 };
+use crate::gauges::StrainBadge;
 use crate::util::{Polled, ago, bytes, me, percent, polled, run, toasts};
 
 const TABS: &[(&str, &str)] = &[
@@ -270,6 +271,9 @@ pub fn Nodes() -> impl IntoView {
                         <Show when=move || node.with(Option::is_some)>
                             <OnlineBadge online=Signal::derive(connected)/>
                         </Show>
+                        <StrainBadge pressure=Signal::derive(move || node.with(|n| {
+                            n.as_ref().filter(|n| n.connected)?.stats.as_ref()?.resources.pressure
+                        }))/>
                     </div>
                     <div class="muted small subtitle">{move || node.with(|n| n.as_ref().map(node_facts))}</div>
                 </div>
@@ -459,6 +463,12 @@ fn NodeMetrics(
         net_out,
         requests,
         errors,
+        disk_read,
+        disk_write,
+        pressure_cpu,
+        pressure_mem,
+        pressure_io,
+        io_wait,
         span,
         gap,
         ..
@@ -466,6 +476,22 @@ fn NodeMetrics(
     let traffic = feed.has_traffic();
     let (cores, mem_total, disk_total) = (totals.cpus, totals.mem_total, totals.disk_total);
     let now = Signal::derive(move || live.get().unwrap_or_else(|| totals.clone()));
+    let known = |s: Signal<Vec<crate::components::Sample>>| {
+        s.with(|s| s.iter().any(crate::components::Sample::known))
+    };
+    // Kernels without pressure information (or with it off) show no panel.
+    let pressure = Signal::derive(move || now.get().resources.pressure);
+    let has_pressure = Signal::derive(move || {
+        pressure.get().is_some() || known(pressure_cpu) || known(pressure_mem) || known(pressure_io)
+    });
+    let has_disk_io = Signal::derive(move || known(disk_read) || known(disk_write));
+    // Time waiting on disk: what disk pressure says over the last minute, else
+    // the share of CPU time idle waiting on it.
+    let disk_wait = move || {
+        let psi = pressure.get().and_then(|p| p.io).map(|io| io.avg60);
+        psi.map(|v| (v, "Share of the last minute some tasks waited on disk"))
+            .or_else(|| last(io_wait).map(|v| (v, "Share of CPU time idle waiting on disk")))
+    };
     let cpu_share = Signal::derive(move || now.get().cpu_percent as f64);
     let mem_share = Signal::derive(move || percent(now.get().mem_used, mem_total));
     let disk_used = Signal::derive(move || now.get().disk_used);
@@ -536,6 +562,20 @@ fn NodeMetrics(
                 {connected.then(|| view! { <DiskMeter storage used=disk_used total=disk_total bare=true/> })}
                 <Sparkline title="Disk" points=disk span=span gap=gap max=Signal::stored(Some(disk_total as f64))
                     format=|v| bytes(v as u64) bare=true axis=true/>
+                <Show when=move || has_disk_io.get()>
+                    <div class="metric-sub metric-sub-split">
+                        <span>"Activity"</span>
+                        {move || disk_wait().filter(|_| connected).map(|(v, why)| view! {
+                            <span class="muted" title=why>{format!("waiting {} of the time", share(v / 100.0))}</span>
+                        })}
+                    </div>
+                    <Sparkline title="Disk activity" points=disk_read span=span gap=gap max=Signal::stored(None)
+                        format=rate bare=true axis=true extra=disk_write extra_label="write" calm=true/>
+                    <div class="spark-legend small muted">
+                        <span class="spark-key-avg"></span>"read"
+                        <span class="spark-key-extra spark-key-calm"></span>"write"
+                    </div>
+                </Show>
             </section>
             <section class="metric-panel">
                 <div class="metric-label">"Network"</div>
@@ -553,6 +593,32 @@ fn NodeMetrics(
                 <Sparkline title="Sent" points=net_out span=span gap=gap max=Signal::stored(None)
                     format=rate bare=true axis=true/>
             </section>
+            // How often tasks waited for CPU, memory or disk (Linux PSI).
+            <Show when=move || has_pressure.get()>
+                <section class="metric-panel pressure-panel">
+                    <div class="metric-label" title=facade_core::resources::STRAIN_HELP>"Pressure"</div>
+                    {figure(
+                        Signal::derive(move || pressure.get().and_then(|p| p.strain()).map(|s| s.to_string()).unwrap_or_else(|| "—".into())),
+                        "strain".into(),
+                    )}
+                    {[
+                        ("Memory", pressure_mem, false, (|p| p.memory) as fn(&facade_core::resources::Pressure) -> _),
+                        ("CPU", pressure_cpu, false, |p| p.cpu),
+                        ("Disk waiting", pressure_io, true, |p| p.io),
+                    ].into_iter().map(|(label, series, axis, pick)| view! {
+                        <div class="metric-sub metric-sub-split">
+                            <span>{label}</span>
+                            // The last minute's, as the strain is judged; else the chart's last.
+                            <span class="muted">{move || {
+                                let now = pressure.get().as_ref().and_then(pick).map(|p| p.avg60).filter(|_| connected);
+                                now.or_else(|| last(series)).map(|v| format!("{v:.1} %")).unwrap_or_default()
+                            }}</span>
+                        </div>
+                        <Sparkline title=label points=series span=span gap=gap max=Signal::stored(Some(10.0))
+                            format=|v| format!("{v:.1} %") bare=true axis=axis/>
+                    }).collect_view()}
+                </section>
+            </Show>
             // Its apps' requests through its entry point, added up.
             <Show when=move || traffic.get()>
                 <section class="metric-panel">

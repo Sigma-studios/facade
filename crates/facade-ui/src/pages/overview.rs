@@ -12,6 +12,7 @@ use crate::components::{
     DiskMeter, ErrorNote, Loading, Meter, OnlineBadge, Sort, SortKey, SortTh, StateBadge, Trend,
     follow_row,
 };
+use crate::gauges::LimitBar;
 use crate::util::{Polled, ago, bytes, cpus, me, percent, polled};
 
 #[component]
@@ -262,7 +263,19 @@ pub fn AppsTable(#[prop(into)] apps: Signal<Vec<AppView>>) -> impl IntoView {
                                         <td><StateBadge state=app.state/></td>
                                         <td class="muted">{app.spec.node.clone()}</td>
                                         <td class="num">{stats.as_ref().map(|s| format!("{:.1} %", s.cpu_percent))}</td>
-                                        <td class="num">{stats.as_ref().map(|s| bytes(s.mem_used))}</td>
+                                        <td class="num">{stats.as_ref().map(|s| {
+                                            // Against its limit, when it has one.
+                                            let share = app.spec.limits.memory_mb
+                                                .map(|m| crate::util::percent(s.mem_used, m * 1024 * 1024));
+                                            view! {
+                                                {bytes(s.mem_used)}
+                                                {share.map(|share| view! {
+                                                    <div class="mem-cell-bar" title=format!("{share:.0} % of its {} MB limit", app.spec.limits.memory_mb.unwrap_or(0))>
+                                                        <LimitBar label="Memory against its limit" percent=share/>
+                                                    </div>
+                                                })}
+                                            }
+                                        })}</td>
                                         <td class="num">{app.disk.clone().filter(|d| d.total() > 0).map(|disk| view! { <DiskCell disk/> })}</td>
                                         <td>
                                             <div class="domains">

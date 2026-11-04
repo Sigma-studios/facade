@@ -2,6 +2,7 @@
 
 mod api;
 mod components;
+mod gauges;
 mod pages;
 mod util;
 
