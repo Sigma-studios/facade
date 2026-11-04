@@ -601,6 +601,42 @@ pub struct AppStats {
     pub net_rx: u64,
     pub net_tx: u64,
     pub restarts: u64,
+    /// What the node's entry point counted for the app; `None` when nothing
+    /// routes to it (no domain) or the entry point cannot tell (an older one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic: Option<Traffic>,
+}
+
+/// Upper bounds, in milliseconds, of the buckets response times are counted
+/// in (a last bucket takes anything slower). Readings are only compared
+/// bucket by bucket, so the bounds must not change.
+pub const LATENCY_BOUNDS_MS: [f64; 27] = [
+    1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0,
+    500.0, 750.0, 1000.0, 1500.0, 2000.0, 3000.0, 5000.0, 7500.0, 10000.0, 15000.0, 30000.0,
+];
+/// Buckets in a latency histogram: one per bound, and one past the last.
+pub const LATENCY_BUCKETS: usize = LATENCY_BOUNDS_MS.len() + 1;
+
+/// An app's traffic through its node's entry point: counters since `since`,
+/// and the connections open now.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Traffic {
+    /// When the entry point started counting for the app (seconds since the
+    /// epoch). A new entry point (after an update) starts again from zero:
+    /// readings with different `since` do not compare.
+    pub since: u64,
+    /// HTTP requests answered (a WebSocket counts once, for its upgrade).
+    pub requests: u64,
+    /// Of which answered 4xx, and 5xx (the entry point's own "unavailable"
+    /// answers included: visitors see those as errors too).
+    pub client_errors: u64,
+    pub server_errors: u64,
+    /// Requests by time to the response's headers, per [`LATENCY_BOUNDS_MS`].
+    #[serde(default)]
+    pub latency: Vec<u64>,
+    /// Client connections open now: kept-alive HTTP, WebSockets, TLS ports.
+    #[serde(default)]
+    pub open: u64,
 }
 
 /// A certificate and its key, for the names it covers (`*.example.com` included).

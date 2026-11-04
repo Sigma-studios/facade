@@ -50,6 +50,8 @@ pub enum Link {
         connected: AtomicBool,
         /// From the entry point's last status.
         bind_errors: Mutex<Vec<String>>,
+        /// Whether it counts traffic (older ones do not know the question).
+        counts_traffic: AtomicBool,
         upgrade: Notify,
         /// Questions about open connections, sent after the latest table: an
         /// answer also says the entry point uses that table.
@@ -58,8 +60,21 @@ pub enum Link {
     },
 }
 
-/// Local ports, and where to send how many connections are open to them.
-type Query = (Vec<u16>, oneshot::Sender<usize>);
+/// A question for the entry point, and where its answer goes.
+pub enum Query {
+    /// How many connections are open to these local ports.
+    Connections(Vec<u16>, oneshot::Sender<usize>),
+    /// The apps' traffic counters.
+    Traffic(oneshot::Sender<AppsTraffic>),
+}
+
+type AppsTraffic = BTreeMap<String, facade_core::proto::Traffic>;
+
+/// An answer to wait for, in the order asked.
+enum Waiting {
+    Connections(oneshot::Sender<usize>),
+    Traffic(oneshot::Sender<AppsTraffic>),
+}
 
 /// How long the entry point has to answer a question.
 const ANSWER_WAIT: Duration = Duration::from_secs(5);
@@ -79,6 +94,7 @@ impl Link {
                     table: watch::channel(None).0,
                     connected: AtomicBool::new(false),
                     bind_errors: Default::default(),
+                    counts_traffic: AtomicBool::new(false),
                     upgrade: Notify::new(),
                     queries,
                     answers: tokio::sync::Mutex::new(answers),
@@ -100,7 +116,28 @@ impl Link {
                     return None;
                 }
                 let (tx, rx) = oneshot::channel();
-                queries.send((ports.to_vec(), tx)).ok()?;
+                queries.send(Query::Connections(ports.to_vec(), tx)).ok()?;
+                tokio::time::timeout(ANSWER_WAIT, rx).await.ok()?.ok()
+            }
+        }
+    }
+
+    /// The traffic counters of the apps the entry point routes to; `None` if it
+    /// cannot tell (not running, or older than counting).
+    pub async fn traffic(&self) -> Option<AppsTraffic> {
+        match self {
+            Link::Embedded { ingress, .. } => Some(ingress.traffic()),
+            Link::External {
+                queries,
+                connected,
+                counts_traffic,
+                ..
+            } => {
+                if !connected.load(Ordering::Relaxed) || !counts_traffic.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let (tx, rx) = oneshot::channel();
+                queries.send(Query::Traffic(tx)).ok()?;
                 tokio::time::timeout(ANSWER_WAIT, rx).await.ok()?.ok()
             }
         }
@@ -271,6 +308,7 @@ impl Agent {
             table,
             connected,
             bind_errors,
+            counts_traffic,
             upgrade,
             answers,
             ..
@@ -298,7 +336,7 @@ impl Agent {
             let mut lines = JsonLines::new(read);
             let mut tables = table.subscribe();
             // Answered in the order asked.
-            let mut waiting = std::collections::VecDeque::<oneshot::Sender<usize>>::new();
+            let mut waiting = std::collections::VecDeque::<Waiting>::new();
             let result: anyhow::Result<()> = async {
                 let current = tables.borrow_and_update().clone();
                 if let Some(table) = current {
@@ -316,7 +354,7 @@ impl Agent {
                         _ = upgrade.notified() => {
                             write_json(&mut write, &ToIngress::Upgrade).await?;
                         }
-                        Some((ports, answer)) = questions.recv() => {
+                        Some(query) = questions.recv() => {
                             // Asked after a table was published: that table first.
                             if tables.has_changed()? {
                                 let current = tables.borrow_and_update().clone();
@@ -324,17 +362,29 @@ impl Agent {
                                     write_json(&mut write, &ToIngress::Table { table }).await?;
                                 }
                             }
-                            write_json(&mut write, &ToIngress::Connections { ports }).await?;
+                            let (question, answer) = match query {
+                                Query::Connections(ports, answer) => {
+                                    (ToIngress::Connections { ports }, Waiting::Connections(answer))
+                                }
+                                Query::Traffic(answer) => (ToIngress::Traffic, Waiting::Traffic(answer)),
+                            };
+                            write_json(&mut write, &question).await?;
                             waiting.push_back(answer);
                         }
                         msg = lines.next::<FromIngress>() => match msg? {
-                            Some(FromIngress::Status { bind_errors: errors, pid }) => {
+                            Some(FromIngress::Status { bind_errors: errors, pid, traffic }) => {
                                 debug!(pid, ?errors, "entry point status");
                                 *bind_errors.lock() = errors;
+                                counts_traffic.store(traffic, Ordering::Relaxed);
                             }
                             Some(FromIngress::Connections { open }) => {
-                                if let Some(answer) = waiting.pop_front() {
+                                if let Some(Waiting::Connections(answer)) = waiting.pop_front() {
                                     let _ = answer.send(open);
+                                }
+                            }
+                            Some(FromIngress::Traffic { apps }) => {
+                                if let Some(Waiting::Traffic(answer)) = waiting.pop_front() {
+                                    let _ = answer.send(apps);
                                 }
                             }
                             None => return Ok(()),
@@ -344,6 +394,7 @@ impl Agent {
             }
             .await;
             connected.store(false, Ordering::Relaxed);
+            counts_traffic.store(false, Ordering::Relaxed);
             match result {
                 Ok(()) => info!("the entry point closed its connection (handover?), reconnecting"),
                 Err(e) => info!("entry point connection: {e:#}"),

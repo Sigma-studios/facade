@@ -14,7 +14,7 @@
 //!   socket activation (`LISTEN_FDS` with `FileDescriptorName=http|https|control`)
 //!   works the same way.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use facade_core::proto::Traffic;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -51,6 +52,10 @@ pub enum ToIngress {
     /// replaced container's), answered with [`FromIngress::Connections`]. Being
     /// answered in order, it also tells the tables sent before are in use.
     Connections { ports: Vec<u16> },
+    /// The apps' traffic counters, answered with [`FromIngress::Traffic`]. Only
+    /// asked of an entry point whose status says it counts: an older one would
+    /// drop the connection on a message it does not know.
+    Traffic,
 }
 
 /// Entry point → agent: its status on connection and whenever it changes, and
@@ -58,8 +63,19 @@ pub enum ToIngress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum FromIngress {
-    Status { bind_errors: Vec<String>, pid: u32 },
-    Connections { open: usize },
+    Status {
+        bind_errors: Vec<String>,
+        pid: u32,
+        /// It answers [`ToIngress::Traffic`] (missing from older ones).
+        #[serde(default)]
+        traffic: bool,
+    },
+    Connections {
+        open: usize,
+    },
+    Traffic {
+        apps: BTreeMap<String, Traffic>,
+    },
 }
 
 pub struct Options {
@@ -280,6 +296,7 @@ async fn control_connection(
     let send_status = |ingress: &Ingress| FromIngress::Status {
         bind_errors: ingress.bind_errors(),
         pid,
+        traffic: true,
     };
     if write_json(&mut write, &send_status(&ingress))
         .await
@@ -295,6 +312,12 @@ async fn control_connection(
                 Ok(Some(ToIngress::Connections { ports })) => {
                     let open = ingress.open_connections(&ports);
                     if write_json(&mut write, &FromIngress::Connections { open }).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Some(ToIngress::Traffic)) => {
+                    let apps = ingress.traffic();
+                    if write_json(&mut write, &FromIngress::Traffic { apps }).await.is_err() {
                         return;
                     }
                 }

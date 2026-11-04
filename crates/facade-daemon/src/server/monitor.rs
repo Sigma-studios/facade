@@ -590,6 +590,7 @@ mod tests {
                     net_rx: 0,
                     net_tx: 0,
                     restarts: 0,
+                    traffic: None,
                 },
             })
             .collect()

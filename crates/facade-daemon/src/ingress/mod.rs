@@ -18,17 +18,19 @@
 mod firewall;
 pub mod process;
 pub mod tcp;
+pub mod traffic;
 
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use facade_core::proto::CertBundle;
+use facade_core::proto::{CertBundle, Traffic};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
@@ -45,6 +47,7 @@ use tokio::sync::watch;
 use tower::ServiceExt;
 use tracing::{debug, info, warn};
 
+use self::traffic::{AppTraffic, Open};
 use crate::tls;
 
 /// Everything the entry point needs to know, replaced as a whole by the agent.
@@ -108,6 +111,34 @@ pub enum Route {
     Unavailable { app: String },
 }
 
+impl Route {
+    /// The app answering at this host, if one does.
+    fn app(&self) -> Option<&str> {
+        match self {
+            Route::Port { app, .. } | Route::Static { app, .. } | Route::Unavailable { app } => {
+                Some(app)
+            }
+            Route::Redirect { .. } => None,
+        }
+    }
+}
+
+/// The table in use, with the traffic counters of the apps it routes to: one
+/// lock gives a request both its route and where to count it.
+struct Routing {
+    table: Table,
+    apps: HashMap<String, Arc<AppTraffic>>,
+}
+
+/// The apps a table routes to, by host name or TLS port.
+fn routed_apps(table: &Table) -> impl Iterator<Item = &str> {
+    table
+        .routes
+        .values()
+        .filter_map(Route::app)
+        .chain(table.tcp.values().map(|t| t.app.as_str()))
+}
+
 /// Certificates by name; `*.example.com` covers one level of subdomains.
 #[derive(Debug)]
 pub struct Certs {
@@ -163,7 +194,7 @@ impl ResolvesServerCert for Certs {
 
 /// The entry point's state, shared by its listeners.
 pub struct Ingress {
-    table: RwLock<Table>,
+    routing: RwLock<Routing>,
     certs: Arc<Certs>,
     client: Client<HttpConnector, Incoming>,
     /// Where the table is kept between runs.
@@ -203,8 +234,11 @@ impl Ingress {
         let client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(60))
             .build(HttpConnector::new());
+        let apps = routed_apps(&table)
+            .map(|app| (app.to_string(), AppTraffic::new()))
+            .collect();
         Ok(Arc::new(Self {
-            table: RwLock::new(table),
+            routing: RwLock::new(Routing { table, apps }),
             certs,
             client,
             file,
@@ -221,7 +255,7 @@ impl Ingress {
     /// Replaces the table (and saves it) if it changed.
     pub fn set_table(self: &Arc<Self>, table: Table) {
         {
-            let current = self.table.read();
+            let current = &self.routing.read().table;
             if *current == table {
                 return;
             }
@@ -250,8 +284,39 @@ impl Ingress {
         self.upstreams
             .lock()
             .retain(|port, open| routed.contains(port) || open.load(Ordering::Relaxed) > 0);
-        *self.table.write() = table;
+        {
+            let mut routing = self.routing.write();
+            // Apps keep their counters while routed to (a deploy moving one to
+            // another port included), and while connections to them last.
+            let mut apps: HashMap<String, Arc<AppTraffic>> = routed_apps(&table)
+                .map(|app| {
+                    let counters = routing.apps.get(app).cloned();
+                    (app.to_string(), counters.unwrap_or_else(AppTraffic::new))
+                })
+                .collect();
+            for (app, counters) in routing.apps.drain() {
+                if counters.open() > 0 {
+                    apps.entry(app).or_insert(counters);
+                }
+            }
+            *routing = Routing { table, apps };
+        }
         self.sync_tcp();
+    }
+
+    /// The counters of every app routed to, as they are now.
+    pub fn traffic(&self) -> BTreeMap<String, Traffic> {
+        self.routing
+            .read()
+            .apps
+            .iter()
+            .map(|(app, counters)| (app.clone(), counters.snapshot()))
+            .collect()
+    }
+
+    /// Where to count traffic for `app`.
+    fn app_traffic(&self, app: &str) -> Option<Arc<AppTraffic>> {
+        self.routing.read().apps.get(app).cloned()
     }
 
     /// Counts a request or connection to a local port while alive. Taken as soon
@@ -386,9 +451,13 @@ impl Ingress {
         I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     {
         let mut retiring = self.retiring.subscribe();
+        // The app the connection's first request went to counts it as open
+        // until it closes (or turns into a WebSocket, which counts on its own).
+        let open = Arc::new(OnceLock::<Open>::new());
         let service = hyper::service::service_fn(move |req| {
             let ingress = self.clone();
-            async move { Ok::<_, Infallible>(ingress.handle(req, peer, tls).await) }
+            let open = open.clone();
+            async move { Ok::<_, Infallible>(ingress.handle(req, peer, tls, &open).await) }
         });
         let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
         let conn = builder.serve_connection_with_upgrades(io, service);
@@ -403,7 +472,14 @@ impl Ingress {
         let _ = conn.await;
     }
 
-    async fn handle(&self, req: Request<Incoming>, peer: SocketAddr, tls: bool) -> Response<Body> {
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+        peer: SocketAddr,
+        tls: bool,
+        open: &OnceLock<Open>,
+    ) -> Response<Body> {
+        let started = Instant::now();
         let host = request_host(&req).unwrap_or_default();
         let path = req
             .uri()
@@ -417,12 +493,20 @@ impl Ingress {
                 .path()
                 .strip_prefix("/.well-known/acme-challenge/")
         {
-            return match self.table.read().challenges.get(token) {
+            return match self.routing.read().table.challenges.get(token) {
                 Some(key_auth) => text(StatusCode::OK, key_auth.clone()),
                 None => text(StatusCode::NOT_FOUND, "unknown challenge"),
             };
         }
-        let route = self.table.read().routes.get(&host).cloned();
+        let (route, counters) = {
+            let routing = self.routing.read();
+            let route = routing.table.routes.get(&host).cloned();
+            let counters = route
+                .as_ref()
+                .and_then(Route::app)
+                .and_then(|app| routing.apps.get(app).cloned());
+            (route, counters)
+        };
         let upstream = match &route {
             Some(Route::Port { port, .. }) => Some(self.upstream(*port)),
             _ => None,
@@ -438,6 +522,9 @@ impl Ingress {
         if !tls && self.certs.find(&host).is_some() {
             return redirect(format!("https://{host}{path}"));
         }
+        if let Some(counters) = &counters {
+            open.get_or_init(|| Open::new(counters.clone()));
+        }
         let result = match route {
             None => {
                 return text(
@@ -451,19 +538,31 @@ impl Ingress {
                 serve_static(req, root).await.map_err(|e| (app, e))
             }
             Some(Route::Port { app, port }) => self
-                .proxy(req, port, upstream, &host, peer, tls)
+                .proxy(req, port, upstream, counters.clone(), &host, peer, tls)
                 .await
                 .map_err(|e| (app, e)),
         };
-        result.unwrap_or_else(|(app, e)| {
-            debug!(%app, "proxy error: {e:#}");
-            text(
-                StatusCode::BAD_GATEWAY,
-                format!("{app} is unavailable right now\n"),
-            )
-        })
+        match result {
+            Ok(response) => {
+                if let Some(counters) = &counters {
+                    counters.record(response.status().as_u16(), Some(started.elapsed()));
+                }
+                response
+            }
+            Err((app, e)) => {
+                debug!(%app, "proxy error: {e:#}");
+                if let Some(counters) = &counters {
+                    counters.record(StatusCode::BAD_GATEWAY.as_u16(), None);
+                }
+                text(
+                    StatusCode::BAD_GATEWAY,
+                    format!("{app} is unavailable right now\n"),
+                )
+            }
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn proxy(
         &self,
         mut req: Request<Incoming>,
@@ -471,6 +570,8 @@ impl Ingress {
         // Counts the request until its response is sent, or the connection it
         // turns into (an upgrade) until it ends.
         upstream: Option<Counted>,
+        // Where the connection an upgrade turns into counts as open.
+        counters: Option<Arc<AppTraffic>>,
         host: &str,
         peer: SocketAddr,
         tls: bool,
@@ -518,7 +619,11 @@ impl Ingress {
         {
             let app_side = hyper::upgrade::on(&mut resp);
             // The HTTP connection ends here; the spliced one counts on its own.
-            let counted = (Counted::new(&self.active), upstream);
+            let counted = (
+                Counted::new(&self.active),
+                upstream,
+                counters.map(Open::new),
+            );
             tokio::spawn(async move {
                 let _counted = counted;
                 match tokio::try_join!(downstream, app_side) {
@@ -883,6 +988,12 @@ mod tests {
             1,
             "as a connection to the app's port"
         );
+        let traffic = &ingress.traffic()["ws"];
+        assert_eq!(
+            (traffic.requests, traffic.open),
+            (1, 1),
+            "its upgrade as a request, then the WebSocket as one connection"
+        );
 
         // The app was replaced: its route goes elsewhere, the WebSocket stays
         // with the old container until it ends, and the agent sees it.
@@ -908,6 +1019,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(ingress.active_connections(), 0, "counted until it ends");
         assert_eq!(ingress.open_connections(&[app_port]), 0);
+        assert_eq!(ingress.traffic()["ws"].open, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1031,6 +1143,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Sends a GET on a kept-alive connection and reads the answer: its status.
+    async fn ask(client: &mut tokio::net::TcpStream, host: &str, path: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        let mut byte = [0u8; 1];
+        while !got.ends_with(b"\r\n\r\n") {
+            client.read_exact(&mut byte).await.unwrap();
+            got.push(byte[0]);
+        }
+        let head = String::from_utf8(got).unwrap().to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map_or(0, |n| n.trim().parse().unwrap());
+        let mut body = vec![0u8; length];
+        client.read_exact(&mut body).await.unwrap();
+        head[9..12].parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn traffic_is_counted_per_app() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The app: answers by path, keeping its connections alive.
+        let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = app.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        head.clear();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            if sock.read_exact(&mut byte).await.is_err() {
+                                return;
+                            }
+                            head.push(byte[0]);
+                        }
+                        let head = String::from_utf8_lossy(&head).to_string();
+                        let status = match head.split(' ').nth(1) {
+                            Some("/missing") => "404 Not Found",
+                            Some("/boom") => "500 Internal Server Error",
+                            _ => "200 OK",
+                        };
+                        let answer = format!("HTTP/1.1 {status}\r\nContent-Length: 2\r\n\r\nok");
+                        sock.write_all(answer.as_bytes()).await.unwrap();
+                    }
+                });
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("facade-traffic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ingress = Ingress::new(&dir).unwrap();
+        let mut table = Table::default();
+        table.routes.insert(
+            "app.example.com".into(),
+            Route::Port {
+                app: "app".into(),
+                port: app_port,
+            },
+        );
+        table.routes.insert(
+            "down.example.com".into(),
+            Route::Unavailable { app: "down".into() },
+        );
+        table.routes.insert(
+            "www.example.com".into(),
+            Route::Redirect {
+                to: "app.example.com".into(),
+            },
+        );
+        ingress.set_table(table.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop_tx, stop) = watch::channel(false);
+        tokio::spawn(ingress.clone().serve(listener, false, stop));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert_eq!(ask(&mut client, "app.example.com", "/").await, 200);
+        assert_eq!(ask(&mut client, "app.example.com", "/missing").await, 404);
+        assert_eq!(ask(&mut client, "app.example.com", "/boom").await, 500);
+        // Answered by the entry point: neither app's.
+        assert_eq!(ask(&mut client, "www.example.com", "/").await, 308);
+        assert_eq!(ask(&mut client, "nowhere.example.com", "/").await, 404);
+        let mut other = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert_eq!(ask(&mut other, "down.example.com", "/").await, 502);
+
+        let traffic = ingress.traffic();
+        assert_eq!(
+            traffic.keys().collect::<Vec<_>>(),
+            ["app", "down"],
+            "only apps are counted"
+        );
+        let app = &traffic["app"];
+        assert_eq!(
+            (app.requests, app.client_errors, app.server_errors),
+            (3, 1, 1)
+        );
+        assert_eq!(app.latency.iter().sum::<u64>(), 3);
+        assert_eq!(app.open, 1, "the kept-alive connection");
+        let down = &traffic["down"];
+        assert_eq!((down.requests, down.server_errors), (1, 1));
+        assert_eq!(
+            down.latency.iter().sum::<u64>(),
+            0,
+            "an app that is down is not fast"
+        );
+        assert_eq!(down.open, 1);
+
+        // Counters stay with an app across tables, and go with it once idle.
+        drop(other);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        table.routes.remove("down.example.com");
+        ingress.set_table(table);
+        let traffic = ingress.traffic();
+        assert_eq!(traffic.keys().collect::<Vec<_>>(), ["app"]);
+        assert_eq!(traffic["app"].requests, 3);
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ingress.traffic()["app"].open, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn hosts() {
         assert_eq!(
@@ -1067,7 +1307,7 @@ mod tests {
         assert!(ingress.certs.find("other.com").is_none());
         // Reloaded from disk after a restart.
         let again = Ingress::new(&dir).unwrap();
-        assert_eq!(*again.table.read(), table);
+        assert_eq!(again.routing.read().table, table);
         assert!(again.certs.find("app.example.com").is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }

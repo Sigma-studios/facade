@@ -20,6 +20,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use super::firewall;
+use super::traffic::Open;
 use super::{BIND_RETRY, Certs, Counted, Ingress, stopped};
 
 /// Where a TLS port goes.
@@ -66,7 +67,7 @@ impl Ingress {
         if self.retired.load(Ordering::Relaxed) {
             return;
         }
-        let wanted: Vec<u16> = self.table.read().tcp.keys().copied().collect();
+        let wanted: Vec<u16> = self.routing.read().table.tcp.keys().copied().collect();
         let mut running = self.tcp.lock();
         running.retain(|port, stop| {
             let keep = wanted.contains(port);
@@ -148,10 +149,11 @@ impl Ingress {
     }
 
     async fn tcp_connection(&self, tcp: TcpStream, port: u16) -> anyhow::Result<()> {
-        let route = self.table.read().tcp.get(&port).cloned();
+        let route = self.routing.read().table.tcp.get(&port).cloned();
         let Some(route) = route else {
             anyhow::bail!("no app on this port any more");
         };
+        let _open = self.app_traffic(&route.app).map(Open::new);
         let Some(target) = route.port else {
             anyhow::bail!("{} is not running", route.app);
         };
@@ -296,6 +298,12 @@ mod tests {
         let mut buf = [0u8; 7];
         tls.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"A1 NOOP");
+        let traffic = &ingress.traffic()["valet"];
+        assert_eq!(
+            (traffic.open, traffic.requests),
+            (1, 0),
+            "a connection, no request"
+        );
 
         // The port goes away with its route.
         table.tcp.clear();

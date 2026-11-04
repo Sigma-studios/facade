@@ -2596,6 +2596,7 @@ impl Runtime {
             net_rx: 0,
             net_tx: 0,
             restarts: 0,
+            traffic: None,
         };
         if w.spec.is_static() {
             stats.state = match (w.spec.enabled, self.static_root(w).is_ok()) {

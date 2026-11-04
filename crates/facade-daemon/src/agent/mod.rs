@@ -661,9 +661,17 @@ impl Agent {
                     .flatten()
             };
             let listeners = self.listeners().await;
+            let mut apps = self.runtime.app_stats(&workloads).await;
+            // Apps nothing routes to have no counters: their traffic is not zero,
+            // there is none to speak of.
+            if let Some(mut traffic) = self.link.traffic().await {
+                for app in &mut apps {
+                    app.traffic = traffic.remove(&app.app);
+                }
+            }
             let report = NodeReport {
                 node: sampler.sample(),
-                apps: self.runtime.app_stats(&workloads).await,
+                apps,
                 storage,
                 listeners,
                 ingress_errors: self.link.errors(),
