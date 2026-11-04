@@ -375,21 +375,31 @@ fn minute_state(
     state: Option<AppState>,
     node_connected: bool,
     main_domain: Option<&ReachView>,
+    unhealthy: bool,
 ) -> u8 {
     if !enabled {
         return STOPPED;
     }
     let state = state.filter(|_| node_connected);
-    let broken = matches!(state, Some(AppState::Crashed | AppState::Failed));
+    let broken = matches!(state, Some(AppState::Crashed | AppState::Failed))
+        || (unhealthy && node_connected);
     if let Some(reach) = main_domain {
         return if !reach.ok || broken { DOWN } else { UP };
     }
     match state {
+        Some(AppState::Running | AppState::Building) if broken => DOWN,
         Some(AppState::Running | AppState::Building) => UP,
         Some(AppState::Crashed | AppState::Failed) => DOWN,
         Some(AppState::Stopped) => STOPPED,
         _ => UNKNOWN,
     }
+}
+
+/// Whether the app's health check says it does not work: its last two results
+/// failed (or its only one), so one slow check does not mark a minute down.
+fn failing_health(results: &[facade_core::resources::HealthCheck]) -> bool {
+    let last: Vec<_> = results.iter().rev().take(2).collect();
+    !last.is_empty() && last.iter().all(|r| !r.ok)
 }
 
 fn record_minute(server: &Server, now: u64, every: u64) {
@@ -414,11 +424,14 @@ fn record_minute(server: &Server, now: u64, every: u64) {
                     .first()
                     .and_then(|d| server.reach.get(d))
                     .filter(|r| r.checked_at >= fresh_after);
+                let app = live.apps.get(&spec.name);
                 let state = minute_state(
                     spec.enabled,
-                    live.apps.get(&spec.name).map(|l| l.state),
+                    app.map(|l| l.state),
                     server.hub.is_connected(&spec.node),
                     reach.as_ref(),
+                    app.and_then(|l| l.stats.as_ref())
+                        .is_some_and(|s| failing_health(&s.resources.health)),
                 );
                 (spec.name.clone(), state)
             })
@@ -704,24 +717,44 @@ mod tests {
         };
         let down = ReachView::default();
         let running = Some(AppState::Running);
-        assert_eq!(minute_state(false, running, true, Some(&up)), STOPPED);
-        assert_eq!(minute_state(true, running, true, Some(&up)), UP);
-        assert_eq!(minute_state(true, running, true, Some(&down)), DOWN);
+        assert_eq!(
+            minute_state(false, running, true, Some(&up), false),
+            STOPPED
+        );
+        assert_eq!(minute_state(true, running, true, Some(&up), false), UP);
+        assert_eq!(minute_state(true, running, true, Some(&down), false), DOWN);
         // Reachable, but answering for a crashed app.
         assert_eq!(
-            minute_state(true, Some(AppState::Crashed), true, Some(&up)),
+            minute_state(true, Some(AppState::Crashed), true, Some(&up), false),
             DOWN
         );
         // No domain: the container says.
-        assert_eq!(minute_state(true, running, true, None), UP);
-        assert_eq!(minute_state(true, Some(AppState::Failed), true, None), DOWN);
+        assert_eq!(minute_state(true, running, true, None, false), UP);
         assert_eq!(
-            minute_state(true, running, false, None),
+            minute_state(true, Some(AppState::Failed), true, None, false),
+            DOWN
+        );
+        assert_eq!(
+            minute_state(true, running, false, None, false),
             UNKNOWN,
             "node away"
         );
         // A domain still answers while the node's agent is away.
-        assert_eq!(minute_state(true, running, false, Some(&up)), UP);
+        assert_eq!(minute_state(true, running, false, Some(&up), false), UP);
+        // Running and reachable, but its health check fails: down.
+        assert_eq!(minute_state(true, running, true, Some(&up), true), DOWN);
+        assert_eq!(minute_state(true, running, true, None, true), DOWN);
+        let check = |ok| facade_core::resources::HealthCheck {
+            at_ms: 0,
+            ok,
+            ms: 1,
+            output: String::new(),
+        };
+        assert!(!failing_health(&[]));
+        assert!(!failing_health(&[check(false), check(true)]));
+        assert!(!failing_health(&[check(true), check(false)]));
+        assert!(failing_health(&[check(true), check(false), check(false)]));
+        assert!(failing_health(&[check(false)]));
     }
 
     #[test]
