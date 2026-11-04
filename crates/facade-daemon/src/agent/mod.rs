@@ -9,6 +9,7 @@ mod layers;
 mod maintenance;
 mod ports;
 mod queue;
+mod resources;
 mod routes;
 mod runtime;
 mod sized;

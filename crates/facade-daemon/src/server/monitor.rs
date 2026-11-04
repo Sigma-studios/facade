@@ -627,6 +627,7 @@ mod tests {
                     net_tx: 0,
                     restarts: 0,
                     traffic: None,
+                    resources: Default::default(),
                 },
             })
             .collect()
