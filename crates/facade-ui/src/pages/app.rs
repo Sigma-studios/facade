@@ -509,6 +509,10 @@ fn OverviewTab(
                 <UpdateCheckPanel name=name deploying=deploying on_deploy=on_deploy/>
             </Show>
         </section>
+        <Show when=move || spec().is_some_and(|s| s.stack.is_none())>
+            <super::auto_deploy::AutoDeployPanel
+                path=Signal::derive(move || format!("/api/apps/{}/auto-deploy", name.get()))/>
+        </Show>
     }
 }
 

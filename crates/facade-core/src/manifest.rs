@@ -38,6 +38,9 @@ pub struct Manifest {
 pub struct StackManifest {
     #[serde(flatten)]
     pub spec: StackSpec,
+    /// Deploy when the branch moves. Left out: unchanged by `apply`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_deploy: Option<bool>,
     /// The stack's variables, used by its compose file (`${DB_PASSWORD}`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub variables: BTreeMap<String, EnvEntry>,
@@ -55,6 +58,10 @@ pub struct NodeDecl {
 pub struct AppManifest {
     #[serde(flatten)]
     pub spec: AppSpec,
+    /// Deploy when the source changes (a new commit on the branch, a new image
+    /// for the tag). Left out: unchanged by `apply`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_deploy: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvEntry>,
 }
@@ -156,6 +163,7 @@ GAME_KEY = { sensitive = true, build = true }
 name = "landing"
 node = "main"
 domains = ["example.com"]
+auto_deploy = true
 source = { type = "git", repo = "https://github.com/me/site", build = { kind = "static", dir = "public" } }
 
 [[app]]
@@ -220,10 +228,13 @@ source = { type = "git", repo = "https://github.com/me/editor", build = { kind =
         );
         assert!(!manifest.apps[0].env["TURN_PASSWORD"].build());
         assert!(manifest.apps[0].env["GAME_KEY"].build());
+        assert_eq!(manifest.apps[1].auto_deploy, Some(true));
+        assert_eq!(manifest.apps[0].auto_deploy, None);
         let again = Manifest::parse(&manifest.to_toml()).unwrap();
         for (a, b) in again.apps.iter().zip(&manifest.apps) {
             assert_eq!(a.spec, b.spec);
             assert_eq!(a.env, b.env);
+            assert_eq!(a.auto_deploy, b.auto_deploy);
         }
     }
 }

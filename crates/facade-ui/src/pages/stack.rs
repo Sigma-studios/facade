@@ -232,7 +232,11 @@ pub fn StackPage() -> impl IntoView {
                         <StackSettings stack=stack.data.get_untracked().expect("loaded")
                             on_saved=Callback::new(move |_| stack.reload())/>
                     }.into_any(),
-                    _ => view! { <StackServices stack=Signal::derive(view_of)/> }.into_any(),
+                    _ => view! {
+                        <StackServices stack=Signal::derive(view_of)/>
+                        <super::auto_deploy::AutoDeployPanel
+                            path=Signal::derive(move || format!("/api/stacks/{}/auto-deploy", name.get()))/>
+                    }.into_any(),
                 }}
             </Show>
         </div>

@@ -255,6 +255,8 @@ pub async fn create(
             tracing::warn!(%app, "push failed: {e:#}");
         }
     }
+    // A token may be what auto-deploys were missing for a webhook.
+    server.auto_deploy.hooks_changed();
     Ok((StatusCode::CREATED, Json(covered)))
 }
 

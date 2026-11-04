@@ -192,6 +192,16 @@ enum Command {
     Updates {
         app: String,
     },
+    /// Apps and stacks that deploy by themselves when their source changes, or
+    /// one's status. Turned on by `app update <app> --auto-deploy on` (or `stack
+    /// update`).
+    AutoDeploy {
+        /// An app or a stack.
+        name: Option<String>,
+        /// Print the URL and secret for a GitHub webhook set up by hand.
+        #[arg(long, conflicts_with = "name")]
+        hook: bool,
+    },
     /// Stacks: services deployed together from one repository (a docker-compose
     /// file, or services defined here), on one node, on a network of their own.
     #[command(subcommand)]
@@ -269,6 +279,9 @@ enum StackCommand {
         no_file: bool,
         #[arg(long)]
         node: Option<String>,
+        /// Deploy by itself when the branch moves: on or off.
+        #[arg(long, value_parser = on_off)]
+        auto_deploy: Option<bool>,
     },
     /// What a deploy would do now: the services, and which ones changed.
     Plan {
@@ -733,6 +746,9 @@ enum AppCommand {
         name: String,
         #[command(flatten)]
         spec: SpecArgs,
+        /// Deploy by itself when its source changes (once deployed by hand): on or off.
+        #[arg(long, value_parser = on_off)]
+        auto_deploy: Option<bool>,
     },
     /// Change an app's settings; only the flags given are changed.
     Update {
@@ -743,6 +759,10 @@ enum AppCommand {
         /// from the old one once copied).
         #[arg(long)]
         move_data: bool,
+        /// Deploy by itself when its source changes (a new commit on its branch, a
+        /// new image for its tag): on or off.
+        #[arg(long, value_parser = on_off)]
+        auto_deploy: Option<bool>,
     },
     /// Give an app to a member (their cap, their logins), or `--admins` back.
     Owner {
@@ -1837,6 +1857,77 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 println!("deploy them with `facade deploy {app}`");
             }
         }
+        Command::AutoDeploy { name: None, hook } => {
+            if hook {
+                let info: WebhookInfo = api.get("/api/hooks/github").await?;
+                if json {
+                    return print_json(&info);
+                }
+                match &info.url {
+                    Some(url) => println!("Payload URL   {url}"),
+                    None => println!(
+                        "Payload URL   (none yet: give the server a domain with `facade server set --api-domain`)"
+                    ),
+                }
+                println!("Content type  application/json");
+                println!("Secret        {}", info.secret);
+                println!(
+                    "Events        push (git apps and stacks), packages (ghcr.io images built from the repository)"
+                );
+                return Ok(());
+            }
+            let targets: Vec<AutoDeployTarget> = api.get("/api/auto-deploy").await?;
+            if json {
+                return print_json(&targets);
+            }
+            if targets.is_empty() {
+                println!(
+                    "nothing deploys by itself; turn it on with `facade app update <app> --auto-deploy on`"
+                );
+                return Ok(());
+            }
+            table(
+                &[
+                    "NAME",
+                    "WATCHING",
+                    "HOW",
+                    "LAST CHECK",
+                    "LAST DEPLOY",
+                    "ERROR",
+                ],
+                targets.iter().map(|t| {
+                    let s = &t.status;
+                    vec![
+                        if t.kind == "stack" {
+                            format!("{} (stack)", t.name)
+                        } else {
+                            t.name.clone()
+                        },
+                        s.watching.clone().unwrap_or_default(),
+                        auto_deploy_method(s),
+                        s.checked_at.map(output::ago).unwrap_or_default(),
+                        s.triggered_at.map(output::ago).unwrap_or_default(),
+                        s.error.clone().unwrap_or_default(),
+                    ]
+                }),
+            );
+        }
+        Command::AutoDeploy {
+            name: Some(name), ..
+        } => {
+            let status: AutoDeployView =
+                match api.get(&format!("/api/apps/{name}/auto-deploy")).await {
+                    Ok(s) => s,
+                    Err(e) => api
+                        .get(&format!("/api/stacks/{name}/auto-deploy"))
+                        .await
+                        .map_err(|_| e)?,
+                };
+            if json {
+                return print_json(&status);
+            }
+            print_auto_deploy(&name, &status);
+        }
         Command::Db(DbCommand::Create {
             name,
             kind,
@@ -2718,11 +2809,13 @@ async fn stack(api: &Api, cmd: StackCommand, json: bool) -> anyhow::Result<()> {
             file,
             no_file,
             node,
+            auto_deploy,
         } => {
-            let mut spec = api
+            let current = api
                 .get::<StackView>(&format!("/api/stacks/{name}"))
                 .await?
                 .spec;
+            let mut spec = current.clone();
             if git.is_some() {
                 spec.repo = git;
             }
@@ -2738,7 +2831,19 @@ async fn stack(api: &Api, cmd: StackCommand, json: bool) -> anyhow::Result<()> {
             if let Some(node) = node {
                 spec.node = node;
             }
-            save_stack(api, &spec, json).await?;
+            if spec != current || auto_deploy.is_none() {
+                save_stack(api, &spec, json && auto_deploy.is_none()).await?;
+            }
+            if let Some(enabled) = auto_deploy {
+                set_auto_deploy(
+                    api,
+                    &format!("/api/stacks/{name}/auto-deploy"),
+                    &name,
+                    enabled,
+                    json,
+                )
+                .await?;
+            }
         }
         StackCommand::Plan { name, commit } => {
             let spec = api
@@ -2792,6 +2897,107 @@ async fn save_stack(api: &Api, spec: &StackSpec, json: bool) -> anyhow::Result<(
         spec.name
     );
     Ok(())
+}
+
+fn on_off(s: &str) -> Result<bool, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" => Ok(true),
+        "off" | "false" | "no" => Ok(false),
+        _ => Err(format!("`{s}`: say on or off")),
+    }
+}
+
+async fn set_auto_deploy(
+    api: &Api,
+    path: &str,
+    name: &str,
+    enabled: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let status: AutoDeployView = api
+        .json(
+            api.request(Method::PUT, path)
+                .json(&SetAutoDeploy { enabled }),
+        )
+        .await?;
+    if json {
+        return print_json(&status);
+    }
+    print_auto_deploy(name, &status);
+    Ok(())
+}
+
+fn minutes(secs: u64) -> String {
+    if secs >= 120 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
+/// How changes are noticed, in a few words.
+fn auto_deploy_method(s: &AutoDeployView) -> String {
+    match s.method {
+        AutoDeployMethod::Off => "off".into(),
+        AutoDeployMethod::Webhook => format!(
+            "webhook ({})",
+            s.webhook_repo.as_deref().unwrap_or_default()
+        ),
+        AutoDeployMethod::Polling => format!("polling every {}", minutes(s.poll_secs)),
+    }
+}
+
+fn print_auto_deploy(name: &str, s: &AutoDeployView) {
+    let short = |h: &str| {
+        let h = h.strip_prefix("sha256:").unwrap_or(h);
+        h.get(..12.min(h.len())).unwrap_or(h).to_string()
+    };
+    if !s.enabled {
+        println!("{name}: auto-deploy off");
+        if let Some(note) = &s.note {
+            println!("  {note}");
+        }
+        return;
+    }
+    println!(
+        "{name}: deploys by itself when {} changes",
+        s.watching.as_deref().unwrap_or("its source")
+    );
+    match s.method {
+        AutoDeployMethod::Webhook => println!(
+            "  noticed by the webhook on {}{}, and checked every {} as well",
+            s.webhook_repo.as_deref().unwrap_or_default(),
+            s.webhook_delivered_at
+                .map(|at| format!(" (last delivery {})", output::ago(at)))
+                .unwrap_or_default(),
+            minutes(s.poll_secs)
+        ),
+        _ => println!("  checked every {}", minutes(s.poll_secs)),
+    }
+    if let Some(note) = &s.note {
+        println!("  {note}");
+    }
+    if let Some(at) = s.checked_at {
+        println!(
+            "  last check {}{}",
+            output::ago(at),
+            s.seen
+                .as_deref()
+                .map(|h| format!(": {}", short(h)))
+                .unwrap_or_default()
+        );
+    }
+    if let (Some(at), Some(what)) = (s.triggered_at, &s.triggered) {
+        println!(
+            "  last automatic deploy {}: {} (noticed by {})",
+            output::ago(at),
+            short(what),
+            s.triggered_by.as_deref().unwrap_or("poll")
+        );
+    }
+    if let Some(e) = &s.error {
+        println!("  error: {e}");
+    }
 }
 
 async fn service(api: &Api, cmd: ServiceCommand, json: bool) -> anyhow::Result<()> {
@@ -3286,8 +3492,20 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 return print_json(&view);
             }
             print_app_detail(&view);
+            // A server from before auto-deploy has no such route: nothing to say.
+            if let Ok(auto) = api
+                .get::<AutoDeployView>(&format!("/api/apps/{name}/auto-deploy"))
+                .await
+                && auto.enabled
+            {
+                println!("auto-deploy: {}", auto_deploy_method(&auto));
+            }
         }
-        AppCommand::Create { name, spec: args } => {
+        AppCommand::Create {
+            name,
+            spec: args,
+            auto_deploy,
+        } => {
             let uploaded = match &args.executable {
                 Some(path) => Some(upload(api, path).await?),
                 None => None,
@@ -3363,6 +3581,14 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
             let view: AppView = api
                 .json(api.request(Method::POST, "/api/apps").json(&spec))
                 .await?;
+            if let Some(enabled) = auto_deploy {
+                let path = format!("/api/apps/{}/auto-deploy", view.spec.name);
+                api.send(
+                    api.request(Method::PUT, &path)
+                        .json(&SetAutoDeploy { enabled }),
+                )
+                .await?;
+            }
             if json {
                 return print_json(&view);
             }
@@ -3370,30 +3596,50 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 "created {}. Set its variables with `facade env set {0} KEY=VALUE`, then `facade deploy {0}`.",
                 view.spec.name
             );
+            if auto_deploy == Some(true) {
+                eprintln!("from then on it deploys by itself when its source changes");
+            }
         }
         AppCommand::Update {
             name,
             spec: args,
             move_data,
+            auto_deploy,
         } => {
             let view: AppView = api.get(&format!("/api/apps/{name}")).await?;
-            let mut spec = view.spec;
+            let mut spec = view.spec.clone();
             let uploaded = match &args.executable {
                 Some(path) => Some(upload(api, path).await?),
                 None => None,
             };
             args.apply(&mut spec, uploaded.as_ref())?;
-            let view: AppView = api
-                .json(
-                    api.request(Method::PUT, &format!("/api/apps/{name}"))
-                        .query(&[("move_data", move_data)])
-                        .json(&spec),
+            // `--auto-deploy` alone changes nothing else (and works on a stack's
+            // service too, to say it is the stack's to change).
+            if spec != view.spec || auto_deploy.is_none() {
+                let view: AppView = api
+                    .json(
+                        api.request(Method::PUT, &format!("/api/apps/{name}"))
+                            .query(&[("move_data", move_data)])
+                            .json(&spec),
+                    )
+                    .await?;
+                if json && auto_deploy.is_none() {
+                    return print_json(&view);
+                }
+                if !json {
+                    eprintln!("updated {name}");
+                }
+            }
+            if let Some(enabled) = auto_deploy {
+                set_auto_deploy(
+                    api,
+                    &format!("/api/apps/{name}/auto-deploy"),
+                    &name,
+                    enabled,
+                    json,
                 )
                 .await?;
-            if json {
-                return print_json(&view);
             }
-            eprintln!("updated {name}");
         }
         AppCommand::Owner { app, user, admins } => {
             if user.is_none() && !admins {

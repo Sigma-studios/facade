@@ -1,6 +1,7 @@
 pub mod alerts;
 pub mod app;
 pub mod apps;
+pub mod auto_deploy;
 pub mod builds;
 pub mod domains;
 pub mod git;
