@@ -848,13 +848,44 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 /* ---------------------------------------------------------------- filters */
 
 .filters { margin-bottom: 20px; }
-.filter-select { width: auto; padding: 6px 10px; }
-.filter-select.filter-active, .multi-select-active { border-color: var(--accent); }
+/* The filters side by side (an app picker, a status, a domain) look alike:
+   same box, font and caret, whether a native select or a checkbox menu. */
+.filter-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  min-width: 140px;
+  max-width: 320px;
+  padding: 0 30px 0 12px;
+  font: inherit;
+  font-weight: 450;
+  line-height: 1;
+  color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.filter-control:hover { background: var(--surface-2); }
+.filter-control.filter-active { border-color: var(--accent); }
+.filter-select-wrap { position: relative; display: inline-flex; }
+.filter-select-wrap::after, .multi-select-caret {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 10px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+.filter-select-wrap::after { content: "▾"; }
+select.filter-select { width: auto; appearance: none; -webkit-appearance: none; text-overflow: ellipsis; }
 .multi-select { position: relative; }
-.multi-select-button { list-style: none; gap: 8px; max-width: 320px; }
+.multi-select-button { position: relative; list-style: none; }
 .multi-select-button::-webkit-details-marker { display: none; }
 .multi-select-label { overflow: hidden; text-overflow: ellipsis; }
-.multi-select-caret { font-size: 10px; color: var(--text-muted); }
 .multi-select-menu {
   position: absolute;
   top: calc(100% + 4px);
@@ -987,6 +1018,7 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .notes { margin: 12px 0 0; padding-left: 18px; color: var(--text-secondary); }
 .notes li + li { margin-top: 3px; }
 .after-cards { margin-top: 12px; }
+.table-more { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 12px; }
 .error-cell { color: var(--critical-text); max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------------------------------------------------------------- stacks */
@@ -1007,7 +1039,6 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 
 /* ---------------------------------------------------------------- domains table, settings tabs */
 
-.toolbar input.filter-input { width: min(320px, 100%); }
 .domain-table td { vertical-align: top; }
 .domain-table { margin-bottom: 24px; }
 .domain-table .domain-cell, .domain-table .app-cell { white-space: nowrap; }

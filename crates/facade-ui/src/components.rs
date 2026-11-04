@@ -1002,6 +1002,35 @@ pub fn follow_row(ev: leptos::ev::MouseEvent) {
     }
 }
 
+/// A dropdown picking one of `options` or, as the empty value, `all` of them;
+/// drawn as [`MultiSelect`]'s button so filters side by side look the same.
+#[component]
+pub fn FilterSelect(
+    label: &'static str,
+    all: &'static str,
+    #[prop(into)] options: Signal<Vec<String>>,
+    #[prop(into)] value: Signal<String>,
+    on_change: Callback<String>,
+) -> impl IntoView {
+    view! {
+        <span class="filter-select-wrap">
+            <select class="filter-control filter-select" aria-label=label
+                class:filter-active=move || value.with(|v| !v.is_empty())
+                on:change=move |ev| on_change.run(event_target_value(&ev))
+                prop:value=move || value.get()>
+                <option value="">{all}</option>
+                <For each=move || options.get() key=|o| o.clone() let:option>
+                    <option value=option.clone()
+                        selected={
+                            let option = option.clone();
+                            move || value.with(|v| *v == option)
+                        }>{option.clone()}</option>
+                </For>
+            </select>
+        </span>
+    }
+}
+
 /// A dropdown of checkboxes picking some of `options`; none picked means all of
 /// them. `noun` is the plural the button uses: "All apps", "3 apps".
 #[component]
@@ -1062,8 +1091,8 @@ pub fn MultiSelect(
     view! {
         <details class="multi-select" node_ref=menu
             on:keydown=move |ev| if ev.key() == "Escape" { close() }>
-            <summary class="button multi-select-button"
-                class:multi-select-active=move || picked.with(|p| !p.is_empty())>
+            <summary class="filter-control multi-select-button"
+                class:filter-active=move || picked.with(|p| !p.is_empty())>
                 <span class="multi-select-label">{summary}</span>
                 <span class="multi-select-caret" aria-hidden="true">"▾"</span>
             </summary>
