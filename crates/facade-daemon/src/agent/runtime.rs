@@ -270,6 +270,11 @@ impl Runtime {
         docker
     }
 
+    /// The agent's data directory.
+    pub fn dir(&self) -> &Path {
+        &self.0.dir
+    }
+
     /// Where sized volumes keep their filesystems: volume data, which Docker
     /// reports with the volumes.
     pub fn sized_volumes_dir(&self) -> PathBuf {
@@ -1489,12 +1494,13 @@ impl Runtime {
             .flat_map(|c| c.mounts.iter().flatten())
             .filter_map(|m| m.name.clone())
             .collect();
-        let volumes: Vec<(VolumeUsage, PathBuf)> = list
+        let volumes: Vec<(VolumeUsage, PathBuf, SizedVolume)> = list
             .volumes
             .unwrap_or_default()
             .into_iter()
             .filter_map(|v| {
                 let dir = PathBuf::from(&v.mountpoint);
+                let sized = SizedVolume::new(&self.0.dir, &v.name);
                 Some(VolumeUsage {
                     app: v
                         .labels
@@ -1503,19 +1509,22 @@ impl Runtime {
                         .clone(),
                     volume: v.labels.get(LABEL_VOLUME)?.clone(),
                     in_use: used.contains(&v.name),
-                    limit: SizedVolume::new(&self.0.dir, &v.name).limit(),
+                    limit: sized.limit(),
                     name: v.name,
                     // Measured below, off the async threads.
                     size: dir.is_dir().then_some(0),
                 })
-                .map(|u| (u, dir))
+                .map(|u| (u, dir, sized))
             })
             .collect::<Vec<_>>();
         let mut volumes: Vec<VolumeUsage> = tokio::task::spawn_blocking(move || {
             volumes
                 .into_iter()
-                .map(|(mut u, dir)| {
-                    if u.size.is_some() {
+                .map(|(mut u, dir, sized)| {
+                    if u.limit.is_some() {
+                        // Its own filesystem says what it holds, without a walk.
+                        u.size = sized.used();
+                    } else if u.size.is_some() {
                         u.size = Some(volumes::size(&dir));
                     }
                     u

@@ -107,6 +107,10 @@ pub struct AppDiskView {
     pub files: u64,
     /// Its volumes; a stack volume counts for each service mounting it.
     pub volumes: u64,
+    /// Its volumes' backups, kept on the server's disk (whichever node the app
+    /// runs on): not in `total`.
+    #[serde(default)]
+    pub backups: u64,
 }
 
 impl AppDiskView {

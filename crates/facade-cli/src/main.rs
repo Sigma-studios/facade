@@ -3142,8 +3142,9 @@ fn print_disk(node: &NodeView, apps: &[AppView], volumes: &[VolumeView]) -> anyh
         (
             "facade",
             s.facade_files,
-            "static sites, certificates, builds; database, uploads, backups".to_string(),
+            "static sites, certificates, builds; database, uploads".to_string(),
         ),
+        ("backups", s.backups, backups_note(s)),
         (
             "other",
             s.other(),
@@ -3206,6 +3207,29 @@ fn print_disk(node: &NodeView, apps: &[AppView], volumes: &[VolumeView]) -> anyh
         }),
     );
     Ok(())
+}
+
+/// The apps whose backups take the most (wherever they run: backups are kept on
+/// the server's disk), for the `backups` row.
+fn backups_note(s: &facade_core::proto::StorageReport) -> String {
+    if s.backups == 0 {
+        return String::new();
+    }
+    let mut top: Vec<(&String, &u64)> = s.app_backups.iter().collect();
+    top.sort_by_key(|(_, size)| std::cmp::Reverse(**size));
+    let named: Vec<String> = top
+        .iter()
+        .take(3)
+        .map(|(app, size)| format!("{app} {}", bytes(**size)))
+        .collect();
+    let mut note = "volume backups and server copies".to_string();
+    if !named.is_empty() {
+        note += &format!(": {}", named.join(", "));
+        if top.len() > named.len() {
+            note += &format!(", {} more", top.len() - named.len());
+        }
+    }
+    note
 }
 
 fn print_join(created: &CreatedNode) {
@@ -4116,6 +4140,9 @@ fn print_app_detail(view: &AppView) {
             parts.push(format!("{} written in the container", bytes(d.written)));
         }
         println!("disk:      {} ({})", bytes(d.total()), parts.join(", "));
+        if d.backups > 0 {
+            println!("backups:   {} on the server's disk", bytes(d.backups));
+        }
         if d.written >= WRITTEN_WARNING {
             println!(
                 "           what the container writes is lost on redeploy: keep it in a volume (--volume name:/path)"

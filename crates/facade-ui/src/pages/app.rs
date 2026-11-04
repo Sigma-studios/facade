@@ -611,6 +611,9 @@ fn disk_detail(d: AppDiskView) -> String {
     if d.files > 0 {
         lines.push(format!("Static files: {}", bytes(d.files)));
     }
+    if d.backups > 0 {
+        lines.push(format!("Backups, on the server's disk: {}", bytes(d.backups)));
+    }
     lines.push(format!("Measured {}", ago(d.at)));
     lines.join("\n")
 }

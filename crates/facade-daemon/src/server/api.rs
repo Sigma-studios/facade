@@ -573,11 +573,21 @@ pub fn app_view(
     } else if !server.hub.is_connected(&spec.node) {
         state = AppState::Unknown;
     }
+    // Backups are on the server's node, wherever the app runs.
+    let backups = live
+        .nodes
+        .get(&server.cfg.local_node)
+        .and_then(|n| n.storage.as_ref())
+        .and_then(|s| s.app_backups.get(&spec.name).copied())
+        .unwrap_or(0);
     let disk = live
         .nodes
         .get(&spec.node)
         .and_then(|n| n.storage.as_ref())
-        .map(|s| app_disk(s, &spec));
+        .map(|s| AppDiskView {
+            backups,
+            ..app_disk(s, &spec)
+        });
     AppView {
         state,
         message,
@@ -609,6 +619,7 @@ pub fn app_disk(storage: &StorageReport, spec: &AppSpec) -> AppDiskView {
         written: own.map_or(0, |a| a.written),
         files: own.map_or(0, |a| a.files),
         volumes,
+        backups: 0,
     }
 }
 

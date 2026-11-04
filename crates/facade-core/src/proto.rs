@@ -9,6 +9,8 @@
 //! * short-lived **data** connections, dialed when the server asks for a tunnel
 //!   (a log stream, a volume archive). After the hello line they carry raw bytes.
 
+use std::collections::BTreeMap;
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -423,14 +425,24 @@ pub struct StorageReport {
     /// What containers wrote outside their volumes.
     #[serde(default)]
     pub containers: u64,
-    /// Every Docker volume of the node, facade's or not.
+    /// Every Docker volume of the node, facade's or not. Volumes with a size
+    /// count for what their filesystem's image file takes on the node's disk
+    /// (Docker leaves them out of its own figure).
     #[serde(default)]
     pub volumes_size: u64,
     /// facade's own files: static sites, certificates, build folders (and on the
-    /// server's node, its database, uploads and backups). Sized volumes' files
-    /// are volume data, left to `volumes_size`.
+    /// server's node, its database and uploads). Sized volumes' files are volume
+    /// data, left to `volumes_size`; backups are `backups` (older agents count
+    /// them here).
     #[serde(default)]
     pub facade_files: u64,
+    /// Volume backups and copies of the server's database: on the server's node
+    /// only, where they are kept (`<data dir>/backups`).
+    #[serde(default)]
+    pub backups: u64,
+    /// What each app's volume backups take, by app (on the server's node).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub app_backups: BTreeMap<String, u64>,
     /// Docker's folders on disk, volumes aside: images, build cache, containers
     /// and their logs, measured. `images` and `build_cache` are Docker's own
     /// figures, which share layers and overlap; this is what they take together.
@@ -457,7 +469,7 @@ impl StorageReport {
             .docker_on_disk
             .unwrap_or(self.images + self.build_cache + self.containers);
         self.disk_used
-            .saturating_sub(docker + self.volumes_size + self.facade_files)
+            .saturating_sub(docker + self.volumes_size + self.facade_files + self.backups)
     }
 
     /// Images and build cache together, as measured on disk: Docker's figures
@@ -488,6 +500,8 @@ pub struct VolumeUsage {
     pub name: String,
     pub app: String,
     pub volume: String,
+    /// What its files take; for a volume with a size, the space used in its
+    /// filesystem.
     pub size: Option<u64>,
     /// Bytes it may hold, for volumes with a size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -606,5 +620,8 @@ mod tests {
         report.docker_on_disk = Some(27 * GB);
         assert_eq!(report.images_and_cache(), Some(27 * GB - GB / 2));
         assert_eq!(report.other(), 32 * GB - 27 * GB - GB - GB / 4);
+
+        report.backups = 2 * GB;
+        assert_eq!(report.other(), 32 * GB - 27 * GB - GB - GB / 4 - 2 * GB);
     }
 }
