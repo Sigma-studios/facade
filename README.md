@@ -280,6 +280,7 @@ template in `lang::generated_dockerfile`.
 | `facade deployments <app> [--id ID]` | build history and logs |
 | `facade updates <app>` | commits on the app's branch since its deployed one |
 | `facade metrics <app>` / `facade node metrics <node>` | last hour of samples, with traffic (see [Traffic](#traffic)) |
+| `facade insights <app>` / `facade errors <app>` | availability, visitors, bandwidth; failed requests (see [Visitors…](#visitors-bandwidth-and-failed-requests)) |
 | `facade env ls <app> [--reveal]` / `env set` / `env unset` | variables; sensitive unless `--public`, handed to builds with `--build` |
 | `facade domain add <app> <domain>` | route a host name to an app |
 | `facade app update <app> --memory 512 --cpus 1 --node eu-2 …` | change settings (moving nodes works) |
@@ -793,6 +794,59 @@ An entry point starts counting from zero when it starts, including when it hands
 to a new version: the period of the handover shows as a gap. Entry points from before
 this counting (until the first handover to a newer `facaded`) report no traffic.
 
+### Visitors, bandwidth and failed requests
+
+The entry point also keeps, for each app:
+
+* **Failed requests**: those answered 4xx or 5xx, grouped by status, method and path.
+  The query string is dropped and segments naming one thing among many become
+  placeholders (`/users/42/avatar?s=64` → `/users/{n}/avatar`; also `{uuid}`, `{hex}`
+  for hashes of 8 hex digits or more, `{token}` for long random strings), so the list
+  stays short: at most 200 groups per app, the least recently seen making room. The
+  app's Overview lists them under its domains (sortable, filtered by 4xx/5xx and path,
+  over the last hour, 24 hours or 7 days), as does `facade errors <app> [--period 1h]
+  [--class 5xx] [--path api] [--sort last]`. Kept 8 days, in 10-minute steps.
+* **Visitors**: how many distinct clients (address and browser) sent a request each
+  day (UTC), estimated within about 2 % by a HyperLogLog sketch: no address is stored
+  anywhere, only maxima of hashes keyed with a secret the entry point keeps. The
+  client is the connection's peer (the entry point is the edge; `X-Forwarded-For` is
+  not trusted), an IPv6 one counted by its /64. Today's and yesterday's are on the
+  Overview, 30 days of them in the Info tab; kept 62 days.
+* **Bandwidth**: bytes received from and sent to clients, counted on the socket (TLS
+  and headers included, as a provider's traffic quota counts them), for the app a
+  connection's first request went to. The Info tab says what an app served this month
+  (and the month before), a node's Network panel what the node served this calendar
+  month.
+
+Requests that succeed cost nothing more; a failed one takes a lock and its normalised
+path (about 0.2 µs), a new connection one keyed hash (about 0.2 µs), and bytes are
+added up per connection and handed to the app every 16 KiB. The agent sends the
+server only what changed since its previous report. Requests from facade's outside
+check (below) are neither visitors nor errors of the app's.
+
+### Availability and the outside check
+
+Every minute the server loads each domain it routes (apps' main and redirecting
+domains, and its own API domain) the way a visitor would: the name resolved by the
+server's resolver, a new connection to whatever it resolves to (the node's entry point,
+through its public address), the certificate checked against the public authorities,
+`GET /` over HTTPS once facade has a certificate for it, over HTTP before. Redirects
+are not followed. Any HTTP answer counts as reachable, even a 404 or a 500: this is
+about DNS, certificates and routing (errors are the traffic counters'). Ten seconds at
+most, eight domains at a time. Each domain on an app's Overview gets a badge
+("reachable · 180 ms", or "unreachable since 14:02" in red, why on hover), the Domains
+page a Reachable column, `facade app show` a line. A domain that answered before and
+fails three rounds in a row raises a "site unreachable" alert (resolved when it answers
+again).
+
+Each minute also records how every deployed app stood. An app with a domain is down
+when its main domain does not answer or its container is crashed or failed; one
+without, when its container is. Stopped on purpose is not counted, nor are minutes the
+server was away. The header of the app page says the share of minutes up over 30 days
+("up 99.95 % · 30 days"); a click shows each day, outages in red (`facade insights
+<app>` prints them). `[checks]` in `server.toml` turns the outside check off (`enabled =
+false`: availability then comes from containers alone) or changes its pace.
+
 ### Alerts on Discord
 
 Create a webhook in a channel (Edit channel → Integrations → Webhooks → New Webhook),
@@ -806,7 +860,8 @@ facade alerts test
 A message is posted when a problem lasts a minute (node offline, app crashed or failed
 to deploy, disk ≥ 90 %, memory ≥ 95 %, app at its memory/CPU limit, entry point unable
 to bind its port, failed backup, app writing over 100 MB inside its container, app
-answering 5xx to at least 20 % of at least 20 requests over 5 minutes) and again when it clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
+answering 5xx to at least 20 % of at least 20 requests over 5 minutes, site unreachable from
+outside for 3 minutes) and again when it clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
 repeatable; copy ids with Discord's developer mode); resolutions tag nobody.
 `--no-mentions` turns tagging off. The webhook is stored encrypted on the server.
 

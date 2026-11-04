@@ -46,3 +46,11 @@ email = "you@example.com"
 
 # Alerts go to Discord; set the webhook and who to tag from the CLI:
 #   facade alerts config --webhook https://discord.com/api/webhooks/… --mention @here
+
+# Every minute the server loads each domain as a visitor would (DNS, certificate,
+# entry point) for the domains' badges, availability and "site unreachable" alerts.
+# [checks]
+# enabled = true
+# every_secs = 60
+# timeout_secs = 10
+# concurrency = 8
