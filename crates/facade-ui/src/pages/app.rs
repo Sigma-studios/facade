@@ -249,6 +249,23 @@ pub fn AppPage() -> impl IntoView {
         });
     };
 
+    // A restart without downtime waits for the new container to be ready:
+    // seconds, longer with a slow health check.
+    let restarting = RwSignal::new(false);
+    let restart = move |_| {
+        restarting.set(true);
+        let path = format!("/api/apps/{}/restart", name.get_untracked());
+        run(
+            "Restarted",
+            async move {
+                let result = api::act(&path).await;
+                restarting.try_set(false);
+                result
+            },
+            move || app.reload(),
+        );
+    };
+
     let confirm_delete = RwSignal::new(false);
     let typed = RwSignal::new(String::new());
     let delete_volumes = RwSignal::new(false);
@@ -430,8 +447,10 @@ pub fn AppPage() -> impl IntoView {
                         on:click=on_primary title=primary_title>
                         {primary_label}
                     </button>
-                    <button class="button" disabled=move || !deployed()
-                        on:click=move |_| simple("restart", "Restarted")>"Restart"</button>
+                    <button class="button" disabled=move || !deployed() || restarting.get()
+                        on:click=restart>
+                        {move || if restarting.get() { "Restarting…" } else { "Restart" }}
+                    </button>
                     <Show
                         when=enabled
                         fallback=move || view! {

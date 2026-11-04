@@ -263,11 +263,28 @@ impl Agent {
     }
 
     /// Restarts an app, without downtime where a deploy would have none (see
-    /// `Runtime::restart`); one at a time with its deploys.
+    /// `Runtime::restart`), unless a deploy of it is under way.
     async fn restart(self: &Arc<Self>, app: String) -> anyhow::Result<()> {
-        let workload = self.workloads.lock().get(&app).cloned();
         let lock = self.lock_for(&app);
-        let _held = lock.lock().await;
+        // A deploy holds the lock through its build (up to an hour) and replaces
+        // the container anyway: meanwhile a restart is the plain one, at once.
+        let Ok(_held) = lock.try_lock() else {
+            tracing::info!(app = %app, "restarting in place: a deploy is in progress");
+            return self
+                .runtime
+                .restart(
+                    &app,
+                    None,
+                    &DeployLog {
+                        agent: self.clone(),
+                        deployment: None,
+                        app: app.clone(),
+                        started: AtomicBool::new(false),
+                    },
+                )
+                .await;
+        };
+        let workload = self.workloads.lock().get(&app).cloned();
         let log = DeployLog {
             agent: self.clone(),
             deployment: None,
