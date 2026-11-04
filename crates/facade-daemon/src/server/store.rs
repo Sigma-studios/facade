@@ -16,6 +16,8 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+mod resources;
+
 pub struct Store(Mutex<Connection>);
 
 const SCHEMA: &str = r#"
@@ -356,6 +358,7 @@ impl Store {
         )?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(AUTO_DEPLOY_SCHEMA)?;
+        conn.execute_batch(resources::SCHEMA)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "node_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;
         add_column(&conn, "node_usage", "net_tx", "INTEGER NOT NULL DEFAULT 0")?;
@@ -818,6 +821,7 @@ impl Store {
         let conn = self.0.lock();
         conn.execute("DELETE FROM apps WHERE name = ?1", [name])?;
         conn.execute("DELETE FROM app_usage WHERE app = ?1", [name])?;
+        resources::delete_app(&conn, name)?;
         Ok(())
     }
 
@@ -1010,6 +1014,7 @@ impl Store {
                 rows[i].set_traffic(&span);
             }
         }
+        resources::fill(&conn, of, name, since, step as u64, &mut rows)?;
         Ok(rows)
     }
 
@@ -1022,6 +1027,7 @@ impl Store {
                 [before as i64],
             )?;
         }
+        resources::prune(&conn, before)?;
         Ok(())
     }
 

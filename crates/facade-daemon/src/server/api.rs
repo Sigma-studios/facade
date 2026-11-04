@@ -19,6 +19,7 @@ use axum::routing::{get, post, put};
 use facade_core::api::*;
 use facade_core::manifest::{AppManifest, EnvEntry, Manifest, NodeDecl};
 use facade_core::proto::{AgentRequest, AppState, Listener, StorageReport};
+use facade_core::resources::ResourcePoint;
 use facade_core::{AppSpec, PortMap, validate_name};
 use serde::Deserialize;
 use tokio::net::TcpListener;
@@ -120,6 +121,14 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/apps/{name}/exec", get(exec_app))
         .route("/api/apps/{name}/metrics", get(app_metrics))
         .route("/api/apps/{name}/usage", get(app_usage))
+        .route(
+            "/api/apps/{name}/volume-sizes",
+            get(super::resources::volume_sizes),
+        )
+        .route(
+            "/api/apps/{name}/health-checks",
+            get(super::resources::health_checks),
+        )
         .route("/api/apps/{name}/deployments", get(list_deployments))
         .route("/api/deployments", get(find_deployments))
         .route("/api/deployments/{id}", get(get_deployment))
@@ -614,6 +623,7 @@ pub fn app_view(
     AppView {
         state,
         message,
+        recent: entry.and_then(|e| super::resources::recent(&e.history)),
         stats: entry.and_then(|e| e.stats.clone()),
         revision,
         commit,
@@ -2063,6 +2073,10 @@ async fn app_usage(
                             ..Default::default()
                         };
                         if let Some(b) = before {
+                            point.resources = ResourcePoint::app_between(
+                                (b.at, &b.stats.resources),
+                                (m.at, &m.stats.resources),
+                            );
                             point.net_rx = facade_core::api::byte_rate(
                                 (b.at, b.stats.net_rx),
                                 (m.at, m.stats.net_rx),
@@ -2121,6 +2135,12 @@ async fn node_usage(
                             connections: m.traffic.as_ref().map(|t| t.open as f64),
                             ..Default::default()
                         };
+                        if let Some(b) = before {
+                            point.resources = ResourcePoint::node_between(
+                                (b.at, &b.stats.resources),
+                                (m.at, &m.stats.resources),
+                            );
+                        }
                         if let Some(b) = before
                             && let (Some(t0), Some(t1)) = (&b.traffic, &m.traffic)
                             && let Some(span) = TrafficSpan::between((b.at, t0), (m.at, t1))
