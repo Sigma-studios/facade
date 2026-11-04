@@ -1861,6 +1861,7 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 println!(
                     "nothing deploys by itself; turn it on with `facade app update <app> --auto-deploy on`"
                 );
+                return Ok(());
             }
             table(
                 &[

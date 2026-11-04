@@ -291,6 +291,7 @@ template in `lang::generated_dockerfile`.
 | `facade app update <app> --backup-before "…" --backup-after "…"` | commands making its files whole while backed up |
 | `facade deploy <app> [--commit REF] [--rebuild]` / `rollback` / `cancel` | deploys |
 | `facade updates <app>` | commits on the app's branch since its deployed one |
+| `facade app update <app> --auto-deploy on` / `facade auto-deploy [<app>]` | deploy on push (see [Auto-deploy](#auto-deploy-deploys-on-push)) |
 | `facade builds` | what each node builds, what waits, recent deployments |
 | `facade db create <name> --kind postgres --link <app>` | a database for an app |
 | `facade stack create shop --git <url>` / `stack show` / `stack plan` | a stack of services |
@@ -336,6 +337,60 @@ version stays. It is the place for database migrations.
 A **health check** (`--health "curl -fs localhost:8080/health"`, or the image's own
 `HEALTHCHECK`) tells when the app is ready: a deploy waits for it to pass, and fails if
 it does not. Without one, a deploy waits for the container to stay up a few seconds.
+
+### Auto-deploy (deploys on push)
+
+```sh
+facade app update api --auto-deploy on      # or the switch on the app's Overview tab
+facade stack update shop --auto-deploy on
+facade auto-deploy                          # what deploys by itself, and how it notices
+facade auto-deploy api                      # webhook or polling, last check, last deploy, error
+```
+
+An app with auto-deploy deploys by itself when its source changes: a new commit on its
+branch (git apps, stacks), or a new image behind its tag (image apps, like
+`ghcr.io/me/blog:latest`). It is the deployment `facade deploy` makes, so the build
+queue, release command, health check, failed-deploy handling and Discord alerts all
+apply, and its log starts with `deploying automatically: …`. It is off until turned
+on; turning it on deploys at once if the app is behind. Apps never deployed, and
+stopped ones, are left alone until deployed or started by hand. Uploaded executables
+have nothing to watch.
+
+facade notices a change in two ways:
+
+* **Polling**, always. Every 3 minutes (`[auto_deploy] poll_secs` in `server.toml`)
+  the server asks the git server where the branch points (`git ls-remote`, with the
+  app's credential), or the registry which digest the tag points to (with the registry
+  login; nothing is pulled).
+* **A GitHub webhook**, which makes it instant. facade creates it on the repository
+  when the server has a domain GitHub can reach (`facade server set --api-domain`)
+  and one of its git access tokens covering the repository may manage webhooks: a
+  fine-grained token with **Webhooks: Read and write** (and Contents: Read to fetch a
+  private repository), or a classic token with `admin:repo_hook` (plus `repo` for
+  private repositories). Polling then goes on every 30 minutes, as a safety net.
+  facade finds its webhook by its URL, so it is created once and updated in place,
+  and removes it when no app or stack of that repository has auto-deploy on any more.
+
+```sh
+facade git token sigma --scope github.com/Sigma-studios   # a token that may manage webhooks
+```
+
+For images on ghcr.io, GitHub tells the webhooks of the repository the package is
+linked to. facade finds that repository in the image's
+`org.opencontainers.image.source` label (which `docker/metadata-action` sets, and
+which links the package to the repository) and puts a webhook for package events
+there. Images on other registries (Docker Hub…) are polled. Without a domain or such a
+token, `facade auto-deploy <app>` and the app page say what is missing; a webhook can
+also be added by hand: `facade auto-deploy --hook` prints its payload URL and secret
+(content type `application/json`, events *Pushes* and/or *Packages*).
+
+What deploys depends on what changed, not on what runs: a commit or image is deployed
+once. A failed deploy is not retried for the same commit (the next push deploys), a
+rollback stays until the next push, and a webhook and a poll noticing the same push
+make one deployment. A change noticed during a deployment waits for it to end.
+Deliveries must be signed with the server's webhook secret (stored encrypted like
+the other secrets), and a delivery only makes facade look at the source: it cannot
+deploy anything that is not on the branch or behind the tag.
 
 ### Stopping cleanly
 
@@ -383,7 +438,8 @@ facade needs read access to private repositories, for scans and builds alike:
 facade git key shop --repo https://github.com/me/shop
 
 # or one access token for every repository of an account or organisation
-# (GitHub: a fine-grained token with read access to Contents)
+# (GitHub: a fine-grained token with read access to Contents; with Webhooks: Read
+# and write too, auto-deploy gets webhooks instead of polling)
 facade git token sigma --scope github.com/Sigma-studios      # prompts for the token
 ```
 
@@ -680,7 +736,9 @@ Every command accepts `--json`. Instead of `facade login`, set `FACADE_SERVER`,
 ### Export / restore
 
 `facade export` writes every node, app and stack as TOML. Variables marked sensitive appear
-as `{ sensitive = true }` without their value; build variables carry `build = true`. `facade apply` on a fresh server
+as `{ sensitive = true }` without their value; build variables carry `build = true`;
+apps and stacks with auto-deploy carry `auto_deploy = true` (`apply` sets it as written,
+and leaves it alone when left out). `facade apply` on a fresh server
 recreates everything, prints join tokens for the nodes it had to create and lists the
 secrets still to set. Applying is idempotent and never deletes anything.
 
@@ -696,6 +754,7 @@ the server; older ones need the server's `facaded` installed by hand.
 * Users other than admins, and per-app permissions.
 * Links across nodes: a database and the apps using it share a node.
 * Backups to somewhere other than the server's disk (S3 and the like).
-* Zero-downtime deploys (the new container starting next to the old one) and deploys
-  on push (webhooks).
+* Zero-downtime deploys (the new container starting next to the old one).
+* Webhooks from forges other than GitHub (GitLab, Gitea…): their repositories are
+  polled.
 * Stacks and databases owned by members (admins create them for now).
