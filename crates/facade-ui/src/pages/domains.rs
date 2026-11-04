@@ -353,10 +353,16 @@ fn DomainRow(d: DomainStatus, show_app: bool, show_node: bool) -> impl IntoView 
         (true, Some(at)) => Some(crate::util::date(at)),
         _ => None,
     };
-    let expires_class = if expires.is_some() {
-        "num expires-cell"
-    } else {
-        "num expires-cell expires-none"
+    // Renewals start a third of the lifetime before the end: a certificate
+    // this close to it is not renewing.
+    let left = d
+        .cert_expires
+        .map(|at| at.saturating_sub(crate::util::now()) / 86400);
+    let expires_class = match (expires.is_some(), left) {
+        (false, _) => "num expires-cell expires-none",
+        (true, Some(0..7)) => "num expires-cell expires-critical",
+        (true, Some(7..14)) => "num expires-cell expires-soon",
+        _ => "num expires-cell",
     };
     let expires = expires.unwrap_or_else(|| "—".into());
     let app = d.app.clone();

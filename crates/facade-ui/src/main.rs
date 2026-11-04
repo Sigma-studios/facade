@@ -34,6 +34,7 @@ fn App() -> impl IntoView {
                     <Route path=path!("stacks/new") view=|| view! { <AdminOnly><pages::stack::NewStack/></AdminOnly> }/>
                     <Route path=path!("stacks/:name") view=|| view! { <AdminOnly><pages::stack::StackPage/></AdminOnly> }/>
                     <Route path=path!("builds") view=pages::builds::Builds/>
+                    <Route path=path!("activity") view=pages::activity::ActivityPage/>
                     <Route path=path!("apps/:name") view=pages::app::AppPage/>
                     <Route path=path!("nodes") view=pages::nodes::Nodes/>
                     <Route path=path!("nodes/:name") view=pages::nodes::Nodes/>
@@ -107,6 +108,7 @@ fn Shell() -> impl IntoView {
                             </Show>
                         </A>
                     </li>
+                    <li><A href="/activity">"Activity"</A></li>
                     <li><A href="/nodes">"Nodes"</A></li>
                     <li><A href="/domains">"Domains"</A></li>
                     <Show when=move || me.is_admin()>

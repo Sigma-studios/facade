@@ -25,6 +25,7 @@ use crate::util::{
 const TABS: &[(&str, &str)] = &[
     ("overview", "Overview"),
     ("info", "Info"),
+    ("activity", "Activity"),
     ("logs", "Logs"),
     ("deployments", "Deployments"),
     ("env", "Environment"),
@@ -506,6 +507,7 @@ pub fn AppPage() -> impl IntoView {
             <Show when=move || app.loaded() fallback=Loading>
                 {move || match tab.get().as_str() {
                     "logs" => view! { <LogsTab name=name/> }.into_any(),
+                    "activity" => view! { <super::activity::ActivityTab app=name/> }.into_any(),
                     "deployments" => view! {
                         <DeploymentsTab name=name selected=selected_deployment
                             current=Signal::derive(move || view_of().and_then(|a| a.commit))
@@ -722,7 +724,7 @@ fn OverviewTab(
                 <div class="tile">
                     <span class="tile-label">"Restarts"</span>
                     <span class="tile-value">{move || stats().map(|s| s.restarts.to_string()).unwrap_or_else(|| "—".into())}</span>
-                    <span class="tile-sub" title="Since the container was created">"since created"</span>
+                    <super::activity::LastRestart app=name restarts=Signal::derive(move || stats().map(|s| s.restarts))/>
                 </div>
                 <A href=info_href attr:class="tile tile-link" attr:title=move || disk().map(disk_detail).unwrap_or_default()>
                     <span class="tile-label">"Disk"</span>
@@ -760,6 +762,7 @@ fn OverviewTab(
         </Show>
         <LatestDeployment name=name deployments
             auto_deploy=Signal::derive(move || spec().is_some_and(|s| s.stack.is_none()))/>
+        <super::activity::RecentActivity app=name/>
         <UsageCharts url=Signal::derive(move || format!("/api/apps/{}/usage", name.get()))
             cpu_max=cpu_max mem_max=mem_max resources=Signal::derive(move || !is_static())/>
         <Show when=move || spec().is_some_and(|s| !s.domains.is_empty())>

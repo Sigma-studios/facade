@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod alerts;
 pub mod app;
 pub mod apps;

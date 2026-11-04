@@ -17,6 +17,7 @@ use crate::util::{Polled, ago, bytes, me, percent, polled, run, toasts};
 
 const TABS: &[(&str, &str)] = &[
     ("overview", "Overview"),
+    ("activity", "Activity"),
     ("ports", "Ports"),
     ("volumes", "Volumes"),
 ];
@@ -213,6 +214,7 @@ pub fn Nodes() -> impl IntoView {
         let n = node.get_untracked()?;
         Some(match tab.get().as_str() {
             "ports" => view! { <Ports node=name/> }.into_any(),
+            "activity" => view! { <super::activity::ActivityTab node=name/> }.into_any(),
             "volumes" => view! { <NodeVolumes node=name volumes/> }.into_any(),
             _ => {
                 let storage = Signal::derive(move || node.with(|n| n.as_ref()?.storage.clone()));
@@ -269,9 +271,17 @@ pub fn Nodes() -> impl IntoView {
                         </Show>
                         <Show when=move || node.with(Option::is_some)>
                             <OnlineBadge online=Signal::derive(connected)/>
+                            <super::activity::NodeBadges node/>
                         </Show>
                     </div>
-                    <div class="muted small subtitle">{move || node.with(|n| n.as_ref().map(node_facts))}</div>
+                    <div class="muted small subtitle">
+                        {move || node.with(|n| n.as_ref().map(node_facts))}
+                        <super::activity::NodeUptime node=Signal::derive(move || current.get().unwrap_or_default())
+                            text=Signal::derive(move || node.with(|n| {
+                                let n = n.as_ref().filter(|n| n.connected)?;
+                                Some(format!("up {}", uptime(n.stats.as_ref()?.uptime)))
+                            }))/>
+                    </div>
                 </div>
                 <Show when=move || me.is_admin() && node.with(Option::is_some)>
                     <div class="actions">
@@ -404,7 +414,8 @@ fn node_facts(node: &NodeView) -> String {
         (None, _) => "no public IP yet".into(),
     });
     match (&node.stats, node.connected, node.last_seen) {
-        (Some(s), true, _) => facts.push(format!("up {}", uptime(s.uptime))),
+        // Uptime follows, leading to the last reboot.
+        (Some(_), true, _) => {}
         (_, false, Some(at)) => facts.push(format!("last seen {}", ago(at))),
         _ => {}
     }
