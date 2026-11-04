@@ -733,6 +733,28 @@ to bind its port, failed backup, app writing over 100 MB inside its container) a
 repeatable; copy ids with Discord's developer mode); resolutions tag nobody.
 `--no-mentions` turns tagging off. The webhook is stored encrypted on the server.
 
+### Accounts
+
+Admins manage everything; members only the apps they own or were granted.
+
+```sh
+facade user add alice --memory 2048 --cpus 2   # prints a one-time password
+facade app owner blog alice                    # alice's app: her cap, her logins
+facade app grant api alice                     # alice may manage api too
+facade app revoke api alice
+facade user set alice --role admin             # or --memory/--cpus (0 removes a cap)
+```
+
+* A member's memory and CPU cap is shared by all their running apps, so their apps
+  must carry limits that fit it.
+* Nodes, DNS, alerts, server settings, users, export/apply and server backups are
+  for admins. Other people's apps, with their deployments, logs, volumes and
+  backups, do not exist for a member.
+* Git and registry logins belong to someone: builds use the app owner's, scans and
+  update checks the caller's.
+* Members cannot put apps on the node's network, and can only add domain names that
+  do not resolve yet.
+
 ### For scripts and AI agents
 
 Every command accepts `--json`. Instead of `facade login`, set `FACADE_SERVER`,
@@ -756,9 +778,9 @@ the server; older ones need the server's `facaded` installed by hand.
 
 ## Not there yet
 
-* Users other than admins, and per-app permissions.
 * Links across nodes: a database and the apps using it share a node.
-* Backups to somewhere other than the server's disk (S3 and the like).
+* Backups to somewhere other than the server's disk (S3 and the like), and
+  incremental backups: each run is a full compressed copy of every volume.
 * Zero-downtime deploys (the new container starting next to the old one).
 * Webhooks from forges other than GitHub (GitLab, Gitea…): their repositories are
   polled.
