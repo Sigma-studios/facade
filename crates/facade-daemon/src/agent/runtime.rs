@@ -1882,23 +1882,30 @@ impl Runtime {
             .state
             .as_ref()
             .is_some_and(|s| s.running == Some(true) && s.restarting != Some(true));
-        let config = existing.config.clone().unwrap_or_default();
+        let app = &w.spec.name;
+        // The tag the app's run key was made with. Not the container's own image
+        // reference: after a restart from an image id (below), that is the id.
         let (Some(tag), Some(run_key), Some(image_id)) = (
-            config.image.clone(),
-            config
-                .labels
+            planned_image(w),
+            existing
+                .config
                 .as_ref()
+                .and_then(|c| c.labels.as_ref())
                 .and_then(|l| l.get(LABEL_RUN))
                 .cloned(),
             existing.image.clone(),
         ) else {
             return Ok(false);
         };
-        if !serving || !run_key_matches(w, &tag, &run_key) {
+        if !serving {
+            return Ok(false);
+        }
+        if !run_key_matches(w, &tag, &run_key) {
+            tracing::info!(%app, "restarting in place: a change waits to be deployed");
             return Ok(false);
         }
         if let Err(why) = self.plan_overlap(w).await {
-            tracing::info!(app = %w.spec.name, "restarting in place: {why}");
+            tracing::info!(%app, "restarting in place: {why}");
             return Ok(false);
         }
         // The image it runs, even if its tag (`latest`…) points elsewhere since:
@@ -1908,8 +1915,20 @@ impl Runtime {
             .inspect_image(&tag)
             .await
             .map_or(true, |i| i.id.as_deref() != Some(image_id.as_str()));
-        let image = if moved { image_id } else { tag };
-        tracing::info!(app = %w.spec.name, "restarting without downtime: a new container starts next to the running one");
+        let image = if !moved {
+            tag
+        } else if self.docker().inspect_image(&image_id).await.is_ok() {
+            image_id
+        } else {
+            // Docker's containerd image store forgets an image once its last tag
+            // moves; only the running container still has it.
+            tracing::info!(
+                %app,
+                "restarting in place: its tag points to another image since, and Docker no longer has the one it runs"
+            );
+            return Ok(false);
+        };
+        tracing::info!(%app, "restarting without downtime: a new container starts next to the running one");
         self.overlap(w, &image, &run_key, &existing, log).await?;
         Ok(true)
     }
