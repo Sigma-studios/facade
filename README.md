@@ -276,6 +276,7 @@ template in `lang::generated_dockerfile`.
 | `facade status` / `facade alerts` | nodes, apps, CPU/memory, firing alerts |
 | `facade activity [--app X] [--node N] [--kind K] [--problems]` | what happened, newest first (see [Activity](#activity)); `--id N` for one entry |
 | `facade alerts config --webhook URL --mention @here` / `facade alerts test` | Discord notifications |
+| `facade alerts weekly [--preview]` / `alerts config --weekly on\|off` | the weekly summary (see [Alerts on Discord](#alerts-on-discord)) |
 | `facade logs <app> -f` | container logs |
 | `facade exec <app> -- <cmd…>` / `exec -it <app> -- sh` | run a command (or a shell) in the app's container; its exit code is facade's |
 | `facade deployments <app> [--id ID]` | build history and logs |
@@ -899,15 +900,43 @@ facade alerts test
 A message is posted when a problem lasts a minute (node offline, app crashed or failed
 to deploy, disk ≥ 90 %, memory ≥ 95 %, app at its memory/CPU limit, entry point unable
 to bind its port, failed backup, app writing over 100 MB inside its container, app
-answering 5xx to at least 20 % of at least 20 requests over 5 minutes, a certificate
-expiring within 7 days, a node waiting for a reboot or for security updates, disk
-errors on a node in the last day) and again when it clears. Each alert is also an
-[Activity](#activity) entry, and with an API domain set, its message links to it. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
+answering 5xx to at least 20 % of at least 20 requests over 5 minutes, site unreachable
+from outside for 3 minutes, a certificate expiring within 7 days, a node waiting for a
+reboot or for security updates, disk errors on a node in the last day) and again when
+it clears. Each alert is also an [Activity](#activity) entry, and with an API domain
+set, its message links to it. Problems tag the `--mention`s (`@here`, `@everyone`,
+`user:<id>`, `role:<id>`, repeatable; copy ids with Discord's developer mode);
+resolutions tag nobody. `--no-mentions` turns tagging off. The webhook is stored
+encrypted on the server.
 
-answering 5xx to at least 20 % of at least 20 requests over 5 minutes, site unreachable from
-outside for 3 minutes) and again when it clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
-repeatable; copy ids with Discord's developer mode); resolutions tag nobody.
-`--no-mentions` turns tagging off. The webhook is stored encrypted on the server.
+**Weekly summary.** With a webhook set, every Monday at 07:00 UTC the server posts one
+message about the seven days before (Monday to Sunday, UTC), tagging nobody:
+
+```
+📊 Week of 26 Oct – 1 Nov 2026
+Apps
+blog · up 99.98 % (2 min down) · 12.4k requests (↑ 14 %) · 37 5xx (0.3 %) · ~212 visitors/day · 2 deploys, 1 crash
+worker · up 100 % · 3 restarts
+Not running: old
+Nodes
+main · disk 45 % (18 GB of 40 GB), +1.3 GB this week · served 4.2 GB (received 310 MB) · 7 updates (2 security) · reboot required
+```
+
+Per app: its [availability](#availability-and-the-outside-check), requests through the
+entry point with the change from the week before (from 50 requests on), the 5xx among
+them, visitors per day on average, and deploys, restarts (asked for), crashes and memory
+kills from the [Activity](#activity). Apps that did not run all week and had nothing
+happen are named on one line. Per node: disk used and how it changed over the week,
+what its entry point served to visitors, pending updates and reboots, and whether it is
+offline or had disk errors. Many apps make several embeds, within Discord's limits.
+
+It is on unless turned off (`facade alerts config --weekly off`, or the switch in
+Settings → Alerts, which says when the next one goes). `facade alerts weekly --preview`
+(or **Preview** there) prints it for the seven days before today without sending
+anything; `--today` covers the last seven days up to now instead. When it last went out
+is kept, so a restart on Monday does not send it twice, and a server that was down at
+07:00 sends it when it is back, the same day. `[alerts]` in `server.toml` moves it:
+`weekly_day = "friday"`, `weekly_hour = 17` (UTC).
 
 ### Activity
 
