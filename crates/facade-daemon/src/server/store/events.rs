@@ -109,25 +109,32 @@ impl Store {
         let details = serde_json::to_string(&e.details)?;
         let conn = self.0.lock();
         if e.fold {
-            let last: Option<(i64, u64, String, String)> = conn
+            let last: Option<(i64, u64, String, String, String)> = conn
                 .query_row(
-                    "SELECT id, at, kind, summary FROM events
+                    "SELECT id, at, kind, summary, details FROM events
                      WHERE app IS ?1 AND node IS ?2 AND scope = ?3
                      ORDER BY at DESC, id DESC LIMIT 1",
                     params![e.app, e.node, e.scope.as_str()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
-            if let Some((id, at, k, summary)) = last
+            if let Some((id, at, k, summary, before)) = last
                 && k == kind.as_str()
                 && summary == e.summary
                 && e.at.saturating_sub(at) <= FOLD_WITHIN
             {
-                // The latest occurrence's details (its crash snapshot) are
-                // the ones worth reading.
+                // The latest occurrence's details are the ones worth reading,
+                // with the last log lines taken (snapshots are not taken at
+                // every turn of a crash loop).
+                let mut latest = e.details.clone();
+                if latest.logs.is_empty() {
+                    latest.logs = serde_json::from_str::<EventDetails>(&before)
+                        .map(|d| d.logs)
+                        .unwrap_or_default();
+                }
                 conn.execute(
                     "UPDATE events SET count = count + 1, at = MAX(at, ?2), details = ?3 WHERE id = ?1",
-                    params![id, e.at, details],
+                    params![id, e.at, serde_json::to_string(&latest)?],
                 )?;
                 return Ok(id);
             }
@@ -259,6 +266,25 @@ impl Store {
             .optional()?)
     }
 
+    /// The latest entry about an alert (by its key): its id and kind.
+    pub fn last_alert_event(&self, key: &str) -> anyhow::Result<Option<(i64, EventKind)>> {
+        let conn = self.0.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, kind FROM events
+                 WHERE category = 'alerts' AND json_extract(details, '$.alert') = ?1
+                 ORDER BY at DESC, id DESC LIMIT 1",
+                [key],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        EventKind::parse(&r.get::<_, String>(1)?),
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
     /// Drops entries older than `before`.
     pub fn prune_events(&self, before: u64) -> anyhow::Result<usize> {
         Ok(self
@@ -308,9 +334,17 @@ mod tests {
         let e = store.get_event(first).unwrap().unwrap();
         assert_eq!((e.count, e.first_at, e.at), (3, 1000, 1100));
         assert_eq!(e.details.logs, vec!["line at 1100".to_string()]);
+        // A turn without a snapshot keeps the last one.
+        let mut bare = crash(1110, "blog");
+        bare.details.logs.clear();
+        bare.details.exit_code = Some(2);
+        assert_eq!(store.insert_event(&bare).unwrap(), first);
+        let e = store.get_event(first).unwrap().unwrap();
+        assert_eq!(e.details.logs, vec!["line at 1100".to_string()]);
+        assert_eq!(e.details.exit_code, Some(2));
         // Long after: a new entry.
         let later = store
-            .insert_event(&crash(1100 + FOLD_WITHIN + 1, "blog"))
+            .insert_event(&crash(1110 + FOLD_WITHIN + 1, "blog"))
             .unwrap();
         assert_ne!(later, first);
         // Something else in between: a new entry too.
@@ -370,7 +404,32 @@ mod tests {
             })
             .unwrap();
         assert!(none.events.is_empty());
-        assert_eq!(store.prune_events(1101).unwrap(), 2);
+        let alert = |kind, at| EventRecord {
+            at,
+            kind: Some(kind),
+            summary: "x".into(),
+            details: EventDetails {
+                alert: Some("app:blog:down".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(store.last_alert_event("app:blog:down").unwrap(), None);
+        let fired = store
+            .insert_event(&alert(EventKind::AlertFired, 6000))
+            .unwrap();
+        assert_eq!(
+            store.last_alert_event("app:blog:down").unwrap(),
+            Some((fired, EventKind::AlertFired))
+        );
+        let resolved = store
+            .insert_event(&alert(EventKind::AlertResolved, 6100))
+            .unwrap();
+        assert_eq!(
+            store.last_alert_event("app:blog:down").unwrap(),
+            Some((resolved, EventKind::AlertResolved))
+        );
+        assert_eq!(store.prune_events(1111).unwrap(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

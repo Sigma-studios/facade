@@ -483,8 +483,20 @@ pub fn alerts_changed(
 ) -> HashMap<String, i64> {
     let mut ids = HashMap::new();
     for a in fired {
+        // Alerts live in memory: after a restart, those still firing fire
+        // again. Their entry from before stands.
+        if let Ok(Some((id, EventKind::AlertFired))) = server.store.last_alert_event(&a.key) {
+            ids.insert(a.key.clone(), id);
+            continue;
+        }
         let message = capitalize(&a.message);
-        if let Some(id) = alert_entry(&a.key, EventKind::AlertFired, Severity::Error, &message)
+        // Pending updates are no outage.
+        let severity = if a.key.ends_with(":upkeep") {
+            Severity::Warn
+        } else {
+            Severity::Error
+        };
+        if let Some(id) = alert_entry(&a.key, EventKind::AlertFired, severity, &message)
             .problem()
             .record(server)
         {
@@ -523,11 +535,21 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
-fn what_deployed(d: &DeploymentView) -> String {
+/// The commit (and its title), else the image, else the revision.
+fn what_deployed(server: &Server, d: &DeploymentView) -> String {
     match (&d.commit, &d.commit_title) {
         (Some(c), Some(t)) => format!("{} · {t}", short(c)),
         (Some(c), None) => short(c).to_string(),
-        _ => format!("revision {}", d.revision),
+        _ => match server
+            .store
+            .get_app(&d.app)
+            .ok()
+            .flatten()
+            .map(|a| a.spec.source)
+        {
+            Some(facade_core::Source::Image { image }) => image,
+            _ => format!("revision {}", d.revision),
+        },
     }
 }
 
@@ -565,12 +587,12 @@ pub fn deploy_requested(
     } else if req.rebuild {
         (
             EventKind::DeployStarted,
-            format!("Rebuild by {}: {}", user.username, what_deployed(d)),
+            format!("Rebuild by {}: {}", user.username, what_deployed(server, d)),
         )
     } else {
         (
             EventKind::DeployStarted,
-            format!("Deploy by {}: {}", user.username, what_deployed(d)),
+            format!("Deploy by {}: {}", user.username, what_deployed(server, d)),
         )
     };
     Entry::app(&d.app, kind, Severity::Info, summary)
@@ -615,7 +637,7 @@ pub fn finish_deployment(
                 &d.app,
                 EventKind::Deployed,
                 Severity::Ok,
-                format!("Deployed {}{took}", what_deployed(&d)),
+                format!("Deployed {}{took}", what_deployed(server, &d)),
             )
         }
         Some(e) => Entry::app(

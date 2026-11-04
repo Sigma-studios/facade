@@ -391,7 +391,7 @@ fn explain_exit(
         let limit = limit.map(|l| format!(" ({} limit)", megabytes(l)));
         let summary = match program {
             Some(p) => format!(
-                "Killed: out of memory{}, the kernel stopped {p}",
+                "Killed: out of memory{}, kernel killed {p}",
                 limit.unwrap_or_default()
             ),
             None => format!("Killed: out of memory{}", limit.unwrap_or_default()),
@@ -1603,7 +1603,7 @@ mod tests {
         );
         assert_eq!(
             explain_exit(137, true, None, None, Some("valet")).summary,
-            "Killed: out of memory, the kernel stopped valet"
+            "Killed: out of memory, kernel killed valet"
         );
         let e = explain_exit(1, false, None, None, None);
         assert_eq!(
