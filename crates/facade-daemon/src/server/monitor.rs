@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use facade_core::api::{
-    AlertView, AppMetric, Mention, NotifyError, NotifySettings, NotifyUpdate, WRITTEN_WARNING,
+    AlertView, AppMetric, Mention, NotifyError, NotifySettings, NotifyUpdate, TrafficSpan,
+    WRITTEN_WARNING,
 };
 use facade_core::proto::AppState;
 use parking_lot::RwLock;
@@ -28,6 +29,13 @@ const NODE_OFFLINE_AFTER: u64 = 120;
 const CPU_PINNED_FOR: u64 = 180;
 /// Stored usage is pruned once an hour.
 const PRUNE_EVERY: u32 = 120;
+/// An app answers too many errors when at least this share of its requests
+/// over the last `ERRORS_OVER` seconds got a 5xx, out of at least
+/// `ERRORS_MIN_REQUESTS` (a handful of failed requests on a quiet app is not
+/// an outage).
+const ERRORS_SHARE: f64 = 0.2;
+const ERRORS_OVER: u64 = 300;
+const ERRORS_MIN_REQUESTS: u64 = 20;
 
 #[derive(Default)]
 pub struct Alerts {
@@ -147,6 +155,23 @@ fn cpu_pinned(history: &VecDeque<AppMetric>, threshold: f64, now: u64) -> bool {
     mean >= threshold
 }
 
+/// The 5xx answers and requests of the last `ERRORS_OVER` seconds, if they
+/// are too many errors. The readings must cover most of that time (not just
+/// after a new entry point started) and be recent.
+fn too_many_errors(history: &VecDeque<AppMetric>, now: u64) -> Option<(u64, u64)> {
+    let mut readings = history
+        .iter()
+        .filter_map(|m| Some((m.at, m.stats.traffic.as_ref()?)));
+    let span = TrafficSpan::recent(readings.clone(), ERRORS_OVER)?;
+    let last = readings.next_back()?.0;
+    let fresh = now.saturating_sub(last) <= ERRORS_OVER / 4;
+    (fresh
+        && span.secs >= ERRORS_OVER * 3 / 4
+        && span.requests >= ERRORS_MIN_REQUESTS
+        && span.server_errors as f64 >= span.requests as f64 * ERRORS_SHARE)
+        .then_some((span.server_errors, span.requests))
+}
+
 /// Everything wrong right now, keyed so the same problem keeps the same key.
 fn conditions(server: &Server) -> HashMap<String, String> {
     let mut out = HashMap::new();
@@ -258,6 +283,17 @@ fn conditions(server: &Server) -> HashMap<String, String> {
                     "app {} has been at its CPU limit for {} minutes",
                     spec.name,
                     CPU_PINNED_FOR / 60
+                ),
+            );
+        }
+        if let Some((errors, requests)) = too_many_errors(&state.history, now) {
+            out.insert(
+                format!("app:{}:errors", spec.name),
+                format!(
+                    "app {} answers errors: {}% of its requests got a 5xx over the last {} minutes ({errors} of {requests})",
+                    spec.name,
+                    errors * 100 / requests,
+                    ERRORS_OVER / 60
                 ),
             );
         }
@@ -613,5 +649,55 @@ mod tests {
         // Too little history (just started) is not enough to say.
         let short = samples(&[50.0; 4], 15, now);
         assert!(!cpu_pinned(&short, 47.5, now));
+    }
+
+    /// Readings every 15 s up to `now`, each adding `requests` of which `errors`
+    /// 5xx; `since` gives each reading's entry point start.
+    fn traffic(steps: &[(u64, u64, u64)], now: u64) -> VecDeque<AppMetric> {
+        let n = steps.len() as u64;
+        let mut total = (0, 0);
+        let mut out = samples(&vec![0.0; steps.len()], 15, now);
+        let mut last_since = 0;
+        for (i, (m, &(since, requests, errors))) in out.iter_mut().zip(steps).enumerate() {
+            if since != last_since {
+                total = (0, 0);
+                last_since = since;
+            }
+            total.0 += requests;
+            total.1 += errors;
+            m.at = now - (n - 1 - i as u64) * 15;
+            m.stats.traffic = Some(facade_core::proto::Traffic {
+                since,
+                requests: total.0,
+                server_errors: total.1,
+                ..Default::default()
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn error_alerts_need_enough_requests_over_long_enough() {
+        let now = 10_000;
+        // 21 readings: five minutes. A quarter of 40 requests failed.
+        let failing = traffic(&[(1, 2, 1); 21], now);
+        assert_eq!(too_many_errors(&failing, now), Some((20, 40)));
+        // A tenth only.
+        let mut steps = [(1, 2, 0); 21];
+        steps[20] = (1, 2, 1);
+        steps[10] = (1, 2, 1);
+        steps[5] = (1, 2, 1);
+        steps[3] = (1, 2, 1);
+        assert_eq!(too_many_errors(&traffic(&steps, now), now), None);
+        // Every request failed, but only 10 of them.
+        assert_eq!(too_many_errors(&traffic(&[(1, 1, 1); 11], now), now), None);
+        // Readings that stopped coming are not about now.
+        assert_eq!(too_many_errors(&failing, now + 600), None);
+        // A new entry point a minute ago: too little to say yet.
+        let mut steps = [(1, 2, 1); 21];
+        for step in &mut steps[17..] {
+            step.0 = 2;
+        }
+        assert_eq!(too_many_errors(&traffic(&steps, now), now), None);
     }
 }
