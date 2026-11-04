@@ -279,7 +279,7 @@ template in `lang::generated_dockerfile`.
 | `facade exec <app> -- <cmd…>` / `exec -it <app> -- sh` | run a command (or a shell) in the app's container; its exit code is facade's |
 | `facade deployments <app> [--id ID]` | build history and logs |
 | `facade updates <app>` | commits on the app's branch since its deployed one |
-| `facade metrics <app>` / `facade node metrics <node>` | last hour of samples |
+| `facade metrics <app>` / `facade node metrics <node>` | last hour of samples, with traffic (see [Traffic](#traffic)) |
 | `facade env ls <app> [--reveal]` / `env set` / `env unset` | variables; sensitive unless `--public`, handed to builds with `--build` |
 | `facade domain add <app> <domain>` | route a host name to an app |
 | `facade app update <app> --memory 512 --cpus 1 --node eu-2 …` | change settings (moving nodes works) |
@@ -770,6 +770,29 @@ When ufw is active, the entry point opens a TLS port in it (`ufw allow
 again once no app asks for it. Published ports need nothing: Docker lets them in
 past ufw by itself.
 
+### Traffic
+
+Each node's entry point counts, for every app a domain or TLS port routes to:
+requests by how they were answered (2xx/3xx, 4xx, 5xx; its own "unavailable" answers
+count as 5xx, since visitors see them as errors; a WebSocket counts once, for its
+upgrade), the time to the response's headers, in fixed buckets from 1 ms to 30 s, and
+the connections open (kept-alive HTTP, WebSockets, TLS ports). It is a few atomic
+additions per request. The agent reads the counters with each report (every 15
+seconds) and the server turns what they grew by into requests per second, 4xx and
+5xx per second, median and 95th percentile response times, and average open
+connections: over the last hour from every report, over 24 hours, 7 and 30 days from
+5-minute buckets. Apps' network traffic in and out (their container's) comes the same
+way.
+
+The app's overview charts requests (5xx in red) and response times (p95, and the
+median), and shows its open connections; a node's overview adds up its apps'
+requests and the share answered 5xx. `facade metrics <app>` prints them, with the
+last five minutes summed up (also in `facade app show`). Apps with no domain show none.
+
+An entry point starts counting from zero when it starts, including when it hands over
+to a new version: the period of the handover shows as a gap. Entry points from before
+this counting (until the first handover to a newer `facaded`) report no traffic.
+
 ### Alerts on Discord
 
 Create a webhook in a channel (Edit channel → Integrations → Webhooks → New Webhook),
@@ -782,7 +805,8 @@ facade alerts test
 
 A message is posted when a problem lasts a minute (node offline, app crashed or failed
 to deploy, disk ≥ 90 %, memory ≥ 95 %, app at its memory/CPU limit, entry point unable
-to bind its port, failed backup, app writing over 100 MB inside its container) and again when it clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
+to bind its port, failed backup, app writing over 100 MB inside its container, app
+answering 5xx to at least 20 % of at least 20 requests over 5 minutes) and again when it clears. Problems tag the `--mention`s (`@here`, `@everyone`, `user:<id>`, `role:<id>`,
 repeatable; copy ids with Discord's developer mode); resolutions tag nobody.
 `--no-mentions` turns tagging off. The webhook is stored encrypted on the server.
 
