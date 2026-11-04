@@ -23,8 +23,11 @@ const CHECK_EVERY: Duration = Duration::from_secs(600);
 const LAST_RUN_KEY: &str = "backups.last_run";
 const SERVER_DIR: &str = "_server";
 
+/// Under the data directory; the local agent reports what it takes.
+pub const DIR: &str = "backups";
+
 pub fn root(server: &Server) -> PathBuf {
-    server.cfg.data_dir.join("backups")
+    server.cfg.data_dir.join(DIR)
 }
 
 pub async fn run(server: Arc<Server>) -> anyhow::Result<()> {
@@ -222,7 +225,7 @@ pub fn snapshot_state(
     store: &super::store::Store,
     keep: usize,
 ) -> anyhow::Result<PathBuf> {
-    let base = data_dir.join("backups").join(SERVER_DIR);
+    let base = data_dir.join(DIR).join(SERVER_DIR);
     create_dirs(&base)?;
     let dir = base.join(facade_core::now().to_string());
     if dir.exists() {

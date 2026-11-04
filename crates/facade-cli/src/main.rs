@@ -2,6 +2,7 @@
 //! for machine-readable output, so scripts and AI agents can drive it.
 
 mod client;
+mod exec;
 mod output;
 
 use std::collections::BTreeMap;
@@ -113,6 +114,28 @@ enum Command {
     /// Stop an app, keeping its configuration.
     Stop {
         app: String,
+    },
+    /// Run a command in an app's running container.
+    ///
+    /// `facade exec blog -- ls /data`, or a shell: `facade exec -it blog -- sh`.
+    /// A stack's services are apps named `<stack>.<service>` (`facade exec
+    /// shop.db -- psql -U postgres`). Output comes as it is written, and facade
+    /// exits with the command's exit code. Closing facade (Ctrl-C without -t)
+    /// stops the command. Admins, and members for the apps they manage.
+    Exec {
+        app: String,
+        /// Pass your input to the command (what you type, or a pipe:
+        /// `facade exec -i db -- psql < dump.sql`).
+        #[arg(short, long)]
+        interactive: bool,
+        /// Give the command a terminal, for shells and programs that need one;
+        /// with -i, every key goes to it (Ctrl-C included).
+        #[arg(short, long)]
+        tty: bool,
+        /// The command and its arguments, after `--`. No shell is involved: use
+        /// `-- sh -c '…'` for pipes and variables.
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<String>,
     },
     /// Show container logs.
     Logs {
@@ -1978,6 +2001,15 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 eprintln!("{app} stopped");
             }
         }
+        Command::Exec {
+            app,
+            interactive,
+            tty,
+            command,
+        } => {
+            let code = exec::run(api, &app, command, interactive, tty).await?;
+            std::process::exit(code);
+        }
         Command::Logs { app, follow, tail } => {
             let resp = api
                 .send(
@@ -3017,7 +3049,7 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
                 return print_json(&ports);
             }
             table(
-                &["PORT", "ADDRESS", "PROCESS", "APP"],
+                &["PORT", "ADDRESS", "PROCESS", "APP", "WHAT"],
                 ports.iter().map(|l| {
                     vec![
                         format!("{}/{}", l.port, l.protocol),
@@ -3028,6 +3060,7 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
                             _ => "?".into(),
                         },
                         l.app.clone().unwrap_or_default(),
+                        l.description.clone().unwrap_or_default(),
                     ]
                 }),
             );
@@ -3142,8 +3175,9 @@ fn print_disk(node: &NodeView, apps: &[AppView], volumes: &[VolumeView]) -> anyh
         (
             "facade",
             s.facade_files,
-            "static sites, certificates, builds; database, uploads, backups".to_string(),
+            "static sites, certificates, builds; database, uploads".to_string(),
         ),
+        ("backups", s.backups, backups_note(s)),
         (
             "other",
             s.other(),
@@ -3206,6 +3240,29 @@ fn print_disk(node: &NodeView, apps: &[AppView], volumes: &[VolumeView]) -> anyh
         }),
     );
     Ok(())
+}
+
+/// The apps whose backups take the most (wherever they run: backups are kept on
+/// the server's disk), for the `backups` row.
+fn backups_note(s: &facade_core::proto::StorageReport) -> String {
+    if s.backups == 0 {
+        return String::new();
+    }
+    let mut top: Vec<(&String, &u64)> = s.app_backups.iter().collect();
+    top.sort_by_key(|(_, size)| std::cmp::Reverse(**size));
+    let named: Vec<String> = top
+        .iter()
+        .take(3)
+        .map(|(app, size)| format!("{app} {}", bytes(**size)))
+        .collect();
+    let mut note = "volume backups and server copies".to_string();
+    if !named.is_empty() {
+        note += &format!(": {}", named.join(", "));
+        if top.len() > named.len() {
+            note += &format!(", {} more", top.len() - named.len());
+        }
+    }
+    note
 }
 
 fn print_join(created: &CreatedNode) {
@@ -4116,6 +4173,32 @@ fn print_app_detail(view: &AppView) {
             parts.push(format!("{} written in the container", bytes(d.written)));
         }
         println!("disk:      {} ({})", bytes(d.total()), parts.join(", "));
+        if d.backups > 0 {
+            println!("backups:   {} on the server's disk", bytes(d.backups));
+        }
+        // What takes the space in the image it runs.
+        let width = d
+            .layers
+            .iter()
+            .map(|l| bytes(l.size).len())
+            .max()
+            .unwrap_or(0);
+        for (i, layer) in d.layers.iter().enumerate() {
+            println!(
+                "{}{:>width$}  {}",
+                if i == 0 { "layers:    " } else { "           " },
+                bytes(layer.size),
+                layer.command
+            );
+        }
+        if d.smaller_layers > 0 && !d.layers.is_empty() {
+            println!(
+                "           {} smaller layer{}: {}",
+                d.smaller_layers,
+                if d.smaller_layers == 1 { "" } else { "s" },
+                bytes(d.smaller_layers_size)
+            );
+        }
         if d.written >= WRITTEN_WARNING {
             println!(
                 "           what the container writes is lost on redeploy: keep it in a volume (--volume name:/path)"

@@ -473,10 +473,13 @@ fn NodeUsage(name: String, #[prop(into)] stats: Signal<Option<NodeStats>>) -> im
 
 /// Who holds a port, as the "Used by" column reads.
 fn used_by(l: &Listener) -> String {
-    match l.app.as_deref() {
-        Some("facade") => "façade".into(),
-        Some(app) => app.into(),
-        None => "another program".into(),
+    match (l.app.as_deref(), l.description.as_deref()) {
+        (Some("facade"), Some(what)) => what.into(),
+        (Some("facade"), None) => "façade".into(),
+        (Some(app), Some(what)) => format!("{app} · {what}"),
+        (Some(app), None) => app.into(),
+        (None, Some(what)) => what.into(),
+        (None, None) => "another program".into(),
     }
 }
 
@@ -574,12 +577,17 @@ fn Ports(node: String) -> impl IntoView {
                                         <td><code>{l.address.clone()}</code></td>
                                         <td class="muted">{Some(process(&l)).filter(|p| !p.is_empty()).unwrap_or_else(|| "—".into())}</td>
                                         <td>
-                                            {match l.app.clone() {
-                                                Some(app) if app == "facade" => view! { <span>"façade"</span> }.into_any(),
-                                                Some(app) => view! {
-                                                    <A href=format!("/apps/{app}") attr:class="strong-link">{app.clone()}</A>
+                                            {match (l.app.clone(), l.description.clone()) {
+                                                (Some(app), what) if app == "facade" => view! {
+                                                    <span>{what.unwrap_or_else(|| "façade".into())}</span>
                                                 }.into_any(),
-                                                None => view! { <span class="muted">{used_by(&l)}</span> }.into_any(),
+                                                (Some(app), what) => view! {
+                                                    <A href=format!("/apps/{app}") attr:class="strong-link">{app.clone()}</A>
+                                                    {what.map(|w| view! { <span class="muted small">{format!(" · {w}")}</span> })}
+                                                }.into_any(),
+                                                (None, what) => view! {
+                                                    <span class="muted">{what.unwrap_or_else(|| "another program".into())}</span>
+                                                }.into_any(),
                                             }}
                                         </td>
                                     </tr>

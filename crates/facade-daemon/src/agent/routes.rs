@@ -107,6 +107,18 @@ impl Link {
         }
     }
 
+    /// The ports this process serves HTTP(S) on, when the entry point runs in it.
+    pub fn embedded_ports(&self) -> std::collections::HashSet<u16> {
+        match self {
+            Link::Embedded { http, https, .. } => [http, https]
+                .into_iter()
+                .flatten()
+                .map(|a| a.port())
+                .collect(),
+            Link::External { .. } => Default::default(),
+        }
+    }
+
     /// Asks an external entry point to hand over to the binary now installed.
     pub fn request_upgrade(&self) {
         if let Link::External { upgrade, .. } = self {

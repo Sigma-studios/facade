@@ -94,6 +94,8 @@ pub struct NodeLive {
     /// when it last connected.
     pub binary: Option<String>,
     pub arch: Option<String>,
+    /// The protocol its agent speaks, as said when it last connected.
+    pub protocol: u32,
 }
 
 pub struct AppLive {

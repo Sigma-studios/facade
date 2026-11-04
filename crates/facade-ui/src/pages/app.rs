@@ -17,7 +17,9 @@ use super::domains::DomainTable;
 use super::spec_form::{SpecFields, SpecForm};
 use crate::api;
 use crate::components::{ErrorNote, Loading, Modal, StateBadge, UsageCharts};
-use crate::util::{ago, bytes, clock, date, me, polled, run, short_hash, strip_ansi, toasts};
+use crate::util::{
+    ago, bytes, clock, date, me, percent, polled, run, short_hash, strip_ansi, toasts,
+};
 
 const TABS: &[(&str, &str)] = &[
     ("overview", "Overview"),
@@ -427,6 +429,7 @@ fn OverviewTab(
             </div>
             <UsageCharts url=Signal::derive(move || format!("/api/apps/{}/usage", name.get()))
                 cpu_max=cpu_max mem_max=mem_max/>
+            <ImageLayers disk=Signal::derive(disk)/>
         </Show>
         <Show when=move || spec().is_some_and(|s| !s.domains.is_empty())>
             <section class="app-domains">
@@ -596,6 +599,56 @@ pub fn CommitRow(c: CommitView) -> impl IntoView {
     }
 }
 
+/// What takes the space in the image the app runs: its largest layers, each
+/// as a bar against the whole image, with the Dockerfile step that made it.
+#[component]
+fn ImageLayers(#[prop(into)] disk: Signal<Option<AppDiskView>>) -> impl IntoView {
+    move || {
+        let d = disk.get().filter(|d| !d.layers.is_empty())?;
+        let image = d.layers.iter().map(|l| l.size).sum::<u64>() + d.smaller_layers_size;
+        let bar = move |size: u64| {
+            view! {
+                <span class="layer-bar">
+                    <span class="layer-fill" style=format!("width: {:.1}%", percent(size, image).max(0.5))></span>
+                </span>
+            }
+        };
+        let smaller = (d.smaller_layers > 0).then(|| {
+            view! {
+                <li class="layer">
+                    {bar(d.smaller_layers_size)}
+                    <span class="layer-size">{bytes(d.smaller_layers_size)}</span>
+                    <span class="layer-step muted">{format!(
+                        "{} smaller layer{}",
+                        d.smaller_layers,
+                        if d.smaller_layers == 1 { "" } else { "s" }
+                    )}</span>
+                </li>
+            }
+        });
+        Some(view! {
+            <section class="image-layers">
+                <h2 class="section-title">"What its image holds"</h2>
+                <p class="muted small">{format!(
+                    "{} in all, largest layers first; each one is a step of its Dockerfile. Measured {}.",
+                    bytes(image),
+                    ago(d.at)
+                )}</p>
+                <ul class="layers">
+                    {d.layers.into_iter().map(|l| view! {
+                        <li class="layer">
+                            {bar(l.size)}
+                            <span class="layer-size">{bytes(l.size)}</span>
+                            <code class="layer-step" title=l.command.clone()>{l.command.clone()}</code>
+                        </li>
+                    }).collect_view()}
+                    {smaller}
+                </ul>
+            </section>
+        })
+    }
+}
+
 /// Every part of an app's disk use, for the tile's tooltip.
 fn disk_detail(d: AppDiskView) -> String {
     let mut lines = vec![format!(
@@ -611,6 +664,12 @@ fn disk_detail(d: AppDiskView) -> String {
     lines.push(format!("Written in the container: {}", bytes(d.written)));
     if d.files > 0 {
         lines.push(format!("Static files: {}", bytes(d.files)));
+    }
+    if d.backups > 0 {
+        lines.push(format!(
+            "Backups, on the server's disk: {}",
+            bytes(d.backups)
+        ));
     }
     lines.push(format!("Measured {}", ago(d.at)));
     lines.join("\n")

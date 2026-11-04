@@ -46,6 +46,27 @@ impl SizedVolume {
         std::fs::metadata(self.image()).ok().map(|m| m.len())
     }
 
+    /// What its data takes: the space used in its filesystem while mounted (as
+    /// `df` says, without walking the files), else what its image file takes.
+    /// Docker cannot size these volumes: `docker system df` skips volumes with
+    /// mount options.
+    pub fn used(&self) -> Option<u64> {
+        if self.is_mounted().unwrap_or(false)
+            && let Some(used) = fs_used(&self.mountpoint())
+        {
+            return Some(used);
+        }
+        self.on_disk()
+    }
+
+    /// What its image file takes on the node's disk (it is sparse).
+    pub fn on_disk(&self) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(self.image())
+            .ok()
+            .map(|m| m.blocks() * 512)
+    }
+
     /// Creates the filesystem, or grows it to `size_mb`, and mounts it. Its data
     /// directory is the caller's to create (or fill).
     pub async fn ensure(&self, size_mb: u64) -> anyhow::Result<()> {
@@ -187,6 +208,31 @@ impl SizedVolume {
 
 const UNIT_DIR: &str = "/etc/systemd/system";
 
+/// What the image files of every sized volume under `agent_dir` take on the
+/// node's disk, the volumes no app declares any more included.
+pub fn on_disk_total(agent_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(agent_dir.join("volumes")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| SizedVolume::new(agent_dir, &e.file_name().to_string_lossy()).on_disk())
+        .sum()
+}
+
+/// Space used in the filesystem mounted at `dir`, from `statvfs`.
+fn fs_used(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is NUL-terminated and `stat` is a valid out pointer.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let blocks = (stat.f_blocks as u64).saturating_sub(stat.f_bfree as u64);
+    Some(blocks * stat.f_frsize as u64)
+}
+
 /// Why this node cannot have volumes with a size, if it cannot.
 pub fn unsupported() -> Option<String> {
     if !cfg!(target_os = "linux") {
@@ -267,4 +313,16 @@ pub async fn copy_into(from: &Path, to: &Path) -> anyhow::Result<()> {
     }
     std::fs::rename(&partial, to)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measures_a_filesystem_without_walking_it() {
+        let used = fs_used(&std::env::temp_dir()).expect("statvfs");
+        assert!(used > 0);
+        assert_eq!(fs_used(Path::new("/no/such/dir")), None);
+    }
 }

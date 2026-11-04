@@ -9,6 +9,8 @@
 //! * short-lived **data** connections, dialed when the server asks for a tunnel
 //!   (a log stream, a volume archive). After the hello line they carry raw bytes.
 
+use std::collections::BTreeMap;
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -19,7 +21,11 @@ use crate::spec::AppSpec;
 /// sizes, and agents run commands in containers (backup hooks).
 /// 5: workloads name the variables their builds get (`build_env`), which an older
 /// agent would drop without a word.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// 6: agents run commands for `facade exec` over a data connection
+/// ([`AgentRequest::ExecStream`]); the server asks only agents speaking 6.
+pub const PROTOCOL_VERSION: u32 = 6;
+/// The first protocol with [`AgentRequest::ExecStream`].
+pub const EXEC_STREAM_PROTOCOL: u32 = 6;
 /// The oldest agent protocol the server still talks to. Agents in between are
 /// sent the server's binary and update themselves.
 pub const MIN_AGENT_PROTOCOL: u32 = 3;
@@ -261,6 +267,13 @@ pub enum AgentRequest {
         command: String,
         timeout_secs: u32,
     },
+    /// Dial a data connection for `tunnel` and run `request` in the app's
+    /// container, with its input and output in [`crate::exec::Frame`]s on it.
+    ExecStream {
+        tunnel: Uuid,
+        app: String,
+        request: crate::exec::ExecRequest,
+    },
 }
 
 /// Stacks deploy in two phases: every service is built first (nothing changes if
@@ -407,9 +420,30 @@ pub struct Listener {
     pub process: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
-    /// The facade app the socket belongs to; `facade` for facade itself.
+    /// The facade app the socket belongs to; `facade` for facade itself. A TLS
+    /// port of the entry point belongs to the app it passes connections to.
     #[serde(default)]
     pub app: Option<String>,
+    /// What holds it, in a few words, when the agent knows: `façade entry
+    /// point`, `container grafana`, `SSH (system)`. Older agents send none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl Listener {
+    /// Who holds the socket, for messages: `app blog`, `facade itself`,
+    /// `docker-proxy (pid 412, container grafana)`.
+    pub fn holder(&self) -> String {
+        match (&self.app, &self.process, self.pid, &self.description) {
+            (Some(app), ..) if app == "facade" => "facade itself".into(),
+            (Some(app), ..) => format!("app {app}"),
+            (None, Some(p), Some(pid), Some(what)) => format!("{p} (pid {pid}, {what})"),
+            (None, Some(p), Some(pid), None) => format!("{p} (pid {pid})"),
+            (None, Some(p), None, _) => p.clone(),
+            (None, None, _, Some(what)) => what.clone(),
+            _ => "another program".into(),
+        }
+    }
 }
 
 /// What Docker and facade keep on a node's disk, and the last cleanup.
@@ -423,14 +457,24 @@ pub struct StorageReport {
     /// What containers wrote outside their volumes.
     #[serde(default)]
     pub containers: u64,
-    /// Every Docker volume of the node, facade's or not.
+    /// Every Docker volume of the node, facade's or not. Volumes with a size
+    /// count for what their filesystem's image file takes on the node's disk
+    /// (Docker leaves them out of its own figure).
     #[serde(default)]
     pub volumes_size: u64,
     /// facade's own files: static sites, certificates, build folders (and on the
-    /// server's node, its database, uploads and backups). Sized volumes' files
-    /// are volume data, left to `volumes_size`.
+    /// server's node, its database and uploads). Sized volumes' files are volume
+    /// data, left to `volumes_size`; backups are `backups` (older agents count
+    /// them here).
     #[serde(default)]
     pub facade_files: u64,
+    /// Volume backups and copies of the server's database: on the server's node
+    /// only, where they are kept (`<data dir>/backups`).
+    #[serde(default)]
+    pub backups: u64,
+    /// What each app's volume backups take, by app (on the server's node).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub app_backups: BTreeMap<String, u64>,
     /// Docker's folders on disk, volumes aside: images, build cache, containers
     /// and their logs, measured. `images` and `build_cache` are Docker's own
     /// figures, which share layers and overlap; this is what they take together.
@@ -457,7 +501,7 @@ impl StorageReport {
             .docker_on_disk
             .unwrap_or(self.images + self.build_cache + self.containers);
         self.disk_used
-            .saturating_sub(docker + self.volumes_size + self.facade_files)
+            .saturating_sub(docker + self.volumes_size + self.facade_files + self.backups)
     }
 
     /// Images and build cache together, as measured on disk: Docker's figures
@@ -480,6 +524,23 @@ pub struct AppDisk {
     pub written: u64,
     /// Static site files.
     pub files: u64,
+    /// The largest layers of the image it runs, largest first. Older agents
+    /// send none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<ImageLayer>,
+    /// The image's other layers holding files: how many, and what they take.
+    #[serde(default)]
+    pub smaller_layers: u32,
+    #[serde(default)]
+    pub smaller_layers_size: u64,
+}
+
+/// One layer of an image, from its history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageLayer {
+    pub size: u64,
+    /// The Dockerfile step that made it, shortened (`RUN apt-get install …`).
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -488,6 +549,8 @@ pub struct VolumeUsage {
     pub name: String,
     pub app: String,
     pub volume: String,
+    /// What its files take; for a volume with a size, the space used in its
+    /// filesystem.
     pub size: Option<u64>,
     /// Bytes it may hold, for volumes with a size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -606,5 +669,8 @@ mod tests {
         report.docker_on_disk = Some(27 * GB);
         assert_eq!(report.images_and_cache(), Some(27 * GB - GB / 2));
         assert_eq!(report.other(), 32 * GB - 27 * GB - GB - GB / 4);
+
+        report.backups = 2 * GB;
+        assert_eq!(report.other(), 32 * GB - 27 * GB - GB - GB / 4 - 2 * GB);
     }
 }

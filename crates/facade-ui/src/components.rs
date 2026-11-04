@@ -714,8 +714,14 @@ fn disk_parts(storage: &StorageReport) -> Vec<DiskPart> {
             "façade",
             storage.facade_files,
             "disk-5",
-            "Static sites, certificates, builds; the server's database, uploads, backups.",
+            "Static sites, certificates, builds; the server's database and uploads.",
         ),
+        DiskPart {
+            label: "Backups",
+            size: storage.backups,
+            class: "disk-7",
+            hint: backups_hint(storage),
+        },
         part(
             "Other",
             storage.other(),
@@ -730,6 +736,23 @@ fn disk_parts(storage: &StorageReport) -> Vec<DiskPart> {
         ),
     ]);
     parts
+}
+
+/// What the backups part holds, naming the apps whose backups take the most.
+fn backups_hint(storage: &StorageReport) -> String {
+    let mut top: Vec<(&String, &u64)> = storage.app_backups.iter().collect();
+    top.sort_by_key(|(_, size)| std::cmp::Reverse(**size));
+    let named: Vec<String> = top
+        .iter()
+        .take(3)
+        .map(|(app, size)| format!("{app} {}", bytes(**size)))
+        .collect();
+    let mut hint =
+        "Volume backups of every node's apps, and copies of the server's database.".to_string();
+    if !named.is_empty() {
+        hint += &format!(" Largest: {}.", named.join(", "));
+    }
+    hint
 }
 
 /// A node's disk meter. Once the node has reported what takes the space, the bar

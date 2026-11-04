@@ -6,7 +6,7 @@
 //! * when the disk is 85 % full: build cache unused for a day, and the images kept
 //!   for rollbacks; at 90 %, the whole build cache.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -243,15 +243,37 @@ async fn du(dir: &Path) -> Result<u64, String> {
     Ok(kib * 1024)
 }
 
-/// Sizes from `docker system df`, this node's volumes, each app's share, and
-/// facade's own files.
+/// What the backups under `dir` take in all, and by app. The server keeps them
+/// in its data directory (see `server::backups`), so only its node has any;
+/// `_server` holds copies of its database, not an app's.
+async fn backups(dir: &Path) -> (u64, BTreeMap<String, u64>) {
+    let mut total = 0;
+    let mut by_app = BTreeMap::new();
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return (0, by_app);
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let size = dir_size(entry.path(), vec![]).await;
+        total += size;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(['_', '.']) && size > 0 {
+            by_app.insert(name, size);
+        }
+    }
+    (total, by_app)
+}
+
+/// Sizes from `docker system df`, this node's volumes, each app's share,
+/// facade's own files and the backups.
 pub async fn refresh_report(agent: &Agent) {
     let (disk_used, disk_total) = disk_usage();
+    let backups_dir = agent.files_dir.join(crate::server::backups::DIR);
     let facade_files = dir_size(
         agent.files_dir.clone(),
-        vec![agent.runtime.sized_volumes_dir()],
+        vec![agent.runtime.sized_volumes_dir(), backups_dir.clone()],
     )
     .await;
+    let (backups, app_backups) = backups(&backups_dir).await;
     let docker_on_disk = docker_on_disk(agent).await;
     let mut report = StorageReport {
         at: facade_core::now(),
@@ -259,6 +281,8 @@ pub async fn refresh_report(agent: &Agent) {
         disk_used,
         disk_total,
         facade_files,
+        backups,
+        app_backups,
         docker_on_disk,
         ..Default::default()
     };
@@ -276,7 +300,7 @@ pub async fn refresh_report(agent: &Agent) {
             match field("Type") {
                 "Images" => report.images = parse_size(field("Size")),
                 "Containers" => report.containers = parse_size(field("Size")),
-                "Local Volumes" => report.volumes_size = parse_size(field("Size")),
+                "Local Volumes" => report.volumes_size += parse_size(field("Size")),
                 "Build Cache" => {
                     report.build_cache = parse_size(field("Size"));
                     report.build_cache_reclaimable = parse_size(field("Reclaimable"));
@@ -285,10 +309,18 @@ pub async fn refresh_report(agent: &Agent) {
             }
         }
     }
+    // Docker's figure leaves out volumes with mount options, which sized
+    // volumes are: their image files are what they take on the disk.
+    let agent_dir = agent.runtime.dir().to_path_buf();
+    report.volumes_size +=
+        tokio::task::spawn_blocking(move || super::sized::on_disk_total(&agent_dir))
+            .await
+            .unwrap_or(0);
     match agent.runtime.volumes().await {
         Ok(mut volumes) => {
-            // Volume sizes need a walk of their files; `df -v` does it.
-            if !volumes.is_empty()
+            // Volume sizes need a walk of their files; `df -v` does it, except
+            // for sized volumes, measured by their own filesystem.
+            if volumes.iter().any(|v| v.limit.is_none())
                 && let Ok(out) = Command::new("docker")
                     .args(["system", "df", "-v", "--format", "{{json .Volumes}}"])
                     .kill_on_drop(true)
@@ -296,7 +328,7 @@ pub async fn refresh_report(agent: &Agent) {
                     .await
                 && let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout)
             {
-                for v in &mut volumes {
+                for v in volumes.iter_mut().filter(|v| v.limit.is_none()) {
                     v.size = rows
                         .iter()
                         .find(|r| r.get("Name").and_then(|n| n.as_str()) == Some(&v.name))
@@ -324,5 +356,25 @@ mod tests {
         assert_eq!(parse_size("121.6MB (66%)"), 121_600_000);
         assert_eq!(parse_size("0B"), 0);
         assert_eq!(parse_size("512kB"), 512_000);
+    }
+
+    #[tokio::test]
+    async fn sizes_backups_by_app() {
+        let dir = std::env::temp_dir().join(format!("facade-backups-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("blog/data")).unwrap();
+        std::fs::create_dir_all(dir.join("_server/1700000000")).unwrap();
+        std::fs::write(
+            dir.join("blog/data/1700000000.tar.gz"),
+            vec![1u8; 64 * 1024],
+        )
+        .unwrap();
+        std::fs::write(dir.join("_server/1700000000/facade.db"), vec![1u8; 8192]).unwrap();
+        let (total, by_app) = backups(&dir).await;
+        assert_eq!(by_app.keys().collect::<Vec<_>>(), ["blog"]);
+        assert!(by_app["blog"] >= 64 * 1024);
+        assert!(total >= by_app["blog"] + 8192);
+        assert_eq!(backups(&dir.join("missing")).await.0, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

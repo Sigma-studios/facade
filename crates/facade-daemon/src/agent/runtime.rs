@@ -59,7 +59,7 @@ struct Inner {
     token: JoinToken,
 }
 
-fn container(app: &str) -> String {
+pub(super) fn container(app: &str) -> String {
     format!("facade-{app}")
 }
 
@@ -268,6 +268,11 @@ impl Runtime {
             u64::from(MAX_STOP_TIMEOUT) + 60,
         ));
         docker
+    }
+
+    /// The agent's data directory.
+    pub fn dir(&self) -> &Path {
+        &self.0.dir
     }
 
     /// Where sized volumes keep their filesystems: volume data, which Docker
@@ -1007,10 +1012,9 @@ impl Runtime {
         let started = std::time::Instant::now();
         let mut last_said = None::<std::time::Instant>;
         loop {
-            let (containers, published) = self.port_owners().await?;
+            let owners = self.port_owners().await?;
             let listeners =
-                tokio::task::spawn_blocking(move || super::ports::scan(&containers, &published))
-                    .await?;
+                tokio::task::spawn_blocking(move || super::ports::scan(&owners)).await?;
             let busy: Vec<String> = listeners
                 .iter()
                 .filter(|l| l.app.as_deref() != Some(w.spec.name.as_str()))
@@ -1019,14 +1023,7 @@ impl Runtime {
                         .iter()
                         .any(|p| p.protocol == l.protocol && p.contains(l.port))
                 })
-                .map(|l| {
-                    let holder = match (&l.app, &l.process, l.pid) {
-                        (Some(app), _, _) => format!("app {app}"),
-                        (None, Some(p), Some(pid)) => format!("{p} (pid {pid})"),
-                        _ => "another program".into(),
-                    };
-                    format!("{}/{} held by {holder}", l.port, l.protocol)
-                })
+                .map(|l| format!("{}/{} held by {}", l.port, l.protocol, l.holder()))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -1199,29 +1196,31 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    /// Which app each managed container and each published host port belongs to,
-    /// to name the owners of listening sockets.
-    pub async fn port_owners(
-        &self,
-    ) -> anyhow::Result<(HashMap<String, String>, HashMap<(Protocol, u16), String>)> {
-        let filters = HashMap::from([(
-            "label".to_string(),
-            vec![format!("{LABEL_NODE}={}", self.0.token.node)],
-        )]);
+    /// Which app each managed container and each published host port belongs
+    /// to, and the names of the other running containers and of their published
+    /// ports, to name the owners of listening sockets.
+    pub async fn port_owners(&self) -> anyhow::Result<super::ports::Owners> {
         let containers = self
             .docker()
             .list_containers(Some(ListContainersOptions {
                 all: false,
-                filters: Some(filters),
                 ..Default::default()
             }))
             .await?;
-        let mut by_container = HashMap::new();
-        let mut by_port = HashMap::new();
+        let mut owners = super::ports::Owners::default();
         for c in containers {
-            let Some(app) = c.labels.as_ref().and_then(|l| l.get(LABEL_APP)).cloned() else {
-                continue;
-            };
+            let labels = c.labels.unwrap_or_default();
+            let app = labels
+                .get(LABEL_APP)
+                .filter(|_| labels.get(LABEL_NODE) == Some(&self.0.token.node))
+                .cloned();
+            let name = c
+                .names
+                .as_ref()
+                .and_then(|n| n.first())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .or_else(|| c.id.clone())
+                .unwrap_or_default();
             for port in c.ports.unwrap_or_default() {
                 let Some(public) = port.public_port else {
                     continue;
@@ -1230,13 +1229,19 @@ impl Runtime {
                     Some("udp") => Protocol::Udp,
                     _ => Protocol::Tcp,
                 };
-                by_port.insert((proto, public), app.clone());
+                match &app {
+                    Some(app) => owners.published.insert((proto, public), app.clone()),
+                    None => owners.other_published.insert((proto, public), name.clone()),
+                };
             }
             if let Some(id) = c.id {
-                by_container.insert(id, app);
+                match app {
+                    Some(app) => owners.containers.insert(id, app),
+                    None => owners.other_containers.insert(id, name),
+                };
             }
         }
-        Ok((by_container, by_port))
+        Ok(owners)
     }
 
     /// The Docker volume for one of the app's volumes, created if needed.
@@ -1489,12 +1494,13 @@ impl Runtime {
             .flat_map(|c| c.mounts.iter().flatten())
             .filter_map(|m| m.name.clone())
             .collect();
-        let volumes: Vec<(VolumeUsage, PathBuf)> = list
+        let volumes: Vec<(VolumeUsage, PathBuf, SizedVolume)> = list
             .volumes
             .unwrap_or_default()
             .into_iter()
             .filter_map(|v| {
                 let dir = PathBuf::from(&v.mountpoint);
+                let sized = SizedVolume::new(&self.0.dir, &v.name);
                 Some(VolumeUsage {
                     app: v
                         .labels
@@ -1503,19 +1509,22 @@ impl Runtime {
                         .clone(),
                     volume: v.labels.get(LABEL_VOLUME)?.clone(),
                     in_use: used.contains(&v.name),
-                    limit: SizedVolume::new(&self.0.dir, &v.name).limit(),
+                    limit: sized.limit(),
                     name: v.name,
                     // Measured below, off the async threads.
                     size: dir.is_dir().then_some(0),
                 })
-                .map(|u| (u, dir))
+                .map(|u| (u, dir, sized))
             })
             .collect::<Vec<_>>();
         let mut volumes: Vec<VolumeUsage> = tokio::task::spawn_blocking(move || {
             volumes
                 .into_iter()
-                .map(|(mut u, dir)| {
-                    if u.size.is_some() {
+                .map(|(mut u, dir, sized)| {
+                    if u.limit.is_some() {
+                        // Its own filesystem says what it holds, without a walk.
+                        u.size = sized.used();
+                    } else if u.size.is_some() {
                         u.size = Some(volumes::size(&dir));
                     }
                     u
@@ -1737,6 +1746,12 @@ impl Runtime {
                     disk.images += (image.size - image.shared_size.max(0)).max(0) as u64;
                     disk.rollback_images += 1;
                 }
+            }
+        }
+        for (app, image) in &running {
+            if let Some(disk) = apps.get_mut(app) {
+                (disk.layers, disk.smaller_layers, disk.smaller_layers_size) =
+                    super::layers::biggest(self.docker(), image).await;
             }
         }
         let mut dirs = tokio::fs::read_dir(self.0.dir.join("static")).await?;

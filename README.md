@@ -276,6 +276,7 @@ template in `lang::generated_dockerfile`.
 | `facade status` / `facade alerts` | nodes, apps, CPU/memory, firing alerts |
 | `facade alerts config --webhook URL --mention @here` / `facade alerts test` | Discord notifications |
 | `facade logs <app> -f` | container logs |
+| `facade exec <app> -- <cmd…>` / `exec -it <app> -- sh` | run a command (or a shell) in the app's container; its exit code is facade's |
 | `facade deployments <app> [--id ID]` | build history and logs |
 | `facade updates <app>` | commits on the app's branch since its deployed one |
 | `facade metrics <app>` / `facade node metrics <node>` | last hour of samples |
@@ -537,8 +538,10 @@ kept for rollbacks (the two previous builds of each app), and at 90 % the whole 
 cache. `facade node prune <node> [--aggressive]` (or the Nodes page) does it now.
 
 `facade node disk <node>` (or the Nodes page) breaks the disk down: images, build
-cache, volumes, what containers wrote, facade's own files, and the rest of the system;
-then each app's share. An app's Overview tab (and `facade app show`) shows its own.
+cache, volumes (sized ones measured by their own filesystem), what containers wrote,
+facade's own files, backups (on the server's node, with the apps taking the most), and
+the rest of the system; then each app's share. An app's Overview tab (and `facade app
+show`) shows its own, with the largest layers of the image it runs.
 What an app writes inside its container, outside volumes, is lost on redeploy: past
 100 MB it raises an alert. Volumes no app declares any more are flagged as orphaned.
 
@@ -690,7 +693,7 @@ secrets still to set. Applying is idempotent and never deletes anything.
 
 Servers and agents speak a versioned protocol; when it changes (it did with commit
 pinning and the build queue, then with stop settings, volume sizes and cgroup
-delegation, then with build variables), agents one version behind are updated by
+delegation, then with build variables, then with `facade exec`), agents one version behind are updated by
 the server; older ones need the server's `facaded` installed by hand.
 
 ## Not there yet
