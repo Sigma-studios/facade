@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::proto::{AppState, AppStats, BuildState, NodeStats, StorageReport};
+use crate::proto::{AppState, AppStats, BuildState, ImageLayer, NodeStats, StorageReport};
 use crate::spec::{AppSpec, Build};
 use crate::stack::StackSpec;
 
@@ -111,6 +111,14 @@ pub struct AppDiskView {
     /// runs on): not in `total`.
     #[serde(default)]
     pub backups: u64,
+    /// The largest layers of the image it runs, largest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<ImageLayer>,
+    /// The image's other layers holding files: how many, and what they take.
+    #[serde(default)]
+    pub smaller_layers: u32,
+    #[serde(default)]
+    pub smaller_layers_size: u64,
 }
 
 impl AppDiskView {

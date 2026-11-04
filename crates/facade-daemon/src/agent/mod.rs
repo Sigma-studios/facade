@@ -4,6 +4,7 @@
 pub(crate) mod build;
 mod cgroups;
 mod compress;
+mod layers;
 mod maintenance;
 mod ports;
 mod queue;

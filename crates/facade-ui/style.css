@@ -916,3 +916,13 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 .service-log { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; }
 .service-log summary { display: flex; align-items: center; gap: 10px; padding: 8px 12px; cursor: pointer; }
 .service-log .deploy-log { border-radius: 0 0 8px 8px; height: 320px; min-height: 0; }
+
+/* ---------------------------------------------------------------- image layers */
+
+.image-layers { margin-top: 24px; }
+.layers { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.layer { display: grid; grid-template-columns: minmax(80px, 180px) 72px 1fr; align-items: center; gap: 12px; min-width: 0; }
+.layer-bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.layer-fill { display: block; height: 100%; background: var(--series-1); border-radius: 4px; }
+.layer-size { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.layer-step { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 12.5px; }

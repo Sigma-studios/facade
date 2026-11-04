@@ -620,6 +620,9 @@ pub fn app_disk(storage: &StorageReport, spec: &AppSpec) -> AppDiskView {
         files: own.map_or(0, |a| a.files),
         volumes,
         backups: 0,
+        layers: own.map(|a| a.layers.clone()).unwrap_or_default(),
+        smaller_layers: own.map_or(0, |a| a.smaller_layers),
+        smaller_layers_size: own.map_or(0, |a| a.smaller_layers_size),
     }
 }
 

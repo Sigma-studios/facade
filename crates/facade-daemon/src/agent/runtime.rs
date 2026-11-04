@@ -1748,6 +1748,12 @@ impl Runtime {
                 }
             }
         }
+        for (app, image) in &running {
+            if let Some(disk) = apps.get_mut(app) {
+                (disk.layers, disk.smaller_layers, disk.smaller_layers_size) =
+                    super::layers::biggest(self.docker(), image).await;
+            }
+        }
         let mut dirs = tokio::fs::read_dir(self.0.dir.join("static")).await?;
         while let Some(entry) = dirs.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();

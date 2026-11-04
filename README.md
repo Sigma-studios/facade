@@ -535,8 +535,10 @@ kept for rollbacks (the two previous builds of each app), and at 90 % the whole 
 cache. `facade node prune <node> [--aggressive]` (or the Nodes page) does it now.
 
 `facade node disk <node>` (or the Nodes page) breaks the disk down: images, build
-cache, volumes, what containers wrote, facade's own files, and the rest of the system;
-then each app's share. An app's Overview tab (and `facade app show`) shows its own.
+cache, volumes (sized ones measured by their own filesystem), what containers wrote,
+facade's own files, backups (on the server's node, with the apps taking the most), and
+the rest of the system; then each app's share. An app's Overview tab (and `facade app
+show`) shows its own, with the largest layers of the image it runs.
 What an app writes inside its container, outside volumes, is lost on redeploy: past
 100 MB it raises an alert. Volumes no app declares any more are flagged as orphaned.
 

@@ -4143,6 +4143,24 @@ fn print_app_detail(view: &AppView) {
         if d.backups > 0 {
             println!("backups:   {} on the server's disk", bytes(d.backups));
         }
+        // What takes the space in the image it runs.
+        let width = d.layers.iter().map(|l| bytes(l.size).len()).max().unwrap_or(0);
+        for (i, layer) in d.layers.iter().enumerate() {
+            println!(
+                "{}{:>width$}  {}",
+                if i == 0 { "layers:    " } else { "           " },
+                bytes(layer.size),
+                layer.command
+            );
+        }
+        if d.smaller_layers > 0 && !d.layers.is_empty() {
+            println!(
+                "           {} smaller layer{}: {}",
+                d.smaller_layers,
+                if d.smaller_layers == 1 { "" } else { "s" },
+                bytes(d.smaller_layers_size)
+            );
+        }
         if d.written >= WRITTEN_WARNING {
             println!(
                 "           what the container writes is lost on redeploy: keep it in a volume (--volume name:/path)"

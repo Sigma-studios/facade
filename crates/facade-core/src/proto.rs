@@ -492,6 +492,23 @@ pub struct AppDisk {
     pub written: u64,
     /// Static site files.
     pub files: u64,
+    /// The largest layers of the image it runs, largest first. Older agents
+    /// send none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<ImageLayer>,
+    /// The image's other layers holding files: how many, and what they take.
+    #[serde(default)]
+    pub smaller_layers: u32,
+    #[serde(default)]
+    pub smaller_layers_size: u64,
+}
+
+/// One layer of an image, from its history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageLayer {
+    pub size: u64,
+    /// The Dockerfile step that made it, shortened (`RUN apt-get install …`).
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
