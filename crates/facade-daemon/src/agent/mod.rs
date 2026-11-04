@@ -4,6 +4,7 @@
 pub(crate) mod build;
 mod cgroups;
 mod compress;
+mod events;
 mod exec;
 mod layers;
 mod maintenance;
@@ -111,6 +112,8 @@ pub struct Agent {
     docker_size: Mutex<Option<(std::time::Instant, u64)>>,
     /// Everything facade keeps on this machine, measured for the storage report.
     files_dir: PathBuf,
+    /// What happens on the node, for the Activity.
+    activity: events::Activity,
 }
 
 struct Cancellable {
@@ -149,6 +152,7 @@ impl Agent {
             last_cleanup: Default::default(),
             docker_size: Default::default(),
             files_dir,
+            activity: Default::default(),
         }))
     }
 
@@ -161,6 +165,7 @@ impl Agent {
         self.start_routing();
         tokio::spawn(maintenance::run(self.clone()));
         tokio::spawn(cgroups::watch(self.runtime.clone()));
+        tokio::spawn(events::run(self.clone()));
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = std::time::Instant::now();
@@ -169,6 +174,7 @@ impl Agent {
                 Err(e) => warn!("server connection: {e:#}"),
             }
             *self.outbox.lock() = None;
+            self.activity.disconnected();
             if started.elapsed() > Duration::from_secs(60) {
                 backoff = Duration::from_secs(1);
             }
@@ -190,6 +196,9 @@ impl Agent {
                 hostname: sysinfo::System::host_name().unwrap_or_default(),
                 binary: crate::selfbin::current().map(|b| b.sha256.clone()),
                 arch: Some(std::env::consts::ARCH.into()),
+                started: Some(self.activity.started),
+                boot: events::boot_time(),
+                commit: crate::selfbin::commit().map(str::to_string),
             },
         )
         .await?;
@@ -222,6 +231,7 @@ impl Agent {
             }
         });
         self.storage.lock().1 = true;
+        self.activity.connected();
         let _guard = AbortOnDrop(vec![writer, reporter, healer, builds]);
 
         let mut lines = JsonLines::new(read);
@@ -312,13 +322,19 @@ impl Agent {
         req: AgentRequest,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         match req {
-            AgentRequest::Sync { workloads } => {
+            AgentRequest::Sync {
+                workloads,
+                activity,
+            } => {
                 let map: HashMap<_, _> = workloads
                     .into_iter()
                     .map(|w| (w.spec.name.clone(), w))
                     .collect();
                 *self.workloads.lock() = map;
                 self.synced.store(true, Ordering::Relaxed);
+                if activity {
+                    self.accept_activity();
+                }
                 let agent = self.clone();
                 tokio::spawn(async move { agent.refresh_routes().await });
                 tokio::spawn(self.clone().reconcile_all());
@@ -675,6 +691,7 @@ impl Agent {
                 storage,
                 listeners,
                 ingress_errors: self.link.errors(),
+                upkeep: self.activity.take_upkeep(),
             };
             if tx
                 .send(AgentMsg::Event {

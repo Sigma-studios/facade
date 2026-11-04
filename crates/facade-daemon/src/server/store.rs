@@ -18,6 +18,9 @@ use uuid::Uuid;
 
 pub struct Store(Mutex<Connection>);
 
+mod events;
+pub use events::{EventQuery, EventRecord};
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
@@ -356,6 +359,7 @@ impl Store {
         )?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(AUTO_DEPLOY_SCHEMA)?;
+        events::migrate(&conn)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "node_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;
         add_column(&conn, "node_usage", "net_tx", "INTEGER NOT NULL DEFAULT 0")?;

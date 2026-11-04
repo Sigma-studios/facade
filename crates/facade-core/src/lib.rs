@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod env;
+pub mod events;
 pub mod exec;
 pub mod git;
 pub mod manifest;

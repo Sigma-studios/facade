@@ -681,6 +681,19 @@ pub async fn deploy(
             .map_err(|e| ApiError::bad_request(format!("invalid body: {e}")))?
     };
     let view = start_deploy(&server, &name, req).await?;
+    let what = view
+        .commit
+        .as_deref()
+        .map(|c| format!(": {}", c.get(..7).unwrap_or(c)))
+        .unwrap_or_default();
+    super::events::Entry::app(
+        &name,
+        facade_core::events::EventKind::DeployStarted,
+        facade_core::events::Severity::Info,
+        format!("Stack deploy by {}{what}", user.username),
+    )
+    .by(&user.username)
+    .record(&server);
     Ok((StatusCode::ACCEPTED, Json(view)))
 }
 

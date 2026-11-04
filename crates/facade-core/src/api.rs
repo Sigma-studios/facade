@@ -54,6 +54,12 @@ pub struct NodeView {
     /// them); it keeps retrying.
     #[serde(default)]
     pub ingress_errors: Vec<String>,
+    /// Pending system updates and reboot, as the node last said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upkeep: Option<crate::events::Upkeep>,
+    /// Disk errors the kernel reported in the last day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_errors: Option<crate::events::DiskTrouble>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

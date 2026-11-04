@@ -25,10 +25,12 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::events;
 use super::store::UsageOf;
 use super::users::{can_see_app, check_caps, check_member_spec, load_app_for, visible_apps};
 use super::{Server, hash_secret, random_token};
 use crate::tls;
+use facade_core::events::EventKind;
 
 const SESSION_DAYS: u64 = 30;
 
@@ -125,6 +127,8 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/deployments/{id}", get(get_deployment))
         .route("/api/deployments/{id}/cancel", post(cancel_deployment))
         .route("/api/builds", get(builds))
+        .route("/api/events", get(super::events::list))
+        .route("/api/events/{id}", get(super::events::get))
         .route("/api/databases", post(create_database))
         .route(
             "/api/stacks",
@@ -557,6 +561,8 @@ fn node_views(server: &Server) -> anyhow::Result<Vec<NodeView>> {
                     .filter(|_| conn.is_some())
                     .map(|l| l.ingress_errors.clone())
                     .unwrap_or_default(),
+                upkeep: server.activity.upkeep(&n.name),
+                disk_errors: server.activity.disk_trouble(&n.name),
                 name: n.name,
             }
         })
@@ -1133,6 +1139,13 @@ async fn create_app(
     server.store.put_app(&spec)?;
     server.store.set_app_owner(&spec.name, owner)?;
     server.refresh_routes()?;
+    events::audit(
+        &server,
+        &user,
+        &spec.name,
+        EventKind::Created,
+        format!("Created by {}", user.username),
+    );
     push_link_targets(&server, None, &spec).await;
     // Created, not deployed: env vars usually come first, then `facade deploy`.
     Ok((
@@ -1168,6 +1181,7 @@ async fn update_app(
     check_caps(&server, old.owner, &spec)?;
     check_spec(&server, &spec)?;
     save_spec(&server, &old.spec, &spec, q.move_data).await?;
+    events::spec_changed(&server, &user, &old.spec, &spec);
     Ok(Json(app_view(
         &server,
         spec,
@@ -1421,6 +1435,14 @@ async fn delete_app(
     server.store.delete_app(&name)?;
     server.live.write().apps.remove(&name);
     server.refresh_routes()?;
+    let volumes = if q.volumes { " with its volumes" } else { "" };
+    events::audit(
+        &server,
+        &user,
+        &name,
+        EventKind::Deleted,
+        format!("Deleted by {}{volumes}", user.username),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1443,6 +1465,7 @@ async fn deploy_app(
         )));
     }
     let view = start_deploy(&server, &name, &req).await?;
+    events::deploy_requested(&server, &user, &req, row.commit.as_deref(), &view);
     Ok((StatusCode::ACCEPTED, Json(view)))
 }
 
@@ -1556,6 +1579,13 @@ async fn cancel_deployment(
         _ => {}
     }
     if server.store.get_deployment(id)?.map(|d| d.status) == Some(DeploymentStatus::Cancelled) {
+        events::audit(
+            &server,
+            &user,
+            &d.app,
+            EventKind::DeployCancelled,
+            format!("Deploy cancelled by {}", user.username),
+        );
         restore_after_cancel(&server, &d).await?;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -1670,9 +1700,16 @@ async fn restart_app(
     let row = load_app_for(&server, &user, &name)?;
     server
         .hub
-        .request(&row.spec.node, AgentRequest::Restart { app: name })
+        .request(&row.spec.node, AgentRequest::Restart { app: name.clone() })
         .await
         .map_err(|e| unavailable(format!("{e:#}")))?;
+    events::audit(
+        &server,
+        &user,
+        &name,
+        EventKind::Restart,
+        format!("Restarted by {}", user.username),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1690,6 +1727,20 @@ async fn set_enabled(
         check_ports_free(server, &spec).await?;
     }
     save_spec(server, &row.spec, &spec, false).await?;
+    if enabled != row.spec.enabled {
+        let (kind, verb) = if enabled {
+            (EventKind::Start, "Started")
+        } else {
+            (EventKind::Stop, "Stopped")
+        };
+        events::audit(
+            server,
+            user,
+            name,
+            kind,
+            format!("{verb} by {}", user.username),
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1778,6 +1829,8 @@ async fn patch_env(
     for key in &patch.unset {
         server.store.delete_env(&name, key)?;
     }
+    let set: Vec<String> = patch.set.keys().cloned().collect();
+    events::env_changed(&server, &user, &name, &set, &patch.unset);
     let mut rebuilding = Vec::new();
     for (app, before) in apps.iter().zip(before) {
         if build_vars(&server, app) != before
@@ -2413,6 +2466,22 @@ async fn apply(State(server): S, user: User, body: String) -> ApiResult<Json<App
     for stack in manifest.stacks {
         super::stack::apply(&server, stack, &mut report).await?;
     }
+    if !report.created.is_empty() || !report.updated.is_empty() {
+        let mut names = report.created.clone();
+        names.extend(report.updated.iter().cloned());
+        events::Entry::global(
+            EventKind::Settings,
+            facade_core::events::Severity::Info,
+            format!(
+                "Configuration applied by {}: {}",
+                user.username,
+                names.join(", ")
+            ),
+        )
+        .by(&user.username)
+        .items(names)
+        .record(&server);
+    }
     Ok(Json(report))
 }
 
@@ -2518,6 +2587,13 @@ async fn create_database(
         save_spec(&server, old, new, false).await?;
     }
     server.refresh_routes()?;
+    events::audit(
+        &server,
+        &user,
+        &req.name,
+        EventKind::Created,
+        format!("Database created by {}", user.username),
+    );
     if server.hub.is_connected(&node) {
         start_deploy(&server, &req.name, &DeployRequest::default()).await?;
     }
@@ -2759,7 +2835,13 @@ async fn resync_nodes(server: &Server) {
             Ok(workloads) => {
                 server
                     .hub
-                    .request(&node.name, AgentRequest::Sync { workloads })
+                    .request(
+                        &node.name,
+                        AgentRequest::Sync {
+                            workloads,
+                            activity: true,
+                        },
+                    )
                     .await
             }
             Err(e) => Err(e),

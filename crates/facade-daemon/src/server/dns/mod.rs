@@ -280,6 +280,8 @@ pub async fn reconcile(server: &Server) {
                 info!(domain = %desired.domain, %ip, "DNS record set");
                 let _ = server.store.put_dns_record(&desired.domain, &zone, &ip);
                 server.clear_dns_error(&desired.domain);
+                let old = current.get(&desired.domain).map(|(_, old)| old.as_str());
+                super::events::dns_record(server, &desired.domain, Some(&ip), old);
             }
             Err(e) => {
                 warn!(domain = %desired.domain, "DNS: {e:#}");
@@ -295,7 +297,10 @@ pub async fn reconcile(server: &Server) {
             .map(|(_, l)| l)
             .unwrap_or_default();
         match provider.delete_address(&zone, &label, &ip).await {
-            Ok(()) => info!(%domain, "DNS record removed"),
+            Ok(()) => {
+                info!(%domain, "DNS record removed");
+                super::events::dns_record(server, &domain, None, None);
+            }
             Err(e) => warn!(%domain, "removing DNS record: {e:#}"),
         }
         let _ = server.store.delete_dns_record(&domain);

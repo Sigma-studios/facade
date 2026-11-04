@@ -8,6 +8,7 @@ pub mod backup_store;
 pub mod backups;
 mod compose;
 mod dns;
+mod events;
 mod git;
 mod github;
 mod hub;
@@ -78,6 +79,8 @@ pub struct Server {
     pub releases: release::Releases,
     /// Apps and stacks deploying by themselves when their source changes.
     pub auto_deploy: autodeploy::AutoDeploy,
+    /// What the Activity entries say about the nodes (upkeep, disk errors).
+    pub activity: events::Activity,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -595,6 +598,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         upgrade_attempts: Default::default(),
         releases: Default::default(),
         auto_deploy: Default::default(),
+        activity: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -603,6 +607,8 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     server.notifier.load(&server.store, &server.secrets)?;
     server.refresh_routes()?;
     api::ensure_admin(&server)?;
+    events::load(&server)?;
+    events::server_started(&server);
 
     // Every node starts offline until its agent connects.
     {
@@ -643,6 +649,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tasks.spawn(backups::run(server.clone()));
     tokio::spawn(release::check_regularly(server.clone()));
     tokio::spawn(autodeploy::run(server.clone()));
+    tokio::spawn(events::run(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
     let files_dir = server.cfg.data_dir.clone();

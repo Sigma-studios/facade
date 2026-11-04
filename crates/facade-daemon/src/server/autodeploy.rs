@@ -660,6 +660,7 @@ async fn check_app(
         .await
         .map_err(|ApiError(_, e)| anyhow!("deploying {what}: {e}"))?;
     info!(app = %name, via = via.as_str(), "auto-deploy: {what}");
+    super::events::auto_deploy(server, name, &what, via.as_str(), deployment.id);
     let _ = server.store.append_deploy_log(
         deployment.id,
         &format!(
@@ -725,6 +726,7 @@ async fn check_stack(
         .await
         .map_err(|ApiError(_, e)| anyhow!("deploying {what}: {e}"))?;
     info!(stack = %name, via = via.as_str(), "auto-deploy: {what}");
+    super::events::auto_deploy(server, name, &what, via.as_str(), deployment.id);
     let _ = server.store.stack_deploy_log(
         deployment.id,
         &format!(
@@ -1088,8 +1090,10 @@ pub async fn put_app(
     if req.enabled {
         supported(&row.spec).map_err(ApiError::conflict)?;
     }
-    let target = Target::App(name);
-    set(&server, &target, req.enabled)?;
+    let target = Target::App(name.clone());
+    if set(&server, &target, req.enabled)? {
+        switched(&server, &user, &name, req.enabled);
+    }
     Ok(Json(view(&server, &target)?))
 }
 
@@ -1125,14 +1129,31 @@ pub async fn put_stack(
     Json(req): Json<SetAutoDeploy>,
 ) -> ApiResult<Json<AutoDeployView>> {
     user.require_admin()?;
-    let target = Target::Stack(name);
+    let target = Target::Stack(name.clone());
     match watched(&server, &target)? {
         None => return Err(ApiError::not_found("no such stack")),
         Some(Watched::Nothing(why)) if req.enabled => return Err(ApiError::conflict(why)),
         _ => {}
     }
-    set(&server, &target, req.enabled)?;
+    if set(&server, &target, req.enabled)? {
+        switched(&server, &user, &name, req.enabled);
+    }
     Ok(Json(view(&server, &target)?))
+}
+
+/// Auto-deploy turned on or off, for the Activity of an app or a stack.
+fn switched(server: &Server, user: &User, target: &str, on: bool) {
+    super::events::audit(
+        server,
+        user,
+        target,
+        facade_core::events::EventKind::AutoDeploySwitch,
+        format!(
+            "Auto-deploy turned {} by {}",
+            if on { "on" } else { "off" },
+            user.username
+        ),
+    );
 }
 
 /// Every app and stack with auto-deploy on that the caller may see.

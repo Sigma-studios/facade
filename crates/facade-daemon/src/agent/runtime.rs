@@ -66,6 +66,8 @@ struct Inner {
     /// Apps whose routes go to this container (an id) instead of the one named
     /// after them, while an overlapping deploy renames its two containers.
     routed: parking_lot::Mutex<HashMap<String, String>>,
+    /// Containers being stopped by facade, whose exit is no crash.
+    expected: super::events::Expected,
 }
 
 pub(super) fn container(app: &str) -> String {
@@ -305,11 +307,17 @@ impl Runtime {
             dir,
             token,
             routed: Default::default(),
+            expected: Default::default(),
         })))
     }
 
     pub fn docker(&self) -> &Docker {
         &self.0.docker
+    }
+
+    /// Containers facade is stopping (see `events`).
+    pub fn expected(&self) -> &super::events::Expected {
+        &self.0.expected
     }
 
     /// A client waiting as long as a container may take to stop: Docker answers a
@@ -1115,6 +1123,7 @@ impl Runtime {
         self.drain(&loopback_ports(&old), Duration::from_secs(grace), log)
             .await;
         // Its stop signal, then its stop timeout, as for any stop.
+        let _expected = self.0.expected.hold(&old_id);
         match self
             .docker_for_stops()
             .stop_container(&old_id, None::<StopContainerOptions>)
@@ -1286,6 +1295,7 @@ impl Runtime {
 
     /// Removes a container at once, if it exists.
     async fn discard(&self, name: &str) {
+        let _expected = self.0.expected.hold(name);
         match self
             .docker()
             .remove_container(
@@ -1327,6 +1337,7 @@ impl Runtime {
         }
         if exists(retired.clone()).await {
             tracing::info!("stopping {retired}, left by an interrupted deploy");
+            let _expected = self.0.expected.hold(&retired);
             let _ = self
                 .docker_for_stops()
                 .stop_container(&retired, None::<StopContainerOptions>)
@@ -1818,6 +1829,7 @@ impl Runtime {
     }
 
     async fn stop(&self, app: &str) -> anyhow::Result<()> {
+        let _expected = self.0.expected.hold(&container(app));
         match self
             .docker_for_stops()
             .stop_container(
@@ -1856,6 +1868,7 @@ impl Runtime {
                 Err(e) => return Err(e.context(format!("restarting {app}"))),
             }
         }
+        let _expected = self.0.expected.hold(&name);
         self.docker_for_stops()
             .restart_container(&name, None::<RestartContainerOptions>)
             .await

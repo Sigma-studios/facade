@@ -355,6 +355,14 @@ pub async fn set_owner(
         None => None,
     };
     server.store.set_app_owner(&app, owner)?;
+    let whose = req.owner.as_deref().unwrap_or("the admins");
+    super::events::audit(
+        &server,
+        &user,
+        &app,
+        facade_core::events::EventKind::Access,
+        format!("Owner set to {whose} by {}", user.username),
+    );
     // Its builds now use other logins.
     if let Err(e) = server.push(&app).await {
         tracing::warn!(%app, "push failed: {e:#}");
@@ -371,6 +379,13 @@ pub async fn grant_access(
     super::api::load_app(&server, &app)?;
     let target = find_user(&server, &name)?;
     server.store.grant_access(&app, target.id)?;
+    super::events::audit(
+        &server,
+        &user,
+        &app,
+        facade_core::events::EventKind::Access,
+        format!("Access granted to {name} by {}", user.username),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -384,5 +399,12 @@ pub async fn revoke_access(
     if !server.store.revoke_access(&app, target.id)? {
         return Err(not_found(format!("{name} has no access to {app}")));
     }
+    super::events::audit(
+        &server,
+        &user,
+        &app,
+        facade_core::events::EventKind::Access,
+        format!("Access revoked from {name} by {}", user.username),
+    );
     Ok(StatusCode::NO_CONTENT)
 }

@@ -47,6 +47,15 @@ pub enum Hello {
         /// CPU architecture the agent runs on.
         #[serde(default)]
         arch: Option<String>,
+        /// When the agent's process started, and the machine booted (seconds
+        /// since the epoch): the server tells restarts and reboots from them.
+        #[serde(default)]
+        started: Option<u64>,
+        #[serde(default)]
+        boot: Option<u64>,
+        /// The commit its binary was built from, when known.
+        #[serde(default)]
+        commit: Option<String>,
     },
     Data {
         node: String,
@@ -185,6 +194,11 @@ pub enum AgentRequest {
     /// listed is removed. Sent on every (re)connection.
     Sync {
         workloads: Vec<Workload>,
+        /// The server takes [`AgentEvent::Activity`]. An older one would drop
+        /// the connection on an event it does not know, so agents keep theirs
+        /// until a server says so.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        activity: bool,
     },
     /// Desired state of one app. Builds when the commit (or source) changed.
     Apply {
@@ -347,6 +361,12 @@ pub enum AgentEvent {
     Builds {
         builds: Vec<BuildEntry>,
     },
+    /// Something happened on the node (an app crashed, the kernel killed a
+    /// process, someone logged in): an Activity entry. Only sent to servers
+    /// asking for them (see [`AgentRequest::Sync`]).
+    Activity {
+        event: Box<crate::events::NodeEvent>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -409,6 +429,10 @@ pub struct NodeReport {
     /// Addresses the HTTP(S) entry point wants but cannot bind (still retrying).
     #[serde(default)]
     pub ingress_errors: Vec<String>,
+    /// Pending system updates and reboot, read every few hours: in the first
+    /// report of a connection, then when it changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upkeep: Option<crate::events::Upkeep>,
 }
 
 /// A TCP socket in LISTEN state or a bound UDP socket.

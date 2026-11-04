@@ -133,6 +133,7 @@ async fn issue_due(
                 info!(name = %job.name, "certificate issued");
                 backoff.remove(&job.name);
                 server.domain_errors.write().remove(&key);
+                super::events::cert_issued(server, &job.name, renew_at.contains_key(&job.name));
             }
             Err(e) => {
                 let failures = backoff.get(&job.name).map_or(0, |(n, _)| *n) + 1;
@@ -140,7 +141,9 @@ async fn issue_due(
                 let wait = (600u64 << failures.min(8)).min(86_400);
                 warn!(name = %job.name, "certificate request failed (retry in {}m): {e:#}", wait / 60);
                 backoff.insert(job.name.clone(), (failures, now + wait));
-                server.domain_errors.write().insert(key, format!("{e:#}"));
+                let error = format!("{e:#}");
+                let before = server.domain_errors.write().insert(key, error.clone());
+                super::events::cert_failed(server, &job.name, &error, before.as_deref());
             }
         }
     }

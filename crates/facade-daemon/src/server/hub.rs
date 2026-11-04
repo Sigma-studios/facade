@@ -324,6 +324,9 @@ async fn accept(
             hostname,
             binary,
             arch,
+            started,
+            boot,
+            commit,
             ..
         } => {
             if protocol > PROTOCOL_VERSION {
@@ -345,6 +348,9 @@ async fn accept(
                 binary,
                 arch,
                 protocol,
+                started,
+                boot,
+                commit,
             };
             control(server, stream, peer, node, hostname, build).await
         }
@@ -357,6 +363,10 @@ struct AgentBuild {
     binary: Option<String>,
     arch: Option<String>,
     protocol: u32,
+    /// When its process started and its machine booted, and its commit.
+    started: Option<u64>,
+    boot: Option<u64>,
+    commit: Option<String>,
 }
 
 async fn control(
@@ -372,6 +382,9 @@ async fn control(
         binary,
         arch,
         protocol,
+        started,
+        boot,
+        commit,
     } = build;
     let (read, mut write) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(256);
@@ -413,6 +426,17 @@ async fn control(
         entry.protocol = protocol;
     }
     info!(%node, %peer, %hostname, "node connected");
+    super::events::agent_connected(
+        &server,
+        &node,
+        super::events::AgentHello {
+            started,
+            boot,
+            binary: binary.as_deref(),
+            commit: commit.as_deref(),
+            version: &agent_version,
+        },
+    );
 
     // Full desired state first, so a reconnecting agent converges.
     {
@@ -423,7 +447,13 @@ async fn control(
                 Ok(workloads) => {
                     server
                         .hub
-                        .request(&node, AgentRequest::Sync { workloads })
+                        .request(
+                            &node,
+                            AgentRequest::Sync {
+                                workloads,
+                                activity: true,
+                            },
+                        )
                         .await
                 }
                 Err(e) => Err(e),
@@ -443,10 +473,19 @@ async fn control(
     let mut lines = JsonLines::new(read);
     let result: anyhow::Result<()> = async {
         loop {
-            let msg = tokio::time::timeout(READ_TIMEOUT, lines.next::<AgentMsg>())
+            let msg = tokio::time::timeout(READ_TIMEOUT, lines.next::<serde_json::Value>())
                 .await
                 .context("agent went silent")??;
             let Some(msg) = msg else { return Ok(()) };
+            // A message this server does not know (from an agent newer than
+            // it, during a rollback) is skipped rather than ending the link.
+            let msg = match serde_json::from_value::<AgentMsg>(msg) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    debug!(%node, "ignoring a message from the agent: {e}");
+                    continue;
+                }
+            };
             match msg {
                 AgentMsg::Response { id, error, data } => {
                     if let Some(waiter) = conn.pending.lock().remove(&id) {
@@ -600,6 +639,7 @@ async fn send_artifact(
 fn on_event(server: &Server, node: &str, event: AgentEvent) {
     let result = match event {
         AgentEvent::Report(report) => {
+            super::events::on_report(server, node, &report);
             server.record_report(node, *report);
             Ok(())
         }
@@ -626,15 +666,17 @@ fn on_event(server: &Server, node: &str, event: AgentEvent) {
             deployment,
             error,
             cancelled,
-        } => server
-            .store
-            .finish_deployment(deployment, error.as_deref(), cancelled),
+        } => super::events::finish_deployment(server, deployment, error.as_deref(), cancelled),
         AgentEvent::BuildDone { deployment, error } => match error {
-            Some(error) => server
-                .store
-                .finish_deployment(deployment, Some(&error), false),
+            Some(error) => {
+                super::events::finish_deployment(server, deployment, Some(&error), false)
+            }
             None => server.store.deployment_built(deployment),
         },
+        AgentEvent::Activity { event } => {
+            super::events::from_agent(server, node, *event);
+            Ok(())
+        }
         AgentEvent::Builds { builds } => {
             server
                 .live

@@ -81,10 +81,17 @@ pub async fn run(server: Arc<Server>) -> anyhow::Result<()> {
         for alert in &cleared {
             info!(key = %alert.key, "resolved: {}", alert.message);
         }
+        // Recorded in the Activity too; messages link to their entries.
+        let entries = super::events::alerts_changed(&server, &fired, &cleared);
+        let link = |key: &str| super::events::link(&server, entries.get(key));
         let notes: Vec<Note> = fired
             .iter()
-            .map(|a| Note::problem(&a.message))
-            .chain(cleared.iter().map(|a| Note::resolved(&a.message)))
+            .map(|a| Note::problem(&a.message).linked(link(&a.key)))
+            .chain(
+                cleared
+                    .iter()
+                    .map(|a| Note::resolved(&a.message).linked(link(&a.key))),
+            )
             .collect();
         if let Err(e) = server.notifier.send(&server.store, &notes).await {
             warn!("sending alerts to Discord: {e:#}");
@@ -176,6 +183,7 @@ fn too_many_errors(history: &VecDeque<AppMetric>, now: u64) -> Option<(u64, u64)
 fn conditions(server: &Server) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let now = facade_core::now();
+    super::events::conditions(server, &mut out);
     let live = server.live.read();
 
     for (name, node) in &live.nodes {
@@ -324,6 +332,8 @@ pub struct Note {
     color: u32,
     /// Tag the configured people.
     ping: bool,
+    /// Its Activity entry on the web UI.
+    url: Option<String>,
 }
 
 impl Note {
@@ -333,6 +343,7 @@ impl Note {
             description: message.into(),
             color: 0xd93f3f,
             ping: true,
+            url: None,
         }
     }
 
@@ -342,7 +353,14 @@ impl Note {
             description: message.into(),
             color: 0x3fa45b,
             ping: false,
+            url: None,
         }
+    }
+
+    /// The title links to `url`.
+    pub fn linked(mut self, url: Option<String>) -> Self {
+        self.url = url;
+        self
     }
 
     pub fn test() -> Self {
@@ -351,6 +369,7 @@ impl Note {
             description: "Alerts from this facade server will arrive here.".into(),
             color: 0x5865f2,
             ping: true,
+            url: None,
         }
     }
 }
@@ -546,12 +565,16 @@ impl Notifier {
             let embeds: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    json!({
+                    let mut embed = json!({
                         "title": n.title,
                         "description": n.description,
                         "color": n.color,
                         "footer": { "text": format!("facade · {}", self.origin) },
-                    })
+                    });
+                    if let Some(url) = &n.url {
+                        embed["url"] = json!(url);
+                    }
+                    embed
                 })
                 .collect();
             let body = json!({
