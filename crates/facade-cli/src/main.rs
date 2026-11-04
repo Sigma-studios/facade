@@ -158,7 +158,7 @@ enum Command {
         #[arg(long)]
         branch: Option<String>,
     },
-    /// CPU / memory history of an app (last hour).
+    /// CPU, memory, network and traffic history of an app (last hour).
     Metrics {
         app: String,
     },
@@ -2301,19 +2301,7 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
             if json {
                 return print_json(&metrics);
             }
-            table(
-                &["AT", "STATE", "CPU", "MEMORY", "NET IN", "NET OUT"],
-                metrics.iter().rev().take(40).map(|m| {
-                    vec![
-                        output::ago(m.at),
-                        m.stats.state.to_string(),
-                        format!("{:.1}%", m.stats.cpu_percent),
-                        bytes(m.stats.mem_used),
-                        bytes(m.stats.net_rx),
-                        bytes(m.stats.net_tx),
-                    ]
-                }),
-            );
+            print_app_metrics(&metrics);
         }
         Command::Export { output } => {
             let toml = api
@@ -3339,10 +3327,16 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
             if json {
                 return print_json(&metrics);
             }
-            table(
-                &["AT", "CPU", "LOAD", "MEMORY", "DISK"],
-                metrics.iter().rev().take(40).map(|m| {
-                    vec![
+            let counted = metrics.iter().any(|m| m.traffic.is_some());
+            let mut headers = vec!["AT", "CPU", "LOAD", "MEMORY", "DISK"];
+            if counted {
+                headers.extend(["REQ/S", "5XX"]);
+            }
+            let rows: Vec<Vec<String>> = metrics
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let mut row = vec![
                         output::ago(m.at),
                         format!("{:.1}%", m.stats.cpu_percent),
                         format!("{:.2}", m.stats.load1),
@@ -3352,9 +3346,27 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
                             bytes(m.stats.disk_used),
                             bytes(m.stats.disk_total)
                         ),
-                    ]
-                }),
-            );
+                    ];
+                    if counted {
+                        let span = i.checked_sub(1).and_then(|i| {
+                            let b = &metrics[i];
+                            TrafficSpan::between(
+                                (b.at, b.traffic.as_ref()?),
+                                (m.at, m.traffic.as_ref()?),
+                            )
+                        });
+                        match span {
+                            Some(s) => row.extend([
+                                format!("{:.1}", s.per_sec(s.requests)),
+                                share(s.server_errors, s.requests),
+                            ]),
+                            None => row.extend(["-".into(), "-".into()]),
+                        }
+                    }
+                    row
+                })
+                .collect();
+            table(&headers, rows.into_iter().rev().take(40));
         }
     }
     Ok(())
@@ -3539,6 +3551,13 @@ async fn app(api: &Api, cmd: AppCommand, json: bool) -> anyhow::Result<()> {
                 return print_json(&view);
             }
             print_app_detail(&view);
+            if let Ok(metrics) = api
+                .get::<Vec<AppMetric>>(&format!("/api/apps/{name}/metrics"))
+                .await
+                && let Some(traffic) = traffic_summary(&metrics)
+            {
+                println!("traffic:   {traffic}");
+            }
             // A server from before auto-deploy has no such route: nothing to say.
             if let Ok(auto) = api
                 .get::<AutoDeployView>(&format!("/api/apps/{name}/auto-deploy"))
@@ -4329,6 +4348,123 @@ fn print_apps(apps: &[AppView]) {
             ]
         }),
     );
+}
+
+/// The samples of the last hour, newest first: what each report said, with
+/// what changed since the one before as rates.
+fn print_app_metrics(metrics: &[AppMetric]) {
+    if let Some(traffic) = traffic_summary(metrics) {
+        println!("last {} minutes: {traffic}\n", TRAFFIC_SUMMARY / 60);
+    }
+    let counted = metrics.iter().any(|m| m.stats.traffic.is_some());
+    let mut headers = vec!["AT", "STATE", "CPU", "MEMORY", "NET IN", "NET OUT"];
+    if counted {
+        headers.extend(["REQ/S", "4XX", "5XX", "P50", "P95", "CONNS"]);
+    }
+    let rows: Vec<Vec<String>> = metrics
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let before = i.checked_sub(1).map(|i| &metrics[i]);
+            let rate = |pick: fn(&AppMetric) -> u64| {
+                before
+                    .and_then(|b| byte_rate((b.at, pick(b)), (m.at, pick(m))))
+                    .map(|r| format!("{}/s", bytes(r as u64)))
+                    .unwrap_or_else(|| "-".into())
+            };
+            let mut row = vec![
+                output::ago(m.at),
+                m.stats.state.to_string(),
+                format!("{:.1}%", m.stats.cpu_percent),
+                bytes(m.stats.mem_used),
+                rate(|m| m.stats.net_rx),
+                rate(|m| m.stats.net_tx),
+            ];
+            if counted {
+                let span = before.and_then(|b| {
+                    TrafficSpan::between(
+                        (b.at, b.stats.traffic.as_ref()?),
+                        (m.at, m.stats.traffic.as_ref()?),
+                    )
+                });
+                let dash = || "-".to_string();
+                match span {
+                    Some(s) => row.extend([
+                        format!("{:.1}", s.per_sec(s.requests)),
+                        share(s.client_errors, s.requests),
+                        share(s.server_errors, s.requests),
+                        s.percentile_ms(0.5).map(millis).unwrap_or_else(dash),
+                        s.percentile_ms(0.95).map(millis).unwrap_or_else(dash),
+                    ]),
+                    None => row.extend((0..5).map(|_| dash())),
+                }
+                row.push(
+                    m.stats
+                        .traffic
+                        .as_ref()
+                        .map(|t| t.open.to_string())
+                        .unwrap_or_else(dash),
+                );
+            }
+            row
+        })
+        .collect();
+    table(&headers, rows.into_iter().rev().take(40));
+}
+
+/// Seconds of traffic summed up by `traffic_summary`.
+const TRAFFIC_SUMMARY: u64 = 300;
+
+/// The app's traffic over the last minutes, on one line; `None` when it has
+/// none to speak of (no domain, or an entry point that does not count).
+fn traffic_summary(metrics: &[AppMetric]) -> Option<String> {
+    let readings = metrics
+        .iter()
+        .filter_map(|m| Some((m.at, m.stats.traffic.as_ref()?)));
+    let open = readings.clone().next_back()?.1.open;
+    let Some(s) = TrafficSpan::recent(readings, TRAFFIC_SUMMARY) else {
+        return Some(format!("{open} open connections"));
+    };
+    let mut parts = vec![format!("{:.2} req/s", s.per_sec(s.requests))];
+    if s.requests > 0 {
+        parts.push(format!(
+            "{} 4xx, {} 5xx",
+            share(s.client_errors, s.requests),
+            share(s.server_errors, s.requests)
+        ));
+    }
+    if let (Some(p50), Some(p95)) = (s.percentile_ms(0.5), s.percentile_ms(0.95)) {
+        parts.push(format!("p50 {} p95 {}", millis(p50), millis(p95)));
+    }
+    parts.push(format!(
+        "{open} open connection{}",
+        if open == 1 { "" } else { "s" }
+    ));
+    Some(parts.join(" · "))
+}
+
+/// `part` of `whole`, in percent.
+fn share(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        return "-".into();
+    }
+    let percent = part as f64 * 100.0 / whole as f64;
+    if percent > 0.0 && percent < 1.0 {
+        format!("{percent:.1}%")
+    } else {
+        format!("{percent:.0}%")
+    }
+}
+
+/// A response time, as people read them.
+fn millis(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{:.1} s", ms / 1000.0)
+    } else if ms >= 10.0 {
+        format!("{ms:.0} ms")
+    } else {
+        format!("{ms:.1} ms")
+    }
 }
 
 fn print_app_detail(view: &AppView) {
