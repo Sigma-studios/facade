@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use facade_core::proto::CertBundle;
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode, Uri, Version};
@@ -172,6 +173,9 @@ pub struct Ingress {
     /// Connections being served (WebSockets included), so a retiring process
     /// knows when it is done.
     active: Arc<AtomicUsize>,
+    /// Requests in flight and connections open to each local port, so the agent
+    /// knows when a container traffic moved away from is done with.
+    upstreams: Mutex<HashMap<u16, Arc<AtomicUsize>>>,
     /// Told whenever `bind_errors` changes.
     pub status: watch::Sender<()>,
     /// The listener of each TLS port, by the sender that stops it.
@@ -206,6 +210,7 @@ impl Ingress {
             file,
             bind_errors: Default::default(),
             active: Default::default(),
+            upstreams: Default::default(),
             status: watch::channel(()).0,
             tcp: Default::default(),
             retired: AtomicBool::new(false),
@@ -232,8 +237,39 @@ impl Ingress {
             }
             Err(e) => warn!("saving the routing table: {e}"),
         }
+        // Counters of ports nothing goes to any more, once idle.
+        let routed: std::collections::HashSet<u16> = table
+            .routes
+            .values()
+            .filter_map(|r| match r {
+                Route::Port { port, .. } => Some(*port),
+                _ => None,
+            })
+            .chain(table.tcp.values().filter_map(|t| t.port))
+            .collect();
+        self.upstreams
+            .lock()
+            .retain(|port, open| routed.contains(port) || open.load(Ordering::Relaxed) > 0);
         *self.table.write() = table;
         self.sync_tcp();
+    }
+
+    /// Counts a request or connection to a local port while alive. Taken as soon
+    /// as the route is looked up, so a request routed by the previous table is
+    /// counted by the time the agent asks about its port.
+    fn upstream(&self, port: u16) -> Counted {
+        let counter = self.upstreams.lock().entry(port).or_default().clone();
+        Counted::new(&counter)
+    }
+
+    /// Requests in flight and connections open to these local ports.
+    pub fn open_connections(&self, ports: &[u16]) -> usize {
+        let upstreams = self.upstreams.lock();
+        ports
+            .iter()
+            .filter_map(|p| upstreams.get(p))
+            .map(|open| open.load(Ordering::Relaxed))
+            .sum()
     }
 
     pub fn bind_errors(&self) -> Vec<String> {
@@ -387,6 +423,10 @@ impl Ingress {
             };
         }
         let route = self.table.read().routes.get(&host).cloned();
+        let upstream = match &route {
+            Some(Route::Port { port, .. }) => Some(self.upstream(*port)),
+            _ => None,
+        };
         if let Some(Route::Redirect { to }) = &route {
             let scheme = if tls || self.certs.find(to).is_some() {
                 "https"
@@ -411,7 +451,7 @@ impl Ingress {
                 serve_static(req, root).await.map_err(|e| (app, e))
             }
             Some(Route::Port { app, port }) => self
-                .proxy(req, port, &host, peer, tls)
+                .proxy(req, port, upstream, &host, peer, tls)
                 .await
                 .map_err(|e| (app, e)),
         };
@@ -428,11 +468,20 @@ impl Ingress {
         &self,
         mut req: Request<Incoming>,
         port: u16,
+        // Counts the request until its response is sent, or the connection it
+        // turns into (an upgrade) until it ends.
+        upstream: Option<Counted>,
         host: &str,
         peer: SocketAddr,
         tls: bool,
     ) -> anyhow::Result<Response<Body>> {
         let upgrade = is_upgrade(req.headers());
+        let websocket = upgrade
+            && req
+                .headers()
+                .get(header::UPGRADE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
         let downstream_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
 
         let path = req
@@ -467,12 +516,15 @@ impl Ingress {
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS
             && let Some(downstream) = downstream_upgrade
         {
-            let upstream = hyper::upgrade::on(&mut resp);
+            let app_side = hyper::upgrade::on(&mut resp);
             // The HTTP connection ends here; the spliced one counts on its own.
-            let counted = Counted::new(&self.active);
+            let counted = (Counted::new(&self.active), upstream);
             tokio::spawn(async move {
                 let _counted = counted;
-                match tokio::try_join!(downstream, upstream) {
+                match tokio::try_join!(downstream, app_side) {
+                    Ok((down, up)) if websocket => {
+                        splice_websocket(TokioIo::new(down), TokioIo::new(up)).await
+                    }
                     Ok((down, up)) => {
                         let mut down = TokioIo::new(down);
                         let mut up = TokioIo::new(up);
@@ -481,14 +533,56 @@ impl Ingress {
                     Err(e) => debug!("upgrade failed: {e}"),
                 }
             });
-        } else {
-            strip_hop_by_hop(resp.headers_mut());
+            return Ok(resp.map(Body::new));
         }
-        Ok(resp.map(Body::new))
+        strip_hop_by_hop(resp.headers_mut());
+        // The body streams after this returns: counted until it is sent (or the
+        // client goes).
+        Ok(resp.map(|body| {
+            Body::new(body.map_frame(move |frame| {
+                let _ = &upstream;
+                frame
+            }))
+        }))
     }
 }
 
 const BIND_RETRY: Duration = Duration::from_secs(5);
+
+/// How long a WebSocket's other side has to finish once one side closed.
+const WEBSOCKET_LINGER: Duration = Duration::from_secs(2);
+
+/// Passes bytes both ways until either side closes, then gives the other a
+/// moment to send what it still has (a close frame) and closes it too. A
+/// WebSocket has no use for a half-closed connection, and apps that never close
+/// theirs once the client left would otherwise keep it open here, and the
+/// container they run in from counting as drained after a deploy.
+async fn splice_websocket<A, B>(a: A, b: B)
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let (mut a_read, mut a_write) = tokio::io::split(a);
+    let (mut b_read, mut b_write) = tokio::io::split(b);
+    let a_to_b = async {
+        let _ = tokio::io::copy(&mut a_read, &mut b_write).await;
+        let _ = b_write.shutdown().await;
+    };
+    let b_to_a = async {
+        let _ = tokio::io::copy(&mut b_read, &mut a_write).await;
+        let _ = a_write.shutdown().await;
+    };
+    tokio::pin!(a_to_b, b_to_a);
+    tokio::select! {
+        _ = &mut a_to_b => {
+            let _ = tokio::time::timeout(WEBSOCKET_LINGER, &mut b_to_a).await;
+        }
+        _ = &mut b_to_a => {
+            let _ = tokio::time::timeout(WEBSOCKET_LINGER, &mut a_to_b).await;
+        }
+    }
+}
 
 /// Resolves once `stop` turns true (or its sender is gone).
 pub async fn stopped(stop: &mut watch::Receiver<bool>) {
@@ -784,6 +878,25 @@ mod tests {
             1,
             "the spliced connection counts"
         );
+        assert_eq!(
+            ingress.open_connections(&[app_port]),
+            1,
+            "as a connection to the app's port"
+        );
+
+        // The app was replaced: its route goes elsewhere, the WebSocket stays
+        // with the old container until it ends, and the agent sees it.
+        let mut moved = Table::default();
+        moved.routes.insert(
+            "ws.example.com".into(),
+            Route::Port {
+                app: "ws".into(),
+                port: 1,
+            },
+        );
+        ingress.set_table(moved);
+        echo(&mut client, b"after the switch").await;
+        assert_eq!(ingress.open_connections(&[app_port]), 1);
 
         // A newer entry point took over: the WebSocket carries on.
         ingress.retire();
@@ -794,6 +907,127 @@ mod tests {
         drop(client);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(ingress.active_connections(), 0, "counted until it ends");
+        assert_eq!(ingress.open_connections(&[app_port]), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_websocket_ends_with_its_client_even_if_the_app_keeps_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The app answers the upgrade, then never reads nor closes again.
+        let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = app.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await.unwrap();
+            sock.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\n\
+                  Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(sock);
+        });
+        let dir = std::env::temp_dir().join(format!("facade-ws-linger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ingress = Ingress::new(&dir).unwrap();
+        let mut table = Table::default();
+        table.routes.insert(
+            "ws.example.com".into(),
+            Route::Port {
+                app: "ws".into(),
+                port: app_port,
+            },
+        );
+        ingress.set_table(table);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop_tx, stop) = watch::channel(false);
+        tokio::spawn(ingress.clone().serve(listener, false, stop));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: ws.example.com\r\n\
+                  Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 101"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ingress.open_connections(&[app_port]), 1);
+        drop(client);
+        tokio::time::sleep(WEBSOCKET_LINGER + Duration::from_millis(300)).await;
+        assert_eq!(ingress.open_connections(&[app_port]), 0);
+        assert_eq!(ingress.active_connections(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn requests_count_until_their_response_is_sent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The app: sends its headers at once, then the body a moment later.
+        let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut sock, _) = app.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = released.await;
+            sock.write_all(b"done").await.unwrap();
+            let _ = sock.read(&mut buf).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!("facade-count-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ingress = Ingress::new(&dir).unwrap();
+        let mut table = Table::default();
+        table.routes.insert(
+            "app.example.com".into(),
+            Route::Port {
+                app: "app".into(),
+                port: app_port,
+            },
+        );
+        ingress.set_table(table);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop_tx, stop) = watch::channel(false);
+        tokio::spawn(ingress.clone().serve(listener, false, stop));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            ingress.open_connections(&[app_port]),
+            1,
+            "its body is still coming"
+        );
+        release.send(()).unwrap();
+        let mut got = String::from_utf8_lossy(&buf[..n]).to_string();
+        while !got.ends_with("done") {
+            let n = client.read(&mut buf).await.unwrap();
+            got.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            ingress.open_connections(&[app_port]),
+            0,
+            "sent: the client connection kept alive does not count"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

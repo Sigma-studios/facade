@@ -97,6 +97,9 @@ pub struct Agent {
     proxies: Mutex<Vec<ProxyRoute>>,
     challenges: Mutex<std::collections::BTreeMap<String, String>>,
     link: routes::Link,
+    /// Held while a routing table is made and published, so a table made from
+    /// what ran a moment ago never replaces a newer one.
+    routing: tokio::sync::Mutex<()>,
     /// One build at a time; the others wait here.
     queue: Arc<BuildQueue>,
     /// Deployments still queued or building, which a cancel can stop.
@@ -139,6 +142,7 @@ impl Agent {
             proxies: Default::default(),
             challenges: Default::default(),
             link,
+            routing: Default::default(),
             queue: BuildQueue::new(1),
             cancellable: Default::default(),
             storage: Default::default(),
@@ -841,6 +845,20 @@ impl DeployLog {
 
     pub fn is_deployment(&self) -> bool {
         self.deployment.is_some()
+    }
+
+    /// Publishes the routing table, and returns once the entry point uses it.
+    pub async fn reroute(&self) {
+        self.agent.refresh_routes().await;
+        if self.agent.link.open_connections(&[]).await.is_none() {
+            self.line("the entry point did not confirm the new routes");
+        }
+    }
+
+    /// Requests and connections the entry point has open to these local ports;
+    /// `None` if it cannot tell.
+    pub async fn open_connections(&self, ports: &[u16]) -> Option<usize> {
+        self.agent.link.open_connections(ports).await
     }
 }
 

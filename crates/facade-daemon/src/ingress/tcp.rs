@@ -155,6 +155,7 @@ impl Ingress {
         let Some(target) = route.port else {
             anyhow::bail!("{} is not running", route.app);
         };
+        let _upstream = self.upstream(target);
         keepalive(&tcp);
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()

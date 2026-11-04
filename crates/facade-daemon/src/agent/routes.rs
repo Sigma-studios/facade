@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::net::UnixStream;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tracing::{debug, info};
 
 use super::Agent;
@@ -51,8 +51,18 @@ pub enum Link {
         /// From the entry point's last status.
         bind_errors: Mutex<Vec<String>>,
         upgrade: Notify,
+        /// Questions about open connections, sent after the latest table: an
+        /// answer also says the entry point uses that table.
+        queries: mpsc::UnboundedSender<Query>,
+        answers: tokio::sync::Mutex<mpsc::UnboundedReceiver<Query>>,
     },
 }
+
+/// Local ports, and where to send how many connections are open to them.
+type Query = (Vec<u16>, oneshot::Sender<usize>);
+
+/// How long the entry point has to answer a question.
+const ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 impl Link {
     pub fn new(mode: IngressMode, data_dir: &std::path::Path) -> anyhow::Result<Self> {
@@ -62,14 +72,38 @@ impl Link {
                 http,
                 https,
             },
-            IngressMode::External { control } => Link::External {
-                control,
-                table: watch::channel(None).0,
-                connected: AtomicBool::new(false),
-                bind_errors: Default::default(),
-                upgrade: Notify::new(),
-            },
+            IngressMode::External { control } => {
+                let (queries, answers) = mpsc::unbounded_channel();
+                Link::External {
+                    control,
+                    table: watch::channel(None).0,
+                    connected: AtomicBool::new(false),
+                    bind_errors: Default::default(),
+                    upgrade: Notify::new(),
+                    queries,
+                    answers: tokio::sync::Mutex::new(answers),
+                }
+            }
         })
+    }
+
+    /// Requests and connections the entry point has open to these local ports,
+    /// once it uses the table last published; `None` if it does not answer (not
+    /// running, or older than this question).
+    pub async fn open_connections(&self, ports: &[u16]) -> Option<usize> {
+        match self {
+            Link::Embedded { ingress, .. } => Some(ingress.open_connections(ports)),
+            Link::External {
+                queries, connected, ..
+            } => {
+                if !connected.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let (tx, rx) = oneshot::channel();
+                queries.send((ports.to_vec(), tx)).ok()?;
+                tokio::time::timeout(ANSWER_WAIT, rx).await.ok()?.ok()
+            }
+        }
     }
 
     fn publish(&self, new: Table) {
@@ -165,6 +199,7 @@ impl Agent {
         if !self.synced.load(Ordering::Relaxed) {
             return;
         }
+        let _routing = self.routing.lock().await;
         let workloads: Vec<_> = self.workloads.lock().values().cloned().collect();
         let mut routes = BTreeMap::new();
         let mut tcp = BTreeMap::new();
@@ -237,10 +272,13 @@ impl Agent {
             connected,
             bind_errors,
             upgrade,
+            answers,
+            ..
         } = &self.link
         else {
             return;
         };
+        let mut questions = answers.lock().await;
         let mut logged = false;
         loop {
             let stream = match UnixStream::connect(control).await {
@@ -259,6 +297,8 @@ impl Agent {
             let (read, mut write) = stream.into_split();
             let mut lines = JsonLines::new(read);
             let mut tables = table.subscribe();
+            // Answered in the order asked.
+            let mut waiting = std::collections::VecDeque::<oneshot::Sender<usize>>::new();
             let result: anyhow::Result<()> = async {
                 let current = tables.borrow_and_update().clone();
                 if let Some(table) = current {
@@ -276,10 +316,26 @@ impl Agent {
                         _ = upgrade.notified() => {
                             write_json(&mut write, &ToIngress::Upgrade).await?;
                         }
+                        Some((ports, answer)) = questions.recv() => {
+                            // Asked after a table was published: that table first.
+                            if tables.has_changed()? {
+                                let current = tables.borrow_and_update().clone();
+                                if let Some(table) = current {
+                                    write_json(&mut write, &ToIngress::Table { table }).await?;
+                                }
+                            }
+                            write_json(&mut write, &ToIngress::Connections { ports }).await?;
+                            waiting.push_back(answer);
+                        }
                         msg = lines.next::<FromIngress>() => match msg? {
                             Some(FromIngress::Status { bind_errors: errors, pid }) => {
                                 debug!(pid, ?errors, "entry point status");
                                 *bind_errors.lock() = errors;
+                            }
+                            Some(FromIngress::Connections { open }) => {
+                                if let Some(answer) = waiting.pop_front() {
+                                    let _ = answer.send(open);
+                                }
                             }
                             None => return Ok(()),
                         },

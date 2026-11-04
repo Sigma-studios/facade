@@ -91,6 +91,57 @@ pub struct AppSpec {
     /// Commands run in the container around backups of its volumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupSpec>,
+    /// How a deploy (or a settings change) replaces the running container.
+    #[serde(default, skip_serializing_if = "DeployStrategy::is_auto")]
+    pub deploy: DeployStrategy,
+}
+
+/// How a new container takes over from the running one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeployStrategy {
+    /// `overlap` when it is safe (see [`AppSpec::overlap`]), else `replace`.
+    #[default]
+    Auto,
+    /// The new container starts next to the old one; traffic moves to it once it
+    /// is ready, then the old one finishes its connections and stops.
+    Overlap,
+    /// The old container stops, then the new one starts: down meanwhile.
+    Replace,
+}
+
+impl DeployStrategy {
+    pub fn is_auto(&self) -> bool {
+        *self == DeployStrategy::Auto
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeployStrategy::Auto => "auto",
+            DeployStrategy::Overlap => "overlap",
+            DeployStrategy::Replace => "replace",
+        }
+    }
+}
+
+impl fmt::Display for DeployStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DeployStrategy {
+    type Err = SpecError;
+    fn from_str(s: &str) -> Result<Self, SpecError> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(DeployStrategy::Auto),
+            "overlap" => Ok(DeployStrategy::Overlap),
+            "replace" => Ok(DeployStrategy::Replace),
+            other => err(format!(
+                "`{other}` is not a deploy strategy: auto, overlap or replace"
+            )),
+        }
+    }
 }
 
 /// Commands making what is on disk whole while the app's volumes are backed up.
@@ -329,6 +380,54 @@ impl AppSpec {
         self.stop_timeout_secs.unwrap_or(DEFAULT_STOP_TIMEOUT)
     }
 
+    /// Why two of its containers cannot run at once, whatever its strategy.
+    fn overlap_impossible(&self) -> Option<String> {
+        if self.host_network {
+            return Some(
+                "it is on the node's network, where two copies cannot bind the same ports".into(),
+            );
+        }
+        if let Some(port) = self.ports.first() {
+            return Some(format!(
+                "it publishes host port {port}, which two copies cannot bind at once"
+            ));
+        }
+        None
+    }
+
+    /// Whether a deploy starts the new container next to the old one (`Ok`) or
+    /// stops the old one first (`Err`), with why. The node may still stop the old
+    /// one first: when it is not running, or memory is short.
+    pub fn overlap(&self) -> Result<String, String> {
+        if let Some(why) = self.overlap_impossible() {
+            return Err(why);
+        }
+        match self.deploy {
+            DeployStrategy::Overlap => return Ok("deploy = overlap".into()),
+            DeployStrategy::Replace => return Err("deploy = replace".into()),
+            DeployStrategy::Auto => {}
+        }
+        let routed =
+            (self.http_port.is_some() && !self.domains.is_empty()) || !self.tls_ports.is_empty();
+        if !routed {
+            // A worker or a bot: two at once would do its work twice, and no
+            // route has to move.
+            return Err(
+                "no domain or TLS port routes to it: no traffic to move, and two copies \
+                 would do its work twice; deploy = overlap if that is fine"
+                    .into(),
+            );
+        }
+        if !self.volumes.is_empty() {
+            return Err(
+                "it has volumes, and two copies writing one at once can corrupt it, \
+                 a SQLite file say; deploy = overlap if it copes"
+                    .into(),
+            );
+        }
+        Ok("its traffic comes through the node's entry point".into())
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         match &self.stack {
             Some(stack) => {
@@ -461,6 +560,16 @@ impl AppSpec {
         }
         if self.host_network && !self.links.is_empty() {
             return err("apps on the node's network cannot use links (use published ports)");
+        }
+        if !self.deploy.is_auto() && self.is_static() {
+            return err(
+                "static sites have no container to replace: their files are swapped at once",
+            );
+        }
+        if self.deploy == DeployStrategy::Overlap
+            && let Some(why) = self.overlap_impossible()
+        {
+            return err(format!("deploy = overlap is impossible: {why}"));
         }
         for (i, link) in self.links.iter().enumerate() {
             link.validate()?;
@@ -1372,6 +1481,40 @@ mod tests {
             "domains": ["example.com"],
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn overlaps_only_when_safe() {
+        assert!(spec().overlap().is_ok(), "a routed app without volumes");
+        let json = serde_json::to_value(spec()).unwrap();
+        assert!(json.get("deploy").is_none(), "auto is left out");
+
+        let mut s = spec();
+        s.volumes = vec!["data:/data".parse().unwrap()];
+        assert!(s.overlap().is_err(), "volumes: two writers");
+        s.deploy = DeployStrategy::Overlap;
+        assert!(s.overlap().is_ok(), "unless asked");
+        assert!(s.validate().is_ok());
+
+        let mut s = spec();
+        s.domains.clear();
+        assert!(s.overlap().is_err(), "nothing to move");
+
+        let mut s = spec();
+        s.deploy = DeployStrategy::Replace;
+        assert!(s.overlap().is_err());
+
+        let mut s = spec();
+        s.ports = vec!["25:25".parse().unwrap()];
+        s.deploy = DeployStrategy::Overlap;
+        assert!(s.overlap().is_err(), "host ports cannot be bound twice");
+        assert!(s.validate().is_err(), "and asking for it is refused");
+
+        assert_eq!(
+            "Overlap".parse::<DeployStrategy>().unwrap(),
+            DeployStrategy::Overlap
+        );
+        assert!("blue-green".parse::<DeployStrategy>().is_err());
     }
 
     #[test]

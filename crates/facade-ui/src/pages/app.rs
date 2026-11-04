@@ -503,6 +503,13 @@ fn OverviewTab(
                             format!("{} (as {})", l.app, l.host())
                         }).collect::<Vec<_>>().join(", ")}</dd>
                     })}
+                    {(!s.is_static()).then(|| {
+                        let (how, why) = match s.overlap() {
+                            Ok(why) => ("no downtime: the new version starts next to the running one", why),
+                            Err(why) => ("the old version stops before the new one starts", why),
+                        };
+                        view! { <dt>"Deploys"</dt><dd title=why>{how}</dd> }
+                    })}
                 </dl>
             })}
             <Show when=from_git>
