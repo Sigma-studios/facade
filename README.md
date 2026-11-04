@@ -279,7 +279,7 @@ template in `lang::generated_dockerfile`.
 | `facade exec <app> -- <cmd…>` / `exec -it <app> -- sh` | run a command (or a shell) in the app's container; its exit code is facade's |
 | `facade deployments <app> [--id ID]` | build history and logs |
 | `facade updates <app>` | commits on the app's branch since its deployed one |
-| `facade metrics <app>` / `facade node metrics <node>` | last hour of samples, with traffic (see [Traffic](#traffic)) |
+| `facade metrics <app>` / `facade node metrics <node>` | last hour of samples, with traffic, throttling, disk activity, strain (see [Traffic](#traffic), [Limits, disks and pressure](#limits-disks-and-pressure)) |
 | `facade env ls <app> [--reveal]` / `env set` / `env unset` | variables; sensitive unless `--public`, handed to builds with `--build` |
 | `facade domain add <app> <domain>` | route a host name to an app |
 | `facade app update <app> --memory 512 --cpus 1 --node eu-2 …` | change settings (moving nodes works) |
@@ -792,6 +792,44 @@ last five minutes summed up (also in `facade app show`). Apps with no domain sho
 An entry point starts counting from zero when it starts, including when it hands over
 to a new version: the period of the handover shows as a gap. Entry points from before
 this counting (until the first handover to a newer `facaded`) report no traffic.
+
+### Limits, disks and pressure
+
+Besides CPU, memory and network, each report carries, for every app's container
+(read from its cgroup v2 files, else from `docker stats`):
+
+* **CPU throttling**, for apps with a CPU limit (`cpu.stat`): the share of the limit's
+  100 ms periods in which the app had used its quota and had to wait. The app's
+  CPU tile says "held back 12 % of the time" when it was over the last five minutes
+  (1 % or more), and its CPU chart shades the periods when it was.
+* **Disk reads and writes** (`io.stat`), charted as Disk activity next to Network.
+* **Processes and threads** against the limit (`--pids`, 4096 by default): past 80 %
+  the app's overview shows a warning.
+* **Health check results**: Docker keeps the last five; the server keeps each app's
+  last 60, shown as a strip of squares under the check in the app's Info tab, with
+  how long the last one took. The overview shows a badge while the last one failed.
+
+An app with a memory limit shows its memory against it ("470 MB of 512 MB", with a
+bar turning orange past 80 % and red past 95 %, in its overview and in the apps
+tables), and a dashed line at the limit on its memory chart. Each volume on the
+app's Volumes tab gets its size over the last 30 days, from the node's storage
+report (every 15 minutes), kept hourly.
+
+Nodes add their pressure stall information (`/proc/pressure`: the share of time some
+tasks waited for CPU, memory or the disk) and their root disk's reads and writes
+(`/proc/diskstats`). The node page's header sums pressure up as its strain, from the
+last minute: moderate from 25 % for CPU, 5 % for memory or 10 % for disk, high from
+60 %, 20 % or 30 % (waiting for CPU is normal on a busy machine; waiting for memory
+or disk hurts sooner). Its overview gets a Pressure panel with the three over the
+chosen period, and the Disk panel a chart of reads and writes with the time spent
+waiting on disk (disk pressure, or the CPU's iowait on kernels without pressure
+information). `facade metrics <app>`, `facade app show` and `facade node metrics`
+print these figures too.
+
+Counters come and are stored the way network bytes are: the server keeps the last
+of each 5-minute bucket and computes rates when history is read; a new container or
+a reboot leaves a gap. What a node cannot measure (cgroup v1 without throttling
+figures, a kernel without PSI) is left out rather than shown as zero.
 
 ### Alerts on Discord
 
