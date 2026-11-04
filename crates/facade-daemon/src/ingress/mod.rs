@@ -15,7 +15,9 @@
 //! entry point updates itself by handing its listening sockets to the new
 //! binary while the old one finishes its open connections.
 
+pub mod edge;
 mod firewall;
+mod meter;
 pub mod process;
 pub mod tcp;
 pub mod traffic;
@@ -24,13 +26,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use facade_core::proto::{CertBundle, Traffic};
+use facade_core::proto::{CertBundle, EdgeReading, Traffic};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
@@ -47,6 +48,8 @@ use tokio::sync::watch;
 use tower::ServiceExt;
 use tracing::{debug, info, warn};
 
+use self::edge::VisitorKey;
+use self::meter::{Metered, Tally};
 use self::traffic::{AppTraffic, Open};
 use crate::tls;
 
@@ -218,6 +221,8 @@ pub struct Ingress {
     /// polling every few seconds keeps it so), a connection would otherwise
     /// stay here, with routes that no longer change, until the drain ends.
     retiring: watch::Sender<bool>,
+    /// What visitors are counted under (see [`edge::VisitorKey`]).
+    visitor_key: VisitorKey,
 }
 
 impl Ingress {
@@ -249,6 +254,7 @@ impl Ingress {
             tcp: Default::default(),
             retired: AtomicBool::new(false),
             retiring: watch::channel(false).0,
+            visitor_key: VisitorKey::load(dir),
         }))
     }
 
@@ -311,6 +317,21 @@ impl Ingress {
             .apps
             .iter()
             .map(|(app, counters)| (app.clone(), counters.snapshot()))
+            .collect()
+    }
+
+    /// Failed requests and visitors of every app routed to.
+    pub fn edge(&self) -> BTreeMap<String, EdgeReading> {
+        let apps: Vec<(String, Arc<AppTraffic>)> = self
+            .routing
+            .read()
+            .apps
+            .iter()
+            .map(|(app, counters)| (app.clone(), counters.clone()))
+            .collect();
+        // Outside the routing lock: copying sketches takes a few microseconds.
+        apps.into_iter()
+            .map(|(app, counters)| (app, counters.edge_snapshot()))
             .collect()
     }
 
@@ -429,14 +450,22 @@ impl Ingress {
             let counted = Counted::new(&ingress.active);
             tokio::spawn(async move {
                 let _counted = counted;
+                let tally = Arc::new(Tally::default());
+                let tcp = Metered::new(tcp, tally.clone());
                 match acceptor {
-                    None => ingress.connection(TokioIo::new(tcp), peer, false).await,
+                    None => {
+                        ingress
+                            .connection(TokioIo::new(tcp), peer, false, tally)
+                            .await
+                    }
                     Some(acceptor) => {
                         match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp))
                             .await
                         {
                             Ok(Ok(stream)) => {
-                                ingress.connection(TokioIo::new(stream), peer, true).await
+                                ingress
+                                    .connection(TokioIo::new(stream), peer, true, tally)
+                                    .await
                             }
                             _ => debug!(%peer, "TLS handshake failed"),
                         }
@@ -446,18 +475,24 @@ impl Ingress {
         }
     }
 
-    async fn connection<I>(self: Arc<Self>, io: I, peer: SocketAddr, tls: bool)
+    /// Serves a client connection. `tally`: the app its first request goes to,
+    /// which its bytes count for (WebSocket ones included).
+    async fn connection<I>(self: Arc<Self>, io: I, peer: SocketAddr, tls: bool, tally: Arc<Tally>)
     where
         I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     {
         let mut retiring = self.retiring.subscribe();
-        // The app the connection's first request went to counts it as open
-        // until it closes (or turns into a WebSocket, which counts on its own).
-        let open = Arc::new(OnceLock::<Open>::new());
+        // That app counts it as open until it closes (or turns into a
+        // WebSocket, which counts on its own).
+        // One reference to clone per request, as before bytes were counted.
+        let conn = Arc::new((OnceLock::<Open>::new(), tally));
         let service = hyper::service::service_fn(move |req| {
             let ingress = self.clone();
-            let open = open.clone();
-            async move { Ok::<_, Infallible>(ingress.handle(req, peer, tls, &open).await) }
+            let conn = conn.clone();
+            async move {
+                let (open, tally) = &*conn;
+                Ok::<_, Infallible>(ingress.handle(req, peer, tls, open, tally).await)
+            }
         });
         let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
         let conn = builder.serve_connection_with_upgrades(io, service);
@@ -478,8 +513,10 @@ impl Ingress {
         peer: SocketAddr,
         tls: bool,
         open: &OnceLock<Open>,
+        tally: &Tally,
     ) -> Response<Body> {
         let started = Instant::now();
+        let method = req.method().clone();
         let host = request_host(&req).unwrap_or_default();
         let path = req
             .uri()
@@ -524,6 +561,24 @@ impl Ingress {
         }
         if let Some(counters) = &counters {
             open.get_or_init(|| Open::new(counters.clone()));
+            let mut first = false;
+            let app = tally.app.get_or_init(|| {
+                first = true;
+                counters.clone()
+            });
+            // A visitor per connection: its first request, and those to another
+            // app (HTTP/2 shares a connection between hosts of one certificate).
+            if first || !Arc::ptr_eq(app, counters) {
+                let agent = req
+                    .headers()
+                    .get(header::USER_AGENT)
+                    .map_or(&b""[..], HeaderValue::as_bytes);
+                if agent.starts_with(edge::CHECK_AGENT.as_bytes()) {
+                    tally.checker.store(true, Ordering::Relaxed);
+                } else {
+                    counters.edge.visit(self.visitor_key.hash(peer.ip(), agent));
+                }
+            }
         }
         let result = match route {
             None => {
@@ -542,10 +597,17 @@ impl Ingress {
                 .await
                 .map_err(|e| (app, e)),
         };
+        let failed = |counters: &AppTraffic, status: u16| {
+            if status >= 400 && !tally.checker.load(Ordering::Relaxed) {
+                counters.edge.record_error(status, &method, &path);
+            }
+        };
         match result {
             Ok(response) => {
                 if let Some(counters) = &counters {
-                    counters.record(response.status().as_u16(), Some(started.elapsed()));
+                    let status = response.status().as_u16();
+                    counters.record(status, Some(started.elapsed()));
+                    failed(counters, status);
                 }
                 response
             }
@@ -553,6 +615,7 @@ impl Ingress {
                 debug!(%app, "proxy error: {e:#}");
                 if let Some(counters) = &counters {
                     counters.record(StatusCode::BAD_GATEWAY.as_u16(), None);
+                    failed(counters, StatusCode::BAD_GATEWAY.as_u16());
                 }
                 text(
                     StatusCode::BAD_GATEWAY,
@@ -1268,6 +1331,148 @@ mod tests {
         drop(client);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(ingress.traffic()["app"].open, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sends a GET as `agent` and reads the answer: its status and length.
+    async fn ask_as(
+        client: &mut tokio::net::TcpStream,
+        host: &str,
+        target: &str,
+        agent: &str,
+    ) -> (u16, usize) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client
+            .write_all(
+                format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {agent}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        let mut byte = [0u8; 1];
+        while !got.ends_with(b"\r\n\r\n") {
+            client.read_exact(&mut byte).await.unwrap();
+            got.push(byte[0]);
+        }
+        let head = String::from_utf8(got.clone()).unwrap().to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map_or(0, |n| n.trim().parse().unwrap());
+        let mut body = vec![0u8; length];
+        client.read_exact(&mut body).await.unwrap();
+        (head[9..12].parse().unwrap(), got.len() + length)
+    }
+
+    #[tokio::test]
+    async fn failed_requests_visitors_and_bytes_are_gathered() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The app: 404 under /missing, 500 under /boom, else 200 with 1000 bytes.
+        let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = app.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        head.clear();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            if sock.read_exact(&mut byte).await.is_err() {
+                                return;
+                            }
+                            head.push(byte[0]);
+                        }
+                        let head = String::from_utf8_lossy(&head).to_string();
+                        let path = head.split(' ').nth(1).unwrap_or_default().to_string();
+                        let (status, body) = if path.starts_with("/missing") {
+                            ("404 Not Found", "no".to_string())
+                        } else if path.starts_with("/boom") {
+                            ("500 Internal Server Error", "boom".to_string())
+                        } else {
+                            ("200 OK", "x".repeat(1000))
+                        };
+                        let answer = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        sock.write_all(answer.as_bytes()).await.unwrap();
+                    }
+                });
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("facade-edge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ingress = Ingress::new(&dir).unwrap();
+        let mut table = Table::default();
+        table.routes.insert(
+            "app.example.com".into(),
+            Route::Port {
+                app: "app".into(),
+                port: app_port,
+            },
+        );
+        ingress.set_table(table);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop_tx, stop) = watch::channel(false);
+        tokio::spawn(ingress.clone().serve(listener, false, stop));
+
+        // Four addresses, two browsers each: eight visitors; the outside check
+        // is none.
+        let mut received = 0;
+        for n in 2..6 {
+            for agent in ["Firefox", "Safari"] {
+                let socket = tokio::net::TcpSocket::new_v4().unwrap();
+                socket
+                    .bind(format!("127.0.0.{n}:0").parse().unwrap())
+                    .unwrap();
+                let mut client = socket.connect(addr).await.unwrap();
+                for target in ["/", "/missing/12?x=1", "/missing/7", "/boom"] {
+                    received += ask_as(&mut client, "app.example.com", target, agent)
+                        .await
+                        .1;
+                }
+            }
+        }
+        let mut check = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (status, _) = ask_as(
+            &mut check,
+            "app.example.com",
+            "/missing/1",
+            "facade-check/1",
+        )
+        .await;
+        assert_eq!(status, 404);
+        drop(check);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let edge = &ingress.edge()["app"];
+        let errors: Vec<_> = edge
+            .errors
+            .iter()
+            .map(|e| (e.status, e.method.as_str(), e.path.as_str(), e.count))
+            .collect();
+        assert_eq!(
+            errors,
+            [(404, "GET", "/missing/{n}", 16), (500, "GET", "/boom", 8)],
+            "the check's 404 is not the app's"
+        );
+        assert_eq!(edge.visitors.len(), 1);
+        let visitors =
+            crate::hll::estimate(&crate::hll::decode(&edge.visitors[0].registers).unwrap());
+        assert!((visitors - 8.0).abs() < 0.5, "{visitors}");
+        let traffic = &ingress.traffic()["app"];
+        // The client sockets are closed: every byte reached the counters.
+        assert!(
+            traffic.bytes_out as usize >= received - 300
+                && traffic.bytes_out as usize <= received + 300,
+            "{} sent, {received} received by clients",
+            traffic.bytes_out
+        );
+        assert!(traffic.bytes_in > 8 * 4 * 50, "{}", traffic.bytes_in);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

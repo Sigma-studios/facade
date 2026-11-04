@@ -433,6 +433,10 @@ pub struct NodeReport {
     /// report of a connection, then when it changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upkeep: Option<crate::events::Upkeep>,
+    /// Failed requests and visitors per app, from the entry point (see
+    /// [`EdgeReading`]); empty from older agents and entry points.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub edge: BTreeMap<String, EdgeReading>,
 }
 
 /// A TCP socket in LISTEN state or a bound UDP socket.
@@ -674,6 +678,51 @@ pub struct Traffic {
     /// Client connections open now: kept-alive HTTP, WebSockets, TLS ports.
     #[serde(default)]
     pub open: u64,
+    /// Bytes received from clients and sent to them, as on the wire (TLS
+    /// included): what a hosting provider's traffic quota counts. A kept-alive
+    /// connection counts for the app its first request went to (0 from older
+    /// entry points).
+    #[serde(default)]
+    pub bytes_in: u64,
+    #[serde(default)]
+    pub bytes_out: u64,
+}
+
+/// What an entry point gathered for one app beyond its counters: requests that
+/// failed, grouped, and who visited. Reports carry only what changed since the
+/// previous one on the same connection to the server, the first one everything.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EdgeReading {
+    /// When the entry point started counting for the app, as [`Traffic::since`].
+    pub since: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ErrorTally>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visitors: Vec<VisitorSketch>,
+}
+
+/// Requests answered 4xx or 5xx with the same status, method and path (query
+/// left out, ids and hashes replaced by placeholders), since `first_seen`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorTally {
+    pub status: u16,
+    pub method: String,
+    pub path: String,
+    pub count: u64,
+    /// When the entry point started counting these (seconds since the epoch):
+    /// one forgotten to make room and seen again starts again from there.
+    pub first_seen: u64,
+    pub last_seen: u64,
+}
+
+/// A HyperLogLog sketch of the visitors of one day (UTC; `day` counts days since
+/// the epoch): per-register maxima, merged by taking the larger of each.
+/// No address is kept, only these maxima of keyed hashes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisitorSketch {
+    pub day: u64,
+    /// The registers, base64-encoded.
+    pub registers: String,
 }
 
 /// A certificate and its key, for the names it covers (`*.example.com` included).

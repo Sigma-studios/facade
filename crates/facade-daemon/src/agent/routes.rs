@@ -52,6 +52,8 @@ pub enum Link {
         bind_errors: Mutex<Vec<String>>,
         /// Whether it counts traffic (older ones do not know the question).
         counts_traffic: AtomicBool,
+        /// Whether it gathers failed requests and visitors.
+        gathers_edge: AtomicBool,
         upgrade: Notify,
         /// Questions about open connections, sent after the latest table: an
         /// answer also says the entry point uses that table.
@@ -66,14 +68,18 @@ pub enum Query {
     Connections(Vec<u16>, oneshot::Sender<usize>),
     /// The apps' traffic counters.
     Traffic(oneshot::Sender<AppsTraffic>),
+    /// The apps' failed requests and visitors.
+    Edge(oneshot::Sender<AppsEdge>),
 }
 
 type AppsTraffic = BTreeMap<String, facade_core::proto::Traffic>;
+type AppsEdge = BTreeMap<String, facade_core::proto::EdgeReading>;
 
 /// An answer to wait for, in the order asked.
 enum Waiting {
     Connections(oneshot::Sender<usize>),
     Traffic(oneshot::Sender<AppsTraffic>),
+    Edge(oneshot::Sender<AppsEdge>),
 }
 
 /// How long the entry point has to answer a question.
@@ -95,6 +101,7 @@ impl Link {
                     connected: AtomicBool::new(false),
                     bind_errors: Default::default(),
                     counts_traffic: AtomicBool::new(false),
+                    gathers_edge: AtomicBool::new(false),
                     upgrade: Notify::new(),
                     queries,
                     answers: tokio::sync::Mutex::new(answers),
@@ -138,6 +145,27 @@ impl Link {
                 }
                 let (tx, rx) = oneshot::channel();
                 queries.send(Query::Traffic(tx)).ok()?;
+                tokio::time::timeout(ANSWER_WAIT, rx).await.ok()?.ok()
+            }
+        }
+    }
+
+    /// The failed requests and visitors of the apps the entry point routes to;
+    /// `None` if it cannot tell (not running, or older).
+    pub async fn edge(&self) -> Option<AppsEdge> {
+        match self {
+            Link::Embedded { ingress, .. } => Some(ingress.edge()),
+            Link::External {
+                queries,
+                connected,
+                gathers_edge,
+                ..
+            } => {
+                if !connected.load(Ordering::Relaxed) || !gathers_edge.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let (tx, rx) = oneshot::channel();
+                queries.send(Query::Edge(tx)).ok()?;
                 tokio::time::timeout(ANSWER_WAIT, rx).await.ok()?.ok()
             }
         }
@@ -309,6 +337,7 @@ impl Agent {
             connected,
             bind_errors,
             counts_traffic,
+            gathers_edge,
             upgrade,
             answers,
             ..
@@ -367,15 +396,17 @@ impl Agent {
                                     (ToIngress::Connections { ports }, Waiting::Connections(answer))
                                 }
                                 Query::Traffic(answer) => (ToIngress::Traffic, Waiting::Traffic(answer)),
+                                Query::Edge(answer) => (ToIngress::Edge, Waiting::Edge(answer)),
                             };
                             write_json(&mut write, &question).await?;
                             waiting.push_back(answer);
                         }
                         msg = lines.next::<FromIngress>() => match msg? {
-                            Some(FromIngress::Status { bind_errors: errors, pid, traffic }) => {
+                            Some(FromIngress::Status { bind_errors: errors, pid, traffic, edge }) => {
                                 debug!(pid, ?errors, "entry point status");
                                 *bind_errors.lock() = errors;
                                 counts_traffic.store(traffic, Ordering::Relaxed);
+                                gathers_edge.store(edge, Ordering::Relaxed);
                             }
                             Some(FromIngress::Connections { open }) => {
                                 if let Some(Waiting::Connections(answer)) = waiting.pop_front() {
@@ -387,6 +418,11 @@ impl Agent {
                                     let _ = answer.send(apps);
                                 }
                             }
+                            Some(FromIngress::Edge { apps }) => {
+                                if let Some(Waiting::Edge(answer)) = waiting.pop_front() {
+                                    let _ = answer.send(apps);
+                                }
+                            }
                             None => return Ok(()),
                         },
                     }
@@ -395,6 +431,7 @@ impl Agent {
             .await;
             connected.store(false, Ordering::Relaxed);
             counts_traffic.store(false, Ordering::Relaxed);
+            gathers_edge.store(false, Ordering::Relaxed);
             match result {
                 Ok(()) => info!("the entry point closed its connection (handover?), reconnecting"),
                 Err(e) => info!("entry point connection: {e:#}"),

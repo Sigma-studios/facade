@@ -773,6 +773,10 @@ pub struct DomainStatus {
     pub certificate: Option<String>,
     pub cert_expires: Option<u64>,
     pub cert_error: Option<String>,
+    /// The outside check's last result; `None` until checked (or from servers
+    /// without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<crate::insights::Reach>,
 }
 
 /// Where alerts go. Read with the webhook partly hidden.
@@ -876,7 +880,7 @@ mod tests {
             client_errors: 0,
             server_errors: errors,
             latency,
-            open: 0,
+            ..Default::default()
         }
     }
 

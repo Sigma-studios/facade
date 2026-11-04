@@ -5,6 +5,7 @@ pub mod env;
 pub mod events;
 pub mod exec;
 pub mod git;
+pub mod insights;
 pub mod manifest;
 #[cfg(feature = "pinned-tls")]
 pub mod pinned;

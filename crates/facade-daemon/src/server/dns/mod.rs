@@ -346,6 +346,7 @@ pub async fn statuses(server: &Server) -> Vec<DomainStatus> {
             managed: server.dns.zone_for(&desired.domain).is_some(),
             dns_error: errors.get(&format!("dns:{}", desired.domain)).cloned(),
             cert_error: errors.get(&format!("cert:{cert_name}")).cloned(),
+            reach: None,
             certificate: cert.map(|c| c.domain.clone()),
             cert_expires: cert.map(|c| c.not_after),
             domain: desired.domain,

@@ -37,6 +37,7 @@ pub struct ServerConfig {
     pub backups: BackupConfig,
     pub update: UpdateConfig,
     pub auto_deploy: AutoDeployConfig,
+    pub checks: ChecksConfig,
     /// The file this was read from (handed to the binary checking an update).
     #[serde(skip)]
     pub path: PathBuf,
@@ -60,6 +61,7 @@ impl Default for ServerConfig {
             backups: BackupConfig::default(),
             update: UpdateConfig::default(),
             auto_deploy: AutoDeployConfig::default(),
+            checks: ChecksConfig::default(),
             path: "/etc/facade/server.toml".into(),
         }
     }
@@ -166,6 +168,37 @@ impl Default for AutoDeployConfig {
         Self {
             poll_secs: 180,
             github_api: "https://api.github.com".into(),
+        }
+    }
+}
+
+/// The outside check: every app domain loaded from the server the way a
+/// visitor would (see `server::reach`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChecksConfig {
+    pub enabled: bool,
+    /// Seconds between two rounds.
+    pub every_secs: u64,
+    /// How long a domain has to answer (headers), connecting included.
+    pub timeout_secs: u64,
+    /// Domains checked at once.
+    pub concurrency: usize,
+    /// Addresses to use instead of DNS for some names (tests, split horizons).
+    pub resolve: std::collections::BTreeMap<String, std::net::IpAddr>,
+    /// A CA certificate to trust besides the public ones (test CAs).
+    pub root_ca: Option<PathBuf>,
+}
+
+impl Default for ChecksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            every_secs: 60,
+            timeout_secs: 10,
+            concurrency: 8,
+            resolve: Default::default(),
+            root_ca: None,
         }
     }
 }

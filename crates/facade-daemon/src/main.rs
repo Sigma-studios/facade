@@ -11,6 +11,7 @@ mod agent;
 mod config;
 mod framing;
 mod gitauth;
+mod hll;
 mod ingress;
 mod lang;
 mod selfbin;

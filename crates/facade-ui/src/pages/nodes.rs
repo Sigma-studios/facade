@@ -603,6 +603,7 @@ fn NodeMetrics(
                 <div class="metric-sub">"Out"</div>
                 <Sparkline title="Sent" points=net_out span=span gap=gap max=Signal::stored(None)
                     format=rate bare=true axis=true/>
+                <super::insights::NodeMonth name=name.clone()/>
             </section>
             // How often tasks waited for CPU, memory or disk (Linux PSI).
             <Show when=move || has_pressure.get()>

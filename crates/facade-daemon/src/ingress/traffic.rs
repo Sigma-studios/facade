@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use facade_core::proto::{LATENCY_BOUNDS_MS, LATENCY_BUCKETS, Traffic};
+use facade_core::proto::{EdgeReading, LATENCY_BOUNDS_MS, LATENCY_BUCKETS, Traffic};
+
+use super::edge::Edge;
 
 /// One app's counters.
 pub struct AppTraffic {
@@ -20,6 +22,10 @@ pub struct AppTraffic {
     server_errors: AtomicU64,
     latency: [AtomicU64; LATENCY_BUCKETS],
     open: AtomicU64,
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+    /// Failed requests and visitors.
+    pub edge: Edge,
 }
 
 impl AppTraffic {
@@ -31,7 +37,20 @@ impl AppTraffic {
             server_errors: AtomicU64::new(0),
             latency: std::array::from_fn(|_| AtomicU64::new(0)),
             open: AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+            edge: Edge::new(),
         })
+    }
+
+    /// Bytes a client connection received and sent (see [`super::meter`]).
+    pub fn add_bytes(&self, received: u64, sent: u64) {
+        if received > 0 {
+            self.bytes_in.fetch_add(received, Ordering::Relaxed);
+        }
+        if sent > 0 {
+            self.bytes_out.fetch_add(sent, Ordering::Relaxed);
+        }
     }
 
     /// A request answered with `status`, the app's answer taking `took` to its
@@ -65,6 +84,16 @@ impl AppTraffic {
                 .map(|c| c.load(Ordering::Relaxed))
                 .collect(),
             open: self.open(),
+            bytes_in: self.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn edge_snapshot(&self) -> EdgeReading {
+        EdgeReading {
+            since: self.since,
+            errors: self.edge.errors(),
+            visitors: self.edge.visitors(),
         }
     }
 }

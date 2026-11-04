@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+pub mod edge;
 mod resources;
 
 pub struct Store(Mutex<Connection>);
@@ -363,6 +364,7 @@ impl Store {
         conn.execute_batch(AUTO_DEPLOY_SCHEMA)?;
         events::migrate(&conn)?;
         conn.execute_batch(resources::SCHEMA)?;
+        conn.execute_batch(edge::SCHEMA)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "node_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;
         add_column(&conn, "node_usage", "net_tx", "INTEGER NOT NULL DEFAULT 0")?;
@@ -969,7 +971,7 @@ impl Store {
                         .split(',')
                         .filter_map(|n| n.parse().ok())
                         .collect(),
-                    open: 0,
+                    ..Default::default()
                 })
             });
             Ok((
@@ -2187,6 +2189,7 @@ mod tests {
                 server_errors: errors,
                 latency,
                 open,
+                ..Default::default()
             })
         };
         let app = |traffic: Option<Traffic>| UsageSample {
