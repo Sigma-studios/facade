@@ -854,7 +854,7 @@ mod tests {
             client_errors: 0,
             server_errors: errors,
             latency,
-            open: 0,
+            ..Default::default()
         }
     }
 

@@ -4,6 +4,7 @@
 pub(crate) mod build;
 mod cgroups;
 mod compress;
+mod edge;
 mod exec;
 mod layers;
 mod maintenance;
@@ -650,6 +651,8 @@ impl Agent {
 
     async fn report_loop(self: Arc<Self>, tx: mpsc::Sender<AgentMsg>) {
         let mut sampler = stats::NodeSampler::new();
+        // Per connection: its first report tells the server everything.
+        let mut edge_sent = edge::Sent::default();
         let mut tick = tokio::time::interval(REPORT_EVERY);
         loop {
             tick.tick().await;
@@ -675,6 +678,7 @@ impl Agent {
                 storage,
                 listeners,
                 ingress_errors: self.link.errors(),
+                edge: edge_sent.changes(self.link.edge().await.unwrap_or_default()),
             };
             if tx
                 .send(AgentMsg::Event {

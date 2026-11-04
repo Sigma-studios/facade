@@ -961,7 +961,7 @@ impl Store {
                         .split(',')
                         .filter_map(|n| n.parse().ok())
                         .collect(),
-                    open: 0,
+                    ..Default::default()
                 })
             });
             Ok((
@@ -2177,6 +2177,7 @@ mod tests {
                 server_errors: errors,
                 latency,
                 open,
+                ..Default::default()
             })
         };
         let app = |traffic: Option<Traffic>| UsageSample {

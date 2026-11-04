@@ -20,6 +20,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use super::firewall;
+use super::meter::{Metered, Tally};
 use super::traffic::Open;
 use super::{BIND_RETRY, Certs, Counted, Ingress, stopped};
 
@@ -153,7 +154,9 @@ impl Ingress {
         let Some(route) = route else {
             anyhow::bail!("no app on this port any more");
         };
-        let _open = self.app_traffic(&route.app).map(Open::new);
+        let counters = self.app_traffic(&route.app);
+        let _open = counters.clone().map(Open::new);
+        let tally = Tally::for_app(counters);
         let Some(target) = route.port else {
             anyhow::bail!("{} is not running", route.app);
         };
@@ -166,6 +169,7 @@ impl Ingress {
                 names: route.names,
             }));
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let tcp = Metered::new(tcp, tally);
         let mut client = tokio::time::timeout(HANDSHAKE, acceptor.accept(tcp))
             .await
             .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;

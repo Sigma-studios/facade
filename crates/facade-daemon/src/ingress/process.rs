@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use facade_core::proto::Traffic;
+use facade_core::proto::{EdgeReading, Traffic};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -56,6 +56,10 @@ pub enum ToIngress {
     /// asked of an entry point whose status says it counts: an older one would
     /// drop the connection on a message it does not know.
     Traffic,
+    /// The apps' failed requests and visitors, answered with
+    /// [`FromIngress::Edge`]; asked only of an entry point whose status says it
+    /// gathers them.
+    Edge,
 }
 
 /// Entry point → agent: its status on connection and whenever it changes, and
@@ -69,12 +73,18 @@ pub enum FromIngress {
         /// It answers [`ToIngress::Traffic`] (missing from older ones).
         #[serde(default)]
         traffic: bool,
+        /// It answers [`ToIngress::Edge`].
+        #[serde(default)]
+        edge: bool,
     },
     Connections {
         open: usize,
     },
     Traffic {
         apps: BTreeMap<String, Traffic>,
+    },
+    Edge {
+        apps: BTreeMap<String, EdgeReading>,
     },
 }
 
@@ -297,6 +307,7 @@ async fn control_connection(
         bind_errors: ingress.bind_errors(),
         pid,
         traffic: true,
+        edge: true,
     };
     if write_json(&mut write, &send_status(&ingress))
         .await
@@ -318,6 +329,12 @@ async fn control_connection(
                 Ok(Some(ToIngress::Traffic)) => {
                     let apps = ingress.traffic();
                     if write_json(&mut write, &FromIngress::Traffic { apps }).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Some(ToIngress::Edge)) => {
+                    let apps = ingress.edge();
+                    if write_json(&mut write, &FromIngress::Edge { apps }).await.is_err() {
                         return;
                     }
                 }
