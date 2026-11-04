@@ -420,18 +420,27 @@ fn stream_chunks(
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
     tokio::task::spawn_blocking(move || {
         let _shared = shared;
-        let out = std::io::BufWriter::with_capacity(256 * 1024, ChannelWriter(tx.clone()));
+        // The error goes out before the writers are dropped: dropping them sends
+        // what they hold (a gzip trailer), which must not end the stream cleanly.
+        let fail = |e: std::io::Error| {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                warn!("reading a backup: {e}");
+                let _ = tx.blocking_send(Err(e));
+            }
+        };
+        let mut out = std::io::BufWriter::with_capacity(256 * 1024, ChannelWriter(tx.clone()));
         let mut tar = store.reader(chunks);
-        let written = if gzip {
+        if gzip {
             // Fast: at the default level, compressing is what limits a download.
             let mut gz = flate2::write::GzEncoder::new(out, flate2::Compression::fast());
-            std::io::copy(&mut tar, &mut gz).and_then(|_| gz.finish()?.flush())
-        } else {
-            let mut out = out;
-            std::io::copy(&mut tar, &mut out).and_then(|_| out.flush())
-        };
-        if let Err(e) = written {
-            let _ = tx.blocking_send(Err(e));
+            if let Err(e) = std::io::copy(&mut tar, &mut gz)
+                .and_then(|_| gz.try_finish())
+                .and_then(|_| gz.get_mut().flush())
+            {
+                fail(e);
+            }
+        } else if let Err(e) = std::io::copy(&mut tar, &mut out).and_then(|_| out.flush()) {
+            fail(e);
         }
     });
     futures_util::stream::unfold(rx, |mut rx| async move {
