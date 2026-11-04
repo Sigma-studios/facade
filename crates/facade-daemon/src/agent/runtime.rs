@@ -288,10 +288,16 @@ impl Runtime {
         for sub in ["static", "builds"] {
             std::fs::create_dir_all(dir.join(sub))?;
         }
-        // Left over by builds interrupted when the agent stopped.
+        // Left over by builds, and volume exports and imports (files), interrupted
+        // when the agent stopped.
         if let Ok(entries) = std::fs::read_dir(dir.join("builds")) {
             for entry in entries.flatten() {
-                let _ = std::fs::remove_dir_all(entry.path());
+                let path = entry.path();
+                let _ = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
             }
         }
         Ok(Self(Arc::new(Inner {
