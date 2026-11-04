@@ -306,8 +306,9 @@ pub async fn errors(api: &Api, args: &ErrorsArgs, json: bool) -> anyhow::Result<
         }),
     );
     println!(
-        "\n{total} failed requests in these {} groups, over the last {}{}",
+        "\n{total} failed requests in {} group{}, over the last {}{}",
         rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
         period_text(period),
         if view.more > 0 {
             format!(" ({} rarer groups not listed)", view.more)
