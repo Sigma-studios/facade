@@ -5,22 +5,30 @@ use facade_core::proto::{Listener, NodeStats, StorageReport};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
-use leptos_router::hooks::{use_navigate, use_params_map};
+use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
 
 use crate::api;
 use crate::components::{
-    CopyField, DiskMeter, ErrorNote, Loading, Meter, Modal, OnlineBadge, Range, RangePicker, Sort,
-    SortKey, SortTh, Sparkline, UsageFeed, usage_feed,
+    CopyField, DiskMeter, ErrorNote, Loading, Menu, Meter, Modal, OnlineBadge, Range, RangePicker,
+    Sort, SortKey, SortTh, Sparkline, TabBar, UsageFeed, usage_feed,
 };
 use crate::util::{Polled, ago, bytes, me, percent, polled, run, toasts};
 
-/// One node at a time: the one in the URL (`/nodes/eu-2`), else the first. Its
-/// card with the actions, its usage, its ports and its volumes.
+const TABS: &[(&str, &str)] = &[
+    ("overview", "Overview"),
+    ("ports", "Ports"),
+    ("volumes", "Volumes"),
+];
+
+/// One node at a time, laid out as an app's page: the one in the URL
+/// (`/nodes/eu-2`), else the first, switched from its title. Its facts and
+/// actions in the header; its usage, ports and volumes in tabs (`?tab=ports`).
 #[component]
 pub fn Nodes() -> impl IntoView {
     // Members see the nodes but cannot change them.
     let me = me();
     let params = use_params_map();
+    let query = use_query_map();
     // Stored, so the closures using it can be copied into the views.
     let navigate = StoredValue::new_local(use_navigate());
     let nodes = polled(Some(Duration::from_secs(5)), || async {
@@ -37,13 +45,25 @@ pub fn Nodes() -> impl IntoView {
                 .with(|n| n.as_ref()?.first().map(|n| n.name.clone()))
         })
     });
+    // Volumes were a section of this page once: `#volumes` links land on the tab.
+    let tab = Memo::new(move |_| {
+        query.read().get("tab").unwrap_or_else(|| {
+            let hash = window().location().hash().unwrap_or_default();
+            if hash == "#volumes" {
+                "volumes"
+            } else {
+                "overview"
+            }
+            .into()
+        })
+    });
     let node = Signal::derive(move || {
         let name = current.get()?;
         nodes
             .data
             .with(|n| n.as_ref()?.iter().find(|n| n.name == name).cloned())
     });
-    // What the node's part of the page is drawn from; the rest follows the polls.
+    // What the tabs are drawn from; the rest follows the polls.
     let shape = Memo::new(move |_| {
         node.with(|n| {
             n.as_ref().map(|n| {
@@ -57,8 +77,30 @@ pub fn Nodes() -> impl IntoView {
             })
         })
     });
-    let go = move |path: &str| navigate.with_value(|n| n(path, Default::default()));
-    let pick = move |name: String| go(&format!("/nodes/{name}"));
+    let connected = move || node.with(|n| n.as_ref().is_some_and(|n| n.connected));
+    let local = move || node.with(|n| n.as_ref().is_some_and(|n| n.local));
+    let go = move |path: &str, replace: bool| {
+        navigate.with_value(|n| {
+            n(
+                path,
+                leptos_router::NavigateOptions {
+                    replace,
+                    scroll: !replace,
+                    ..Default::default()
+                },
+            )
+        })
+    };
+    // The tab in a node's URL; the overview needs none.
+    let href = move |name: &str, tab: &str| match tab {
+        "overview" => format!("/nodes/{name}"),
+        tab => format!("/nodes/{name}?tab={tab}"),
+    };
+    let set_tab = Callback::new(move |t: &'static str| {
+        if let Some(name) = current.get_untracked() {
+            go(&href(&name, t), true);
+        }
+    });
 
     let add_open = RwSignal::new(false);
     let new_name = RwSignal::new(String::new());
@@ -84,7 +126,7 @@ pub fn Nodes() -> impl IntoView {
         add_open.set(false);
         // To the node just added (or given a new token).
         if let Some(j) = joined.get_untracked() {
-            pick(j.name);
+            go(&format!("/nodes/{}", j.name), false);
         }
         joined.set(None);
         new_name.set(String::new());
@@ -113,7 +155,7 @@ pub fn Nodes() -> impl IntoView {
             move || {
                 remove_open.set(false);
                 nodes.reload();
-                go("/nodes");
+                go("/nodes", false);
             },
         );
     };
@@ -147,112 +189,117 @@ pub fn Nodes() -> impl IntoView {
             .map(|j| format!("./install.sh agent {}", j.join_token))
             .unwrap_or_default()
     });
+    let this = move || current.get_untracked().unwrap_or_default();
 
-    let detail = move || {
+    let errors = Signal::derive(move || {
+        node.with(|n| {
+            n.as_ref()
+                .filter(|n| n.connected)
+                .map(|n| n.ingress_errors.clone())
+                .unwrap_or_default()
+        })
+    });
+    let never_seen = move || {
+        node.with(|n| {
+            n.as_ref()
+                .is_some_and(|n| !n.connected && n.last_seen.is_none())
+        })
+    };
+
+    // The tab's content, rebuilt only when the node or its shape changes.
+    let content = move || {
         let (name, connected, _) = shape.get()?;
         let n = node.get_untracked()?;
-        let local = n.local;
-        let storage = Signal::derive(move || node.with(|n| n.as_ref()?.storage.clone()));
-        let orphaned = orphaned_on(volumes, name.clone());
-        let live = Signal::derive(move || node.with(|n| n.as_ref()?.stats.clone()));
-        // The period the charts cover, picked in the card's head; for a node
-        // that is away, long enough to show when it was last there.
-        let range = RwSignal::new(if connected { Range::Hour } else { Range::Day });
-        let metrics = n.stats.clone().map(|s| {
-            view! { <NodeMetrics name=name.clone() totals=s live connected storage range/> }
-        });
-        let errors = Signal::derive(move || {
-            node.with(|n| {
-                n.as_ref()
-                    .filter(|n| n.connected)
-                    .map(|n| n.ingress_errors.clone())
-                    .unwrap_or_default()
-            })
-        });
-        let has_notes = storage_notes_shown(storage, orphaned);
-        let this = StoredValue::new(name.clone());
-        Some(view! {
-            <section class="node-detail">
-                <div class="node-wrap">
-                    <article class="card node-card">
-                        <header class="card-head">
-                            <div>
-                                <div class="node-title-row">
-                                    <h2 class="node-title">{name.clone()}</h2>
-                                    <OnlineBadge online=connected/>
-                                </div>
-                                <div class="muted small">{move || node.with(|n| n.as_ref().map(node_facts))}</div>
-                            </div>
-                            {metrics.is_some().then(|| view! { <RangePicker range/> })}
-                        </header>
-                        <IngressNote errors/>
-                        {(!connected).then(|| view! { <p class="muted small">{not_reporting(&n)}</p> })}
-                        {metrics}
+        Some(match tab.get().as_str() {
+            "ports" => view! { <Ports node=name/> }.into_any(),
+            "volumes" => view! { <NodeVolumes node=name volumes/> }.into_any(),
+            _ => {
+                let storage = Signal::derive(move || node.with(|n| n.as_ref()?.storage.clone()));
+                let live = Signal::derive(move || node.with(|n| n.as_ref()?.stats.clone()));
+                let orphaned = orphaned_on(volumes, name.clone());
+                let has_notes = storage_notes_shown(storage, orphaned);
+                let volumes_href = href(&name, "volumes");
+                view! {
+                    {n.stats.clone().map(|totals| view! {
+                        <NodeMetrics name=name.clone() totals live connected storage/>
+                    })}
+                    <p class="node-notes small muted">
                         <Show when=move || has_notes.get()>
-                            <p class="node-notes small muted">
-                                <StorageNotes storage orphaned volumes_href="#volumes"/>
-                            </p>
+                            <StorageNotes storage orphaned volumes_href=volumes_href.clone()/>
+                            " "
                         </Show>
-                    </article>
-                    <Show when=move || me.is_admin()>
-                        <div class="card-actions">
-                            <Show when=move || connected>
-                                <button class="link-button" title="Remove dangling images and build cache unused for a week"
-                                    on:click=move |_| prune(&this.get_value(), false)>"Clean up"</button>
-                                <button class="link-button" title="Also drop the whole build cache (next builds start from scratch) and the images kept for rollbacks"
-                                    on:click=move |_| prune(&this.get_value(), true)>"Deep clean"</button>
-                            </Show>
-                            <button class="link-button" on:click=move |_| {
-                                ip_value.set(node.with_untracked(|n| {
-                                    n.as_ref().and_then(|n| n.public_ip.clone()).unwrap_or_default()
-                                }));
-                                ip_open.set(true);
-                            }>"Public IP"</button>
-                            <Show when=move || !local>
-                                <button class="link-button" on:click=move |_| token_for(this.get_value())>"New join token"</button>
-                                <button class="link-button danger push-right" on:click=move |_| remove_open.set(true)>"Remove"</button>
-                            </Show>
-                        </div>
-                    </Show>
-                </div>
-                <p class="muted small after-cards">
-                    "Nodes clean up after builds on their own: every 6 hours, and harder when the disk is 85 % full."
-                </p>
-            </section>
-            <Ports node=name.clone()/>
-            <NodeVolumes node=name volumes/>
+                        "Nodes clean up after builds on their own: every 6 hours, and harder when the disk is 85 % full."
+                    </p>
+                }
+                .into_any()
+            }
         })
     };
 
     view! {
         <div class="page">
             <header class="page-head">
-                <div class="title-row">
-                    <h1>"Nodes"</h1>
-                    <Show when=move || nodes.data.with(|n| n.as_ref().is_some_and(|n| !n.is_empty()))>
-                        <select class="node-picker" aria-label="Node"
-                            on:change=move |ev| pick(event_target_value(&ev))
-                            prop:value=move || current.get().unwrap_or_default()>
-                            <For each=move || nodes.data.get().unwrap_or_default() key=|n| (n.name.clone(), n.connected) let:n>
-                                <option value=n.name.clone()
-                                    selected={
-                                        let name = n.name.clone();
-                                        move || current.with(|c| c.as_ref() == Some(&name))
-                                    }>
-                                    {if n.connected { n.name.clone() } else { format!("{} (offline)", n.name) }}
-                                </option>
-                            </For>
-                        </select>
-                    </Show>
+                <div>
+                    <span class="crumb">"Node"</span>
+                    <div class="title-row">
+                        <Show when=move || current.with(Option::is_some) fallback=|| view! { <h1>"Nodes"</h1> }>
+                            <Menu label=Signal::derive(move || current.get().unwrap_or_default()) heading=true start=true
+                                title="Switch to another node">
+                                <For each=move || nodes.data.get().unwrap_or_default()
+                                    key=|n| (n.name.clone(), n.connected)
+                                    children=move |n| {
+                                        let (to, here) = (n.name.clone(), n.name.clone());
+                                        let link = move || href(&to, &tab.get());
+                                        let class = move || if current.with(|c| c.as_ref() == Some(&here)) { "menu-item active" } else { "menu-item" };
+                                        let dot = if n.connected { "dot dot-good" } else { "dot dot-critical" };
+                                        view! {
+                                            <A href=link attr:class=class attr:role="menuitem">
+                                                <span class=dot aria-hidden="true"></span>
+                                                {n.name}
+                                                {(!n.connected).then(|| view! { <span class="muted small">"offline"</span> })}
+                                            </A>
+                                        }
+                                    }/>
+                                <Show when=move || me.is_admin()>
+                                    <div class="menu-sep" role="separator"></div>
+                                    <button class="menu-item" role="menuitem" on:click=move |_| add_open.set(true)>"Add a node…"</button>
+                                </Show>
+                            </Menu>
+                        </Show>
+                        <Show when=move || node.with(Option::is_some)>
+                            <OnlineBadge online=Signal::derive(connected)/>
+                        </Show>
+                    </div>
+                    <div class="muted small subtitle">{move || node.with(|n| n.as_ref().map(node_facts))}</div>
                 </div>
-                <Show when=move || me.is_admin()>
-                    <button class="button button-primary" on:click=move |_| add_open.set(true)>"Add node"</button>
+                <Show when=move || me.is_admin() && node.with(Option::is_some)>
+                    <div class="actions">
+                        <Show when=connected>
+                            <button class="button" title="Remove dangling images and build cache unused for a week"
+                                on:click=move |_| prune(&this(), false)>"Clean up"</button>
+                            <button class="button" title="Also drop the whole build cache (next builds start from scratch) and the images kept for rollbacks"
+                                on:click=move |_| prune(&this(), true)>"Deep clean"</button>
+                        </Show>
+                        <button class="button" title="The address this node's domains point to" on:click=move |_| {
+                            ip_value.set(node.with_untracked(|n| {
+                                n.as_ref().and_then(|n| n.public_ip.clone()).unwrap_or_default()
+                            }));
+                            ip_open.set(true);
+                        }>"Public IP"</button>
+                        <Show when=move || !local()>
+                            <Menu label="More">
+                                <button class="menu-item" role="menuitem" on:click=move |_| token_for(this())>"New join token…"</button>
+                                <button class="menu-item danger" role="menuitem" on:click=move |_| remove_open.set(true)>"Remove node…"</button>
+                            </Menu>
+                        </Show>
+                    </div>
                 </Show>
             </header>
-            <p class="muted lead">
-                "Servers that run apps. Each one runs an agent that connects to this server and serves its own apps' domains: it needs Docker, and ports 80 and 443 open."
-            </p>
             <ErrorNote error=nodes.error/>
+            <IngressNote errors/>
+            <Show when=never_seen>
+                <div class="note">"Not connected yet: start its agent with the join command (More, New join token)."</div>
+            </Show>
             <Show when=move || nodes.loaded() fallback=Loading>
                 <Show when=move || wanted.get().is_some() && node.with(Option::is_none)>
                     <div class="empty">
@@ -260,7 +307,10 @@ pub fn Nodes() -> impl IntoView {
                         <p><A href="/nodes">"See the nodes"</A></p>
                     </div>
                 </Show>
-                {detail}
+                <Show when=move || node.with(Option::is_some)>
+                    <TabBar tabs=Signal::stored(TABS.to_vec()) active=tab on_pick=set_tab/>
+                </Show>
+                {content}
             </Show>
         </div>
 
@@ -269,6 +319,9 @@ pub fn Nodes() -> impl IntoView {
                 when=move || joined.with(Option::is_some)
                 fallback=move || view! {
                     <form class="form" on:submit=add>
+                        <p class="muted small">
+                            "A node is a server that runs apps. Its agent connects to this server and serves its own apps' domains: it needs Docker, and ports 80 and 443 open."
+                        </p>
                         <label class="field">
                             <span>"Name"</span>
                             <input type="text" bind:value=new_name required placeholder="eu-2"
@@ -328,16 +381,10 @@ pub fn Nodes() -> impl IntoView {
     }
 }
 
-/// Public IP, CPU, cores, agent and uptime, on one line.
+/// What the node is, on one line under its name, as an app's page says what
+/// the app runs: hardware, address, uptime (or when it was last seen), agent.
 fn node_facts(node: &NodeView) -> String {
-    let mut facts = vec![
-        node.public_ip
-            .clone()
-            .unwrap_or_else(|| "no public IP yet".into()),
-    ];
-    if node.public_ip_manual {
-        facts[0].push_str(" (set by hand)");
-    }
+    let mut facts = vec![];
     if let Some(s) = &node.stats {
         if !s.arch.is_empty() {
             facts.push(s.arch.clone());
@@ -347,15 +394,24 @@ fn node_facts(node: &NodeView) -> String {
             s.cpus,
             if s.cpus == 1 { "" } else { "s" }
         ));
+        facts.push(format!("{} memory", bytes(s.mem_total)));
+        facts.push(format!("{} disk", bytes(s.disk_total)));
+    }
+    facts.push(match (&node.public_ip, node.public_ip_manual) {
+        (Some(ip), true) => format!("{ip} (set by hand)"),
+        (Some(ip), false) => ip.clone(),
+        (None, _) => "no public IP yet".into(),
+    });
+    match (&node.stats, node.connected, node.last_seen) {
+        (Some(s), true, _) => facts.push(format!("up {}", uptime(s.uptime))),
+        (_, false, Some(at)) => facts.push(format!("last seen {}", ago(at))),
+        _ => {}
     }
     if node.local {
         facts.push("this server".into());
     }
     if let Some(v) = &node.agent_version {
         facts.push(format!("agent {v}"));
-    }
-    if let Some(s) = node.stats.as_ref().filter(|_| node.connected) {
-        facts.push(format!("up {}", uptime(s.uptime)));
     }
     facts.join(" · ")
 }
@@ -377,9 +433,10 @@ pub fn not_reporting(node: &NodeView) -> String {
     }
 }
 
-/// The node's CPU, memory and disk, one row each: the bar for now (from `live`,
-/// else the `totals` snapshot; none while offline) beside the chart over the
-/// `range`. The disk bar says what takes the space.
+/// The node's CPU, memory and disk, one panel each: the figure for now (from
+/// `live`, else the `totals` snapshot; none while offline), its bar, then its
+/// chart over the period picked above them. The disk bar says what takes the
+/// space. Offline, the period starts long enough to show when it was last there.
 #[component]
 fn NodeMetrics(
     name: String,
@@ -387,8 +444,8 @@ fn NodeMetrics(
     live: Signal<Option<NodeStats>>,
     connected: bool,
     storage: Signal<Option<StorageReport>>,
-    range: RwSignal<Range>,
 ) -> impl IntoView {
+    let range = RwSignal::new(if connected { Range::Hour } else { Range::Day });
     let UsageFeed {
         cpu,
         mem,
@@ -401,55 +458,77 @@ fn NodeMetrics(
     );
     let (cores, mem_total, disk_total) = (totals.cpus, totals.mem_total, totals.disk_total);
     let now = Signal::derive(move || live.get().unwrap_or_else(|| totals.clone()));
-    // Offline, nothing is current: the name only, its history beside it.
-    let offline = |label: &'static str| {
-        view! {
-            <div class="meter">
-                <div class="meter-head"><span class="meter-label">{label}</span></div>
-            </div>
+    let cpu_share = Signal::derive(move || now.get().cpu_percent as f64);
+    let mem_share = Signal::derive(move || percent(now.get().mem_used, mem_total));
+    let disk_used = Signal::derive(move || now.get().disk_used);
+    // Offline, nothing is current: a dash, and the history under it.
+    let figure = move |value: Signal<String>, of: String| {
+        if connected {
+            view! {
+                <div class="metric-figure">
+                    <span class="metric-value">{move || value.get()}</span>
+                    <span class="metric-of">{of}</span>
+                </div>
+            }
+            .into_any()
+        } else {
+            view! {
+                <div class="metric-figure">
+                    <span class="metric-value muted">"—"</span>
+                    <span class="metric-of">"offline"</span>
+                </div>
+            }
+            .into_any()
         }
     };
-    let (cpu_now, mem_now, disk_now) = if connected {
-        (
-            view! {
-                <Meter label="CPU" percent=Signal::derive(move || now.get().cpu_percent as f64)
-                    detail=Signal::derive(move || format!("{:.0} % of {cores} core{}", now.get().cpu_percent, if cores == 1 { "" } else { "s" }))/>
-            }
-            .into_any(),
-            view! {
-                <Meter label="Memory" percent=Signal::derive(move || percent(now.get().mem_used, mem_total))
-                    detail=Signal::derive(move || format!("{} / {}", bytes(now.get().mem_used), bytes(mem_total)))/>
-            }
-            .into_any(),
-            view! {
-                <DiskMeter storage used=Signal::derive(move || now.get().disk_used) total=disk_total/>
-            }
-            .into_any(),
-        )
-    } else {
-        (
-            offline("CPU").into_any(),
-            offline("Memory").into_any(),
-            offline("Disk").into_any(),
-        )
+    let warn = |share: Signal<f64>| {
+        let high = move || connected && share.get() >= 90.0;
+        view! {
+            <Show when=high>
+                <span class="meter-warn" title="above 90 %">"⚠"</span>
+            </Show>
+        }
     };
     view! {
-        <div class="node-metrics">
-            <div class="metric-row">
-                <div class="metric-now">{cpu_now}</div>
+        <div class="charts-head">
+            <h2 class="section-title">"Usage"</h2>
+            <RangePicker range/>
+        </div>
+        <div class="metric-grid">
+            <section class="metric-panel">
+                <div class="metric-label">"CPU" {warn(cpu_share)}</div>
+                {figure(
+                    Signal::derive(move || format!("{:.0} %", cpu_share.get())),
+                    format!("of {cores} core{}", if cores == 1 { "" } else { "s" }),
+                )}
+                {connected.then(|| view! {
+                    <Meter label="CPU" bare=true percent=cpu_share detail=Signal::stored(String::new())/>
+                })}
                 <Sparkline title="CPU" points=cpu span=span gap=gap max=Signal::stored(Some(100.0))
-                    format=|v| format!("{v:.1} %") bare=true/>
-            </div>
-            <div class="metric-row">
-                <div class="metric-now">{mem_now}</div>
+                    format=|v| format!("{v:.1} %") bare=true axis=true/>
+            </section>
+            <section class="metric-panel">
+                <div class="metric-label">"Memory" {warn(mem_share)}</div>
+                {figure(
+                    Signal::derive(move || bytes(now.get().mem_used)),
+                    format!("of {}", bytes(mem_total)),
+                )}
+                {connected.then(|| view! {
+                    <Meter label="Memory" bare=true percent=mem_share detail=Signal::stored(String::new())/>
+                })}
                 <Sparkline title="Memory" points=mem span=span gap=gap max=Signal::stored(Some(mem_total as f64))
-                    format=|v| bytes(v as u64) bare=true/>
-            </div>
-            <div class="metric-row">
-                <div class="metric-now">{disk_now}</div>
+                    format=|v| bytes(v as u64) bare=true axis=true/>
+            </section>
+            <section class="metric-panel">
+                <div class="metric-label">"Disk" {warn(Signal::derive(move || percent(disk_used.get(), disk_total)))}</div>
+                {figure(
+                    Signal::derive(move || bytes(disk_used.get())),
+                    format!("of {}", bytes(disk_total)),
+                )}
+                {connected.then(|| view! { <DiskMeter storage used=disk_used total=disk_total bare=true/> })}
                 <Sparkline title="Disk" points=disk span=span gap=gap max=Signal::stored(Some(disk_total as f64))
                     format=|v| bytes(v as u64) bare=true axis=true/>
-            </div>
+            </section>
         </div>
     }
 }
@@ -464,7 +543,7 @@ fn IngressNote(#[prop(into)] errors: Signal<Vec<String>>) -> impl IntoView {
                 "Apps on this node are not reachable over the web: "
                 {move || errors.get().join("; ")}
                 ". Another program (a web server?) holds the port; façade keeps retrying. "
-                "The Ports list below shows which."
+                "The Ports tab shows which."
             </div>
         </Show>
     }
@@ -536,70 +615,67 @@ fn Ports(node: String) -> impl IntoView {
         rows
     });
     view! {
-        <section class="node-ports">
-            <div class="toolbar">
-                <h2 class="section-title">"Ports"</h2>
-                <Show when=move || { total() > 0 }>
-                    <input type="search" class="table-filter push-right" placeholder="Filter by program, app or port"
-                        aria-label="Filter ports" autocomplete="off" bind:value=filter/>
-                    <span class="muted small" aria-live="polite">
-                        {move || {
-                            let (shown, total) = (rows.with(Vec::len), total());
-                            if shown == total { format!("{total} open") } else { format!("{shown} of {total}") }
-                        }}
-                    </span>
-                </Show>
-            </div>
-            <p class="muted small">"Every TCP and UDP port open on the node, façade's or not. A port held by another program cannot be published by an app."</p>
-            <ErrorNote error=listeners.error/>
-            <Show when=move || listeners.loaded() fallback=Loading>
-                <Show when=move || { total() > 0 }
-                    fallback=|| view! { <div class="empty"><p>"Nothing is listening."</p></div> }>
-                    <div class="table-wrap">
-                        <table class="table">
-                            <thead>
-                                <tr>
-                                    <SortTh sort col=0 label="Port" num=true/>
-                                    <SortTh sort col=1 label="Protocol"/>
-                                    <SortTh sort col=2 label="Address"/>
-                                    <SortTh sort col=3 label="Process"/>
-                                    <SortTh sort col=4 label="Used by"/>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <For each=move || rows.get()
-                                    key=|l| (l.protocol, l.address.clone(), l.port, l.pid, l.app.clone())
-                                    let:l>
-                                    <tr>
-                                        <td class="num">{l.port}</td>
-                                        <td>{l.protocol.to_string()}</td>
-                                        <td><code>{l.address.clone()}</code></td>
-                                        <td class="muted">{Some(process(&l)).filter(|p| !p.is_empty()).unwrap_or_else(|| "—".into())}</td>
-                                        <td>
-                                            {match (l.app.clone(), l.description.clone()) {
-                                                (Some(app), what) if app == "facade" => view! {
-                                                    <span>{what.unwrap_or_else(|| "façade".into())}</span>
-                                                }.into_any(),
-                                                (Some(app), what) => view! {
-                                                    <A href=format!("/apps/{app}") attr:class="strong-link">{app.clone()}</A>
-                                                    {what.map(|w| view! { <span class="muted small">{format!(" · {w}")}</span> })}
-                                                }.into_any(),
-                                                (None, what) => view! {
-                                                    <span class="muted">{what.unwrap_or_else(|| "another program".into())}</span>
-                                                }.into_any(),
-                                            }}
-                                        </td>
-                                    </tr>
-                                </For>
-                                <Show when=move || rows.with(Vec::is_empty)>
-                                    <tr><td colspan="5" class="muted small">"No port matches."</td></tr>
-                                </Show>
-                            </tbody>
-                        </table>
-                    </div>
-                </Show>
+        <div class="toolbar">
+            <span class="muted small">"Every TCP and UDP port open on the node, façade's or not. A port held by another program cannot be published by an app."</span>
+            <Show when=move || { total() > 0 }>
+                <input type="search" class="table-filter push-right" placeholder="Filter by program, app or port"
+                    aria-label="Filter ports" autocomplete="off" bind:value=filter/>
+                <span class="muted small" aria-live="polite">
+                    {move || {
+                        let (shown, total) = (rows.with(Vec::len), total());
+                        if shown == total { format!("{total} open") } else { format!("{shown} of {total}") }
+                    }}
+                </span>
             </Show>
-        </section>
+        </div>
+        <ErrorNote error=listeners.error/>
+        <Show when=move || listeners.loaded() fallback=Loading>
+            <Show when=move || { total() > 0 }
+                fallback=|| view! { <div class="empty"><p>"Nothing is listening."</p></div> }>
+                <div class="table-wrap">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <SortTh sort col=0 label="Port" num=true/>
+                                <SortTh sort col=1 label="Protocol"/>
+                                <SortTh sort col=2 label="Address"/>
+                                <SortTh sort col=3 label="Process"/>
+                                <SortTh sort col=4 label="Used by"/>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <For each=move || rows.get()
+                                key=|l| (l.protocol, l.address.clone(), l.port, l.pid, l.app.clone())
+                                let:l>
+                                <tr>
+                                    <td class="num">{l.port}</td>
+                                    <td>{l.protocol.to_string()}</td>
+                                    <td><code>{l.address.clone()}</code></td>
+                                    <td class="muted">{Some(process(&l)).filter(|p| !p.is_empty()).unwrap_or_else(|| "—".into())}</td>
+                                    <td>
+                                        {match (l.app.clone(), l.description.clone()) {
+                                            (Some(app), what) if app == "facade" => view! {
+                                                <span>{what.unwrap_or_else(|| "façade".into())}</span>
+                                            }.into_any(),
+                                            (Some(app), what) => view! {
+                                                <A href=format!("/apps/{app}") attr:class="strong-link">{app.clone()}</A>
+                                                {what.map(|w| view! { <span class="muted small">{format!(" · {w}")}</span> })}
+                                            }.into_any(),
+                                            (None, what) => view! {
+                                                <span class="muted">{what.unwrap_or_else(|| "another program".into())}</span>
+                                            }.into_any(),
+                                        }}
+                                    </td>
+                                </tr>
+                            </For>
+                            <Show when=move || rows.with(Vec::is_empty)>
+                                <tr><td colspan="5" class="muted small">"No port matches."</td></tr>
+                            </Show>
+                        </tbody>
+                    </table>
+                </div>
+            </Show>
+        </Show>
     }
 }
 
@@ -615,23 +691,6 @@ fn NodeVolumes(node: String, volumes: Polled<Vec<VolumeView>>) -> impl IntoView 
                 .cloned()
                 .collect::<Vec<_>>()
         })
-    });
-    // Arriving at `#volumes` from another page: the section only now has its
-    // rows, after the router looked for it.
-    let section = NodeRef::<leptos::html::Section>::new();
-    Effect::new(move |done: Option<bool>| {
-        if done == Some(true) || !volumes.loaded() {
-            return done.unwrap_or(false);
-        }
-        if window().location().hash().is_ok_and(|h| h != "#volumes") {
-            return true;
-        }
-        let Some(el) = section.get() else {
-            return false;
-        };
-        // Once the sections above (ports, charts) have had their data too.
-        set_timeout(move || el.scroll_into_view(), Duration::from_millis(400));
-        true
     });
     let volume_target = RwSignal::new(None::<VolumeView>);
     let volume_open = RwSignal::new(false);
@@ -650,10 +709,10 @@ fn NodeVolumes(node: String, volumes: Polled<Vec<VolumeView>>) -> impl IntoView 
         );
     };
     view! {
-        <section id="volumes" node_ref=section>
-            <h2 class="section-title">"Volumes"</h2>
+        <ErrorNote error=volumes.error/>
+        <Show when=move || volumes.loaded() fallback=Loading>
             <Show when=move || here.with(|v| !v.is_empty())
-                fallback=|| view! { <p class="muted small">"No volumes on this node. Apps get one when their settings list it (databases have one)."</p> }>
+                fallback=|| view! { <div class="empty"><p>"No volumes on this node. Apps get one when their settings list it (databases have one)."</p></div> }>
                 <div class="table-wrap">
                     <table class="table">
                         <thead><tr><th>"Volume"</th><th>"App"</th><th class="num">"Size"</th><th>"State"</th><th></th></tr></thead>
@@ -696,9 +755,9 @@ fn NodeVolumes(node: String, volumes: Polled<Vec<VolumeView>>) -> impl IntoView 
                         </tbody>
                     </table>
                 </div>
-                <p class="muted small">"Orphaned volumes belong to deleted apps, or were removed from an app's settings. Their data stays until you delete them."</p>
+                <p class="muted small after-cards">"Orphaned volumes belong to deleted apps, or were removed from an app's settings. Their data stays until you delete them."</p>
             </Show>
-        </section>
+        </Show>
 
         <Modal open=volume_open title="Delete volume">
             <p>
@@ -764,9 +823,9 @@ fn StorageNotes(
         {move || {
             let (count, size) = orphaned.get();
             (count > 0).then(|| view! {
-                <a href=volumes_href.clone() class="disk-orphans">
+                <A href=volumes_href.clone() attr:class="disk-orphans">
                     {format!("{count} orphaned volume{} ({}) no app declares.", if count == 1 { "" } else { "s" }, bytes(size))}
-                </a>
+                </A>
                 " "
             })
         }}

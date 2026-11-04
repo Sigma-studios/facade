@@ -37,25 +37,28 @@ pub fn OnlineBadge(#[prop(into)] online: Signal<bool>) -> impl IntoView {
 }
 
 /// A usage bar: label, value text, and a fill that turns critical (with an icon)
-/// from 90 %.
+/// from 90 %. `bare`: the bar alone, under a figure that already says it.
 #[component]
 pub fn Meter(
     label: &'static str,
     #[prop(into)] percent: Signal<f64>,
     #[prop(into)] detail: Signal<String>,
+    #[prop(optional)] bare: bool,
 ) -> impl IntoView {
     let high = move || percent.get() >= 90.0;
     view! {
         <div class="meter">
-            <div class="meter-head">
-                <span class="meter-label">{label}</span>
-                <span class="meter-value">
-                    <Show when=high>
-                        <span class="meter-warn" title="above 90 %">"⚠ "</span>
-                    </Show>
-                    {move || detail.get()}
-                </span>
-            </div>
+            {(!bare).then(|| view! {
+                <div class="meter-head">
+                    <span class="meter-label">{label}</span>
+                    <span class="meter-value">
+                        <Show when=high>
+                            <span class="meter-warn" title="above 90 %">"⚠ "</span>
+                        </Show>
+                        {move || detail.get()}
+                    </span>
+                </div>
+            })}
             <div class="meter-track" role="meter" aria-label=label
                 aria-valuenow=move || format!("{:.0}", percent.get())
                 aria-valuemin="0" aria-valuemax="100">
@@ -516,6 +519,74 @@ pub fn usage_feed(url: Signal<String>, range: Signal<Range>) -> UsageFeed {
     }
 }
 
+/// A page's tabs; `active` is the key of the one shown.
+#[component]
+pub fn TabBar(
+    #[prop(into)] tabs: Signal<Vec<(&'static str, &'static str)>>,
+    #[prop(into)] active: Signal<String>,
+    on_pick: Callback<&'static str>,
+) -> impl IntoView {
+    view! {
+        <div class="tabs" role="tablist">
+            {move || tabs.get().into_iter().map(|(key, label)| view! {
+                <button role="tab" class=move || if active.get() == key { "tab active" } else { "tab" }
+                    aria-selected=move || (active.get() == key).to_string()
+                    on:click=move |_| on_pick.run(key)>
+                    {label}
+                </button>
+            }).collect_view()}
+        </div>
+    }
+}
+
+/// A button opening a short list (`children`: buttons or links); picking one
+/// closes it, as do a click elsewhere and Escape. `heading`: the label is the
+/// page's title (a switcher between pages of the same kind). `start`: the list
+/// lines up with the button's left edge rather than its right.
+#[component]
+pub fn Menu(
+    #[prop(into)] label: Signal<String>,
+    #[prop(optional)] heading: bool,
+    #[prop(optional)] start: bool,
+    #[prop(optional)] title: &'static str,
+    children: Children,
+) -> impl IntoView {
+    let menu = NodeRef::<leptos::html::Details>::new();
+    let close = move || {
+        if let Some(menu) = menu.get_untracked() {
+            let _ = menu.remove_attribute("open");
+        }
+    };
+    let outside = window_event_listener(leptos::ev::click, move |ev| {
+        use wasm_bindgen::JsCast;
+        let Some(menu) = menu.get_untracked() else {
+            return;
+        };
+        let inside = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+            .is_some_and(|t| menu.contains(Some(&t)));
+        if !inside {
+            let _ = menu.remove_attribute("open");
+        }
+    });
+    on_cleanup(move || outside.remove());
+    let caret = view! { <span class="menu-caret" aria-hidden="true">"▾"</span> };
+    view! {
+        <details class="menu" class:menu-heading=heading node_ref=menu
+            on:keydown=move |ev| if ev.key() == "Escape" { close() }>
+            {if heading {
+                view! { <summary class="menu-title" title=title><h1>{move || label.get()}</h1>{caret}</summary> }.into_any()
+            } else {
+                view! { <summary class="button menu-button" title=title>{move || label.get()}{caret}</summary> }.into_any()
+            }}
+            <div class="menu-list" class:menu-start=start role="menu" on:click=move |_| close()>
+                {children()}
+            </div>
+        </details>
+    }
+}
+
 #[component]
 pub fn Modal(
     #[prop(into)] open: RwSignal<bool>,
@@ -831,12 +902,14 @@ fn backups_hint(storage: &StorageReport) -> String {
 /// is split into one coloured part each (free space last), and hovering a part
 /// shows an infotip saying what it holds; until then, a plain meter. `caption`:
 /// no label, the figures under the bar (in a table whose column names it).
+/// `bare`: the bar alone, under a figure that already says it.
 #[component]
 pub fn DiskMeter(
     #[prop(into)] storage: Signal<Option<StorageReport>>,
     #[prop(into)] used: Signal<u64>,
     total: u64,
     #[prop(optional)] caption: bool,
+    #[prop(optional)] bare: bool,
 ) -> impl IntoView {
     let share = move || percent(used.get(), total);
     let high = move || share() >= 90.0;
@@ -916,7 +989,7 @@ pub fn DiskMeter(
     };
     view! {
         <div class="meter">
-            {(!caption).then(|| view! {
+            {(!caption && !bare).then(|| view! {
                 <div class="meter-head">
                     <span class="meter-label">"Disk"</span>
                     <span class="meter-value">{figures()}</span>
