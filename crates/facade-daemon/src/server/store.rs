@@ -1075,6 +1075,33 @@ impl Store {
         Ok(rows)
     }
 
+    /// The latest `limit` deployments of `apps` (every app, deleted ones too,
+    /// with `None`) in `status` if given, and how many there are in all.
+    pub fn find_deployments(
+        &self,
+        apps: Option<&[String]>,
+        status: Option<&str>,
+        limit: u32,
+    ) -> anyhow::Result<(u64, Vec<DeploymentView>)> {
+        let apps = apps.map(serde_json::to_string).transpose()?;
+        let filter = "(?1 IS NULL OR app IN (SELECT value FROM json_each(?1)))
+             AND (?2 IS NULL OR status = ?2)";
+        let conn = self.0.lock();
+        let total: u64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM deployments WHERE {filter}"),
+            params![apps, status],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DEPLOYMENT_COLUMNS}, '' FROM deployments WHERE {filter}
+             ORDER BY started_at DESC, rowid DESC LIMIT ?3"
+        ))?;
+        let rows = stmt
+            .query_map(params![apps, status, limit], Self::deployment_row)?
+            .collect::<Result<_, _>>()?;
+        Ok((total, rows))
+    }
+
     pub fn get_deployment(&self, id: Uuid) -> anyhow::Result<Option<DeploymentView>> {
         Ok(self
             .0
@@ -1788,6 +1815,35 @@ fn migrate_from_branch_logins(conn: &Connection) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployments_are_found_and_counted() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        for (app, fail) in [
+            ("web", false),
+            ("web", true),
+            ("api", false),
+            ("gone", true),
+        ] {
+            let id = Uuid::new_v4();
+            store.create_deployment(id, app, 1, None).unwrap();
+            store
+                .finish_deployment(id, fail.then_some("boom"), false)
+                .unwrap();
+        }
+        let (total, rows) = store.find_deployments(None, None, 2).unwrap();
+        assert_eq!((total, rows.len()), (4, 2));
+        let apps = ["web".to_string(), "api".to_string()];
+        let (total, rows) = store.find_deployments(Some(&apps), None, 10).unwrap();
+        assert_eq!((total, rows.len()), (3, 3));
+        let (total, rows) = store
+            .find_deployments(Some(&apps), Some("failed"), 10)
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].app, "web");
+        let (total, rows) = store.find_deployments(Some(&[]), None, 10).unwrap();
+        assert_eq!((total, rows.len()), (0, 0));
+    }
 
     #[test]
     fn usage_is_bucketed_and_merged() {

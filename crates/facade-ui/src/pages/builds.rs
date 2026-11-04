@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use facade_core::api::{AppView, BuildsView, DeploymentView, QueuedBuild};
+use facade_core::api::{AppView, BuildsView, DeploymentView, DeploymentsPage, QueuedBuild};
 use facade_core::proto::BuildState;
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -8,7 +8,7 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 
 use super::app::DeployStatus;
 use crate::api;
-use crate::components::{ErrorNote, Loading, MultiSelect, Sort, SortKey, SortTh};
+use crate::components::{ErrorNote, FilterSelect, Loading, MultiSelect, Sort, SortKey, SortTh};
 use crate::util::{ago, polled, run};
 
 fn short(commit: &Option<String>) -> String {
@@ -56,8 +56,25 @@ fn deployment_key(col: usize, d: &DeploymentView) -> SortKey {
 /// The statuses the filter offers, as the API writes them.
 const STATUSES: [&str; 5] = ["queued", "running", "succeeded", "failed", "cancelled"];
 
-/// What every node builds now, what waits, and the latest deployments; filtered
-/// by app and status from the URL (`?app=web,api&status=failed`).
+/// Deployments listed at first, and added by each "Show more".
+const PAGE: u32 = 50;
+
+/// A count with thin spaces between thousands: 12 345.
+fn count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('\u{202f}');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What every node builds now, what waits, and every deployment (the latest
+/// first, more on demand); filtered by app and status from the URL
+/// (`?app=web,api&status=failed`).
 #[component]
 pub fn Builds() -> impl IntoView {
     let query = use_query_map();
@@ -104,21 +121,21 @@ pub fn Builds() -> impl IntoView {
     let apps = polled(Some(Duration::from_secs(30)), || async {
         api::get::<Vec<AppView>>("/api/apps").await
     });
-    // The latest across every app are only the last few dozen: with apps picked,
-    // their own histories.
-    let histories = polled(Some(Duration::from_secs(5)), move || {
-        let picked = picked.get();
-        async move {
-            let lists = futures_util::future::join_all(picked.iter().map(|app| {
-                let path = format!("/api/apps/{app}/deployments");
-                async move { api::get::<Vec<DeploymentView>>(&path).await }
-            }))
-            .await;
-            // A deleted app (left in a bookmark, say) just has none.
-            let mut all = lists.into_iter().flatten().flatten().collect::<Vec<_>>();
-            all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            Ok((picked, all))
-        }
+    // How many to list; back to one page when the filters change.
+    let limit = RwSignal::new(PAGE);
+    Effect::new(move |_| {
+        picked.track();
+        status.track();
+        limit.set(PAGE);
+    });
+    let deployments = polled(Some(Duration::from_secs(3)), move || {
+        let path = format!(
+            "/api/deployments?app={}&status={}&limit={}",
+            picked.get().join(","),
+            status.get(),
+            limit.get()
+        );
+        async move { api::get::<DeploymentsPage>(&path).await }
     });
     let options = Signal::derive(move || {
         let mut names = apps.data.with(|a| {
@@ -133,6 +150,9 @@ pub fn Builds() -> impl IntoView {
                 names.extend(b.recent.iter().map(|d| d.app.clone()));
             }
         });
+        deployments
+            .data
+            .with(|d| names.extend(d.iter().flat_map(|d| &d.deployments).map(|d| d.app.clone())));
         names.extend(picked.get());
         names.sort();
         names.dedup();
@@ -163,28 +183,19 @@ pub fn Builds() -> impl IntoView {
         queue
     });
     let recent = Signal::derive(move || {
-        let picked = picked.get();
         let status = status.get();
-        // The picked apps' histories once they arrive; until then what the latest have.
-        let mut recent = histories
+        let mut recent = deployments
             .data
             .get()
-            .filter(|(p, _)| *p == picked && !picked.is_empty())
-            .map(|(_, all)| all)
-            .unwrap_or_else(|| {
-                builds
-                    .data
-                    .get()
-                    .map(|b| b.recent)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|d| shows(&d.app))
-                    .collect()
-            });
-        recent.retain(|d| status.is_empty() || d.status.to_string() == status);
+            .map(|d| d.deployments)
+            .unwrap_or_default();
+        // Until the server answers for new filters, what the last answer has of them.
+        recent.retain(|d| shows(&d.app) && (status.is_empty() || d.status.to_string() == status));
         recent_sort.apply(&mut recent, deployment_key);
         recent
     });
+    let total = move || deployments.data.with(|d| d.as_ref().map_or(0, |d| d.total));
+    let more = move || recent.with(Vec::len) < total() as usize;
     let total_queue = move || {
         builds
             .data
@@ -203,18 +214,13 @@ pub fn Builds() -> impl IntoView {
                         let set_filters = set_filters.clone();
                         move |apps| set_filters(apps, status.get_untracked())
                     })/>
-                <select class="filter-select" aria-label="Status"
-                    class:filter-active=move || status.with(|s| !s.is_empty())
-                    on:change={
+                <FilterSelect label="Status" all="Any status"
+                    options=Signal::stored(STATUSES.map(String::from).to_vec())
+                    value=status
+                    on_change=Callback::new({
                         let set_filters = set_filters.clone();
-                        move |ev| set_filters(picked.get_untracked(), event_target_value(&ev))
-                    }
-                    prop:value=move || status.get()>
-                    <option value="">"Any status"</option>
-                    {STATUSES.into_iter().map(|s| view! {
-                        <option value=s selected=move || status.with(|x| x == s)>{s}</option>
-                    }).collect_view()}
-                </select>
+                        move |s| set_filters(picked.get_untracked(), s)
+                    })/>
                 <Show when=filtered>
                     <button type="button" class="link-button" on:click={
                         let set_filters = set_filters.clone();
@@ -223,6 +229,7 @@ pub fn Builds() -> impl IntoView {
                 </Show>
             </div>
             <ErrorNote error=builds.error/>
+            <ErrorNote error=deployments.error/>
             <Show when=move || builds.loaded() fallback=Loading>
                 <section>
                     <h2 class="section-title">"Queue"</h2>
@@ -276,7 +283,8 @@ pub fn Builds() -> impl IntoView {
                 </section>
                 <section>
                     <h2 class="section-title">
-                        {move || if picked.with(|p| !p.is_empty()) { "Deployments" } else { "Recent deployments" }}
+                        "Deployments"
+                        {move || deployments.data.with(Option::is_some).then(|| format!(" ({})", count(total())))}
                     </h2>
                     <Show when=move || recent.with(|r| !r.is_empty())
                         fallback=move || view! { <div class="empty"><p>{move || if filtered() {
@@ -313,6 +321,16 @@ pub fn Builds() -> impl IntoView {
                                 </tbody>
                             </table>
                         </div>
+                        <Show when=more>
+                            <div class="table-more">
+                                <span class="muted small">
+                                    {move || format!("Latest {} of {}", recent.with(Vec::len), count(total()))}
+                                </span>
+                                <button type="button" class="button" on:click=move |_| limit.update(|l| *l += PAGE)>
+                                    "Show more"
+                                </button>
+                            </div>
+                        </Show>
                     </Show>
                 </section>
             </Show>

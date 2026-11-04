@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use facade_core::api::{CreateNode, CreatedNode, NodeView, SetNodeIp, UsagePoint, VolumeView};
+use facade_core::api::{CreateNode, CreatedNode, NodeView, SetNodeIp, VolumeView};
 use facade_core::proto::{Listener, NodeStats, StorageReport};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -9,8 +9,8 @@ use leptos_router::hooks::{use_navigate, use_params_map};
 
 use crate::api;
 use crate::components::{
-    CopyField, DiskMeter, ErrorNote, Loading, Meter, Modal, OnlineBadge, Sort, SortKey, SortTh,
-    Trend, UsageCharts,
+    CopyField, DiskMeter, ErrorNote, Loading, Meter, Modal, OnlineBadge, Range, RangePicker, Sort,
+    SortKey, SortTh, Sparkline, UsageFeed, usage_feed,
 };
 use crate::util::{Polled, ago, bytes, me, percent, polled, run, toasts};
 
@@ -155,12 +155,11 @@ pub fn Nodes() -> impl IntoView {
         let storage = Signal::derive(move || node.with(|n| n.as_ref()?.storage.clone()));
         let orphaned = orphaned_on(volumes, name.clone());
         let live = Signal::derive(move || node.with(|n| n.as_ref()?.stats.clone()));
-        let meters = n.stats.clone().filter(|_| connected).map(|s| {
-            let now = Signal::derive(move || {
-                let l = live.get().unwrap_or_else(|| s.clone());
-                (l.cpu_percent, l.mem_used, l.disk_used)
-            });
-            node_meters(&n.stats.clone().unwrap_or_default(), now, storage, None)
+        // The period the charts cover, picked in the card's head; for a node
+        // that is away, long enough to show when it was last there.
+        let range = RwSignal::new(if connected { Range::Hour } else { Range::Day });
+        let metrics = n.stats.clone().map(|s| {
+            view! { <NodeMetrics name=name.clone() totals=s live connected storage range/> }
         });
         let errors = Signal::derive(move || {
             node.with(|n| {
@@ -178,22 +177,23 @@ pub fn Nodes() -> impl IntoView {
                     <article class="card node-card">
                         <header class="card-head">
                             <div>
-                                <h2 class="node-title">{name.clone()}</h2>
+                                <div class="node-title-row">
+                                    <h2 class="node-title">{name.clone()}</h2>
+                                    <OnlineBadge online=connected/>
+                                </div>
                                 <div class="muted small">{move || node.with(|n| n.as_ref().map(node_facts))}</div>
                             </div>
-                            <OnlineBadge online=connected/>
+                            {metrics.is_some().then(|| view! { <RangePicker range/> })}
                         </header>
-                        <IngressNote errors here=true/>
-                        {match meters {
-                            Some(meters) => view! { <div class="meters node-meters">{meters}</div> }.into_any(),
-                            None => view! { <p class="muted small">{not_reporting(&n)}</p> }.into_any(),
-                        }}
+                        <IngressNote errors/>
+                        {(!connected).then(|| view! { <p class="muted small">{not_reporting(&n)}</p> })}
+                        {metrics}
+                        <Show when=move || has_notes.get()>
+                            <p class="node-notes small muted">
+                                <StorageNotes storage orphaned volumes_href="#volumes"/>
+                            </p>
+                        </Show>
                     </article>
-                    <Show when=move || has_notes.get()>
-                        <div class="storage-line small muted">
-                            <StorageNotes storage orphaned volumes_href="#volumes"/>
-                        </div>
-                    </Show>
                     <Show when=move || me.is_admin()>
                         <div class="card-actions">
                             <Show when=move || connected>
@@ -219,7 +219,6 @@ pub fn Nodes() -> impl IntoView {
                     "Nodes clean up after builds on their own: every 6 hours, and harder when the disk is 85 % full."
                 </p>
             </section>
-            <NodeUsage name=name.clone() stats=live/>
             <Ports node=name.clone()/>
             <NodeVolumes node=name volumes/>
         })
@@ -261,7 +260,7 @@ pub fn Nodes() -> impl IntoView {
                         <p><A href="/nodes">"See the nodes"</A></p>
                     </div>
                 </Show>
-                {detail.clone()}
+                {detail}
             </Show>
         </div>
 
@@ -330,7 +329,7 @@ pub fn Nodes() -> impl IntoView {
 }
 
 /// Public IP, CPU, cores, agent and uptime, on one line.
-pub fn node_facts(node: &NodeView) -> String {
+fn node_facts(node: &NodeView) -> String {
     let mut facts = vec![
         node.public_ip
             .clone()
@@ -378,72 +377,86 @@ pub fn not_reporting(node: &NodeView) -> String {
     }
 }
 
-/// A node's CPU, memory and disk meters, from the latest `(cpu %, memory, disk)`;
-/// with `usage`, each has its last hour beside it.
-pub fn node_meters(
-    s: &NodeStats,
-    now: Signal<(f32, u64, u64)>,
+/// The node's CPU, memory and disk, one row each: the bar for now (from `live`,
+/// else the `totals` snapshot; none while offline) beside the chart over the
+/// `range`. The disk bar says what takes the space.
+#[component]
+fn NodeMetrics(
+    name: String,
+    totals: NodeStats,
+    live: Signal<Option<NodeStats>>,
+    connected: bool,
     storage: Signal<Option<StorageReport>>,
-    usage: Option<Polled<Vec<UsagePoint>>>,
-) -> [AnyView; 3] {
-    let (cores, mem_total, disk_total) = (s.cpus, s.mem_total, s.disk_total);
-    let cpu = view! {
-        <Meter label="CPU" percent=Signal::derive(move || now.get().0 as f64)
-            detail=Signal::derive(move || format!("{:.0} % of {cores} cores", now.get().0))/>
-    };
-    let mem = view! {
-        <Meter label="Memory" percent=Signal::derive(move || percent(now.get().1, mem_total))
-            detail=Signal::derive(move || format!("{} / {}", bytes(now.get().1), bytes(mem_total)))/>
-    };
-    let disk = view! {
-        <DiskMeter storage used=Signal::derive(move || now.get().2) total=disk_total/>
-    };
-    let Some(usage) = usage else {
-        return [cpu.into_any(), mem.into_any(), disk.into_any()];
-    };
-    let series = move |f: Box<dyn Fn(&UsagePoint) -> f64 + Send + Sync>| {
-        Signal::derive(move || {
-            usage
-                .data
-                .with(|u| u.iter().flatten().map(|p| (p.at, f(p))).collect::<Vec<_>>())
-        })
-    };
-    let span = Signal::derive(|| {
-        let now = crate::util::now();
-        (now.saturating_sub(3600), now)
-    });
-    [
+    range: RwSignal<Range>,
+) -> impl IntoView {
+    let UsageFeed {
+        cpu,
+        mem,
+        disk,
+        span,
+        gap,
+    } = usage_feed(
+        Signal::stored(format!("/api/nodes/{name}/usage")),
+        range.into(),
+    );
+    let (cores, mem_total, disk_total) = (totals.cpus, totals.mem_total, totals.disk_total);
+    let now = Signal::derive(move || live.get().unwrap_or_else(|| totals.clone()));
+    // Offline, nothing is current: the name only, its history beside it.
+    let offline = |label: &'static str| {
         view! {
-            <div class="meter-row">
-                {cpu}
-                <Trend label="CPU" points=series(Box::new(|p| f64::from(p.cpu))) span=span gap=40
-                    format=Callback::new(|v: f64| format!("{v:.0} %"))/>
+            <div class="meter">
+                <div class="meter-head"><span class="meter-label">{label}</span></div>
             </div>
         }
-        .into_any(),
-        view! {
-            <div class="meter-row">
-                {mem}
-                <Trend label="Memory" points=series(Box::new(move |p| percent(p.mem, mem_total))) span=span gap=40
-                    format=Callback::new(move |v: f64| bytes((v / 100.0 * mem_total as f64) as u64))/>
+    };
+    let (cpu_now, mem_now, disk_now) = if connected {
+        (
+            view! {
+                <Meter label="CPU" percent=Signal::derive(move || now.get().cpu_percent as f64)
+                    detail=Signal::derive(move || format!("{:.0} % of {cores} core{}", now.get().cpu_percent, if cores == 1 { "" } else { "s" }))/>
+            }
+            .into_any(),
+            view! {
+                <Meter label="Memory" percent=Signal::derive(move || percent(now.get().mem_used, mem_total))
+                    detail=Signal::derive(move || format!("{} / {}", bytes(now.get().mem_used), bytes(mem_total)))/>
+            }
+            .into_any(),
+            view! {
+                <DiskMeter storage used=Signal::derive(move || now.get().disk_used) total=disk_total/>
+            }
+            .into_any(),
+        )
+    } else {
+        (
+            offline("CPU").into_any(),
+            offline("Memory").into_any(),
+            offline("Disk").into_any(),
+        )
+    };
+    view! {
+        <div class="node-metrics">
+            <div class="metric-row">
+                <div class="metric-now">{cpu_now}</div>
+                <Sparkline title="CPU" points=cpu span=span gap=gap max=Signal::stored(Some(100.0))
+                    format=|v| format!("{v:.1} %") bare=true/>
             </div>
-        }
-        .into_any(),
-        view! {
-            <div class="meter-row">
-                {disk}
-                <Trend label="Disk" points=series(Box::new(move |p| percent(p.disk.unwrap_or(0), disk_total))) span=span gap=40
-                    format=Callback::new(move |v: f64| bytes((v / 100.0 * disk_total as f64) as u64))/>
+            <div class="metric-row">
+                <div class="metric-now">{mem_now}</div>
+                <Sparkline title="Memory" points=mem span=span gap=gap max=Signal::stored(Some(mem_total as f64))
+                    format=|v| bytes(v as u64) bare=true/>
             </div>
-        }
-        .into_any(),
-    ]
+            <div class="metric-row">
+                <div class="metric-now">{disk_now}</div>
+                <Sparkline title="Disk" points=disk span=span gap=gap max=Signal::stored(Some(disk_total as f64))
+                    format=|v| bytes(v as u64) bare=true axis=true/>
+            </div>
+        </div>
+    }
 }
 
-/// Why apps on a node cannot be reached over the web, if they cannot. `here`: on
-/// the node's own page, above its Ports list.
+/// Why apps on the node cannot be reached over the web, if they cannot.
 #[component]
-pub fn IngressNote(#[prop(into)] errors: Signal<Vec<String>>, here: bool) -> impl IntoView {
+fn IngressNote(#[prop(into)] errors: Signal<Vec<String>>) -> impl IntoView {
     view! {
         <Show when=move || errors.with(|e| !e.is_empty())>
             <div class="note note-error" role="alert">
@@ -451,23 +464,9 @@ pub fn IngressNote(#[prop(into)] errors: Signal<Vec<String>>, here: bool) -> imp
                 "Apps on this node are not reachable over the web: "
                 {move || errors.get().join("; ")}
                 ". Another program (a web server?) holds the port; façade keeps retrying. "
-                {if here { "The Ports list below shows which." } else { "The node's Ports list shows which." }}
+                "The Ports list below shows which."
             </div>
         </Show>
-    }
-}
-
-/// The usage charts of a node.
-#[component]
-fn NodeUsage(name: String, #[prop(into)] stats: Signal<Option<NodeStats>>) -> impl IntoView {
-    let url = format!("/api/nodes/{name}/usage");
-    let mem_max = Signal::derive(move || stats.with(|s| s.as_ref().map(|s| s.mem_total as f64)));
-    let disk_max = Signal::derive(move || stats.with(|s| s.as_ref().map(|s| s.disk_total as f64)));
-    view! {
-        <section class="node-usage">
-            <UsageCharts url=url cpu_max=Signal::derive(|| Some(100.0))
-                mem_max=mem_max disk_max=disk_max/>
-        </section>
     }
 }
 
@@ -715,7 +714,7 @@ fn NodeVolumes(node: String, volumes: Polled<Vec<VolumeView>>) -> impl IntoView 
 }
 
 /// Whether [`StorageNotes`] has anything to say.
-pub fn storage_notes_shown(
+fn storage_notes_shown(
     storage: Signal<Option<StorageReport>>,
     orphaned: Signal<(usize, u64)>,
 ) -> Signal<bool> {
@@ -731,7 +730,7 @@ pub fn storage_notes_shown(
 /// What a node's disk meter does not say: unused build cache, orphaned volumes
 /// (linking to `volumes_href`), the last cleanup.
 #[component]
-pub fn StorageNotes(
+fn StorageNotes(
     #[prop(into)] storage: Signal<Option<StorageReport>>,
     #[prop(into)] orphaned: Signal<(usize, u64)>,
     #[prop(into)] volumes_href: String,
@@ -776,7 +775,7 @@ pub fn StorageNotes(
 }
 
 /// How many volumes on `node` no app declares, and their size.
-pub fn orphaned_on(volumes: Polled<Vec<VolumeView>>, node: String) -> Signal<(usize, u64)> {
+fn orphaned_on(volumes: Polled<Vec<VolumeView>>, node: String) -> Signal<(usize, u64)> {
     Signal::derive(move || {
         volumes.data.with(|v| {
             v.iter()

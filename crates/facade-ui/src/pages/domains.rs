@@ -4,33 +4,95 @@ use facade_core::api::{DnsSettings, DnsUpdate, DomainStatus};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
+use leptos_router::hooks::{use_navigate, use_query_map};
 
 use crate::api;
-use crate::components::{ErrorNote, Loading, Sort, SortKey, SortTh};
+use crate::components::{ErrorNote, FilterSelect, Loading, Sort, SortKey, SortTh};
 use crate::util::{me, polled, run, toasts};
+
+/// Public suffixes of more than one label that people register under, so
+/// `shop.example.co.uk` belongs to `example.co.uk`. Not the whole list: the
+/// common ones, separated by spaces.
+const SUFFIXES: &str = "\
+    co.uk org.uk me.uk ltd.uk plc.uk net.uk ac.uk gov.uk com.au net.au org.au edu.au gov.au \
+    co.nz net.nz org.nz co.jp ne.jp or.jp ac.jp co.kr or.kr com.br net.br org.br com.mx com.ar \
+    com.tr com.cn net.cn org.cn com.tw com.hk com.sg com.my co.in net.in org.in co.id co.il \
+    co.za org.za com.ua com.pl co.at or.at com.es com.pt co.it eu.org github.io gitlab.io \
+    pages.dev netlify.app vercel.app fly.dev herokuapp.com duckdns.org";
+
+/// The registered domain a host name belongs to: `www.example.com` →
+/// `example.com`. Addresses stay as they are.
+fn main_domain(host: &str) -> String {
+    let host = host.trim_end_matches('.').to_lowercase();
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let n = labels.len();
+    let keep = if n >= 3
+        && SUFFIXES
+            .split_whitespace()
+            .any(|s| s == labels[n - 2..].join("."))
+    {
+        3
+    } else {
+        2
+    };
+    labels[n.saturating_sub(keep)..].join(".")
+}
 
 #[component]
 pub fn Domains() -> impl IntoView {
     let me = me();
+    let query = use_query_map();
+    let navigate = use_navigate();
     let domains = polled(Some(Duration::from_secs(15)), || async {
         api::get::<Vec<DomainStatus>>("/api/domains").await
     });
-    let filter = RwSignal::new(String::new());
+    // The main domain picked, from the URL (`?domain=example.com`); empty for all.
+    let picked = Memo::new(move |_| query.read().get("domain").unwrap_or_default());
+    let pick = Callback::new(move |domain: String| {
+        let url = if domain.is_empty() {
+            "/domains".to_string()
+        } else {
+            format!("/domains?domain={domain}")
+        };
+        navigate(
+            &url,
+            leptos_router::NavigateOptions {
+                replace: true,
+                scroll: false,
+                ..Default::default()
+            },
+        );
+    });
+    let mains = Signal::derive(move || {
+        let mut mains = domains.data.with(|d| {
+            d.iter()
+                .flatten()
+                .map(|d| main_domain(&d.domain))
+                .collect::<Vec<_>>()
+        });
+        // One picked in a link but gone stays listed, so the selector says so.
+        mains.extend(Some(picked.get()).filter(|p| !p.is_empty()));
+        mains.sort();
+        mains.dedup();
+        mains
+    });
     let total = move || domains.data.with(|d| d.as_ref().map_or(0, Vec::len));
     let shown = Signal::derive(move || {
-        let needle = filter.with(|f| f.trim().to_lowercase());
+        let picked = picked.get();
         domains
             .data
             .get()
             .unwrap_or_default()
             .into_iter()
-            .filter(|d| d.domain.contains(&needle))
+            .filter(|d| picked.is_empty() || main_domain(&d.domain) == picked)
             .collect::<Vec<_>>()
     });
     let problems = move || {
-        domains.data.with(|d| {
+        shown.with(|d| {
             d.iter()
-                .flatten()
                 .filter(|d| dns_state(d) == Check::Failed || https_state(d) == Check::Failed)
                 .count()
         })
@@ -46,10 +108,10 @@ pub fn Domains() -> impl IntoView {
             <Show when=move || domains.loaded() fallback=Loading>
                 <Show when=move || { total() > 0 }>
                     <div class="toolbar">
-                        <input type="search" class="filter-input" placeholder="Filter by domain"
-                            aria-label="Filter by domain" autocomplete="off"
-                            prop:value=move || filter.get()
-                            on:input=move |ev| filter.set(event_target_value(&ev))/>
+                        <Show when=move || { mains.with(Vec::len) > 1 || !picked.with(String::is_empty) }>
+                            <FilterSelect label="Main domain" all="All domains" options=mains
+                                value=picked on_change=pick/>
+                        </Show>
                         <span class="muted small">
                             {move || {
                                 let (n, all) = (shown.with(Vec::len), total());
@@ -66,7 +128,7 @@ pub fn Domains() -> impl IntoView {
                 </Show>
                 <Show when=move || { total() == 0 || !shown.with(Vec::is_empty) }
                     fallback=move || view! {
-                        <div class="empty"><p>{move || format!("No domain matches “{}”.", filter.get().trim())}</p></div>
+                        <div class="empty"><p>{move || format!("No domain under {}.", picked.get())}</p></div>
                     }>
                     <DomainTable domains=shown show_app=true/>
                 </Show>
