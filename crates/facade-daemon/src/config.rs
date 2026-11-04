@@ -36,6 +36,7 @@ pub struct ServerConfig {
     pub acme: AcmeConfig,
     pub backups: BackupConfig,
     pub update: UpdateConfig,
+    pub auto_deploy: AutoDeployConfig,
     /// The file this was read from (handed to the binary checking an update).
     #[serde(skip)]
     pub path: PathBuf,
@@ -58,6 +59,7 @@ impl Default for ServerConfig {
             acme: AcmeConfig::default(),
             backups: BackupConfig::default(),
             update: UpdateConfig::default(),
+            auto_deploy: AutoDeployConfig::default(),
             path: "/etc/facade/server.toml".into(),
         }
     }
@@ -143,6 +145,27 @@ impl Default for UpdateConfig {
             repository: "Sigma-studios/facade".into(),
             release: "edge".into(),
             url: None,
+        }
+    }
+}
+
+/// Apps and stacks with auto-deploy on: how often their source is checked when
+/// no webhook reports changes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoDeployConfig {
+    /// Seconds between two checks of a source without a working webhook (ten
+    /// times longer with one, as a safety net).
+    pub poll_secs: u64,
+    /// GitHub's REST API, where repository webhooks are created.
+    pub github_api: String,
+}
+
+impl Default for AutoDeployConfig {
+    fn default() -> Self {
+        Self {
+            poll_secs: 180,
+            github_api: "https://api.github.com".into(),
         }
     }
 }

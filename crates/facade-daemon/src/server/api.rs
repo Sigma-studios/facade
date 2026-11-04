@@ -85,6 +85,19 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/apps/{name}/deploy", post(deploy_app))
         .route("/api/apps/{name}/updates", post(check_updates))
         .route(
+            "/api/apps/{name}/auto-deploy",
+            get(super::autodeploy::get_app).put(super::autodeploy::put_app),
+        )
+        .route(
+            "/api/stacks/{name}/auto-deploy",
+            get(super::autodeploy::get_stack).put(super::autodeploy::put_stack),
+        )
+        .route("/api/auto-deploy", get(super::autodeploy::list))
+        .route(
+            "/api/hooks/github",
+            get(super::autodeploy::hook_info).post(super::autodeploy::github_hook),
+        )
+        .route(
             "/api/apps/{name}/volumes/{volume}/archive",
             get(export_volume)
                 .put(import_volume)
@@ -492,6 +505,8 @@ async fn update_server_settings(
         server.settings.set_api_domain(&server.store, domain)?;
         server.domains_wake.notify_one();
         super::acme::push_ingress_all(&server).await;
+        // Webhooks deliver to the domain.
+        server.auto_deploy.hooks_changed();
     }
     if let Some(email) = email {
         server.settings.set_acme_email(&server.store, email)?;
@@ -1390,6 +1405,7 @@ async fn delete_app(
     }
     // An offline node drops the app when it reconnects and syncs.
     super::updates::forget(&server, &name).await;
+    super::autodeploy::forget(&server, &super::autodeploy::Target::App(name.clone()));
     server.store.delete_app(&name)?;
     server.live.write().apps.remove(&name);
     server.refresh_routes()?;
@@ -1420,7 +1436,7 @@ async fn deploy_app(
 
 /// Resolves the commit, records a deployment and hands it to the app's node, where
 /// it waits for the build slot.
-async fn start_deploy(
+pub(super) async fn start_deploy(
     server: &Server,
     name: &str,
     req: &DeployRequest,
@@ -2023,8 +2039,10 @@ async fn export(State(server): S, user: User) -> ApiResult<Response> {
         if app.spec.stack.is_some() {
             continue;
         }
+        let target = super::autodeploy::Target::App(app.spec.name.clone());
         manifest.apps.push(AppManifest {
             spec: app.spec.clone(),
+            auto_deploy: super::autodeploy::is_enabled(&server, &target).then_some(true),
             env: exported(server.store.list_env(&app.spec.name)?)?,
         });
     }
@@ -2040,8 +2058,10 @@ async fn export(State(server): S, user: User) -> ApiResult<Response> {
                 }
             }
         }
+        let target = super::autodeploy::Target::Stack(stack.spec.name.clone());
         manifest.stacks.push(facade_core::manifest::StackManifest {
             variables: exported(server.store.list_stack_vars(&stack.spec.name)?)?,
+            auto_deploy: super::autodeploy::is_enabled(&server, &target).then_some(true),
             spec: stack.spec,
             env,
         });
@@ -2097,6 +2117,10 @@ async fn apply(State(server): S, user: User, body: String) -> ApiResult<Json<App
         for app in &manifest.apps {
             check_spec_for_apply(&server, &app.spec, &names)?;
             check_links(&app.spec, &all)?;
+            if app.auto_deploy == Some(true) {
+                super::autodeploy::supported(&app.spec)
+                    .map_err(|e| bad_request(format!("{}: auto_deploy: {e}", app.spec.name)))?;
+            }
             for key in app.env.keys() {
                 if !valid_env_key(key) {
                     return Err(bad_request(format!(
@@ -2164,13 +2188,22 @@ async fn apply(State(server): S, user: User, body: String) -> ApiResult<Json<App
             None => {
                 server.store.put_app(&app.spec)?;
                 server.refresh_routes()?;
-                report.created.push(name);
+                report.created.push(name.clone());
             }
             Some(old) if changed => {
                 save_spec(&server, &old.spec, &app.spec, false).await?;
+                report.updated.push(name.clone());
+            }
+            Some(_) => report.unchanged.push(name.clone()),
+        }
+        if let Some(on) = app.auto_deploy {
+            let target = super::autodeploy::Target::App(name.clone());
+            if super::autodeploy::set(&server, &target, on)?
+                && let Some(i) = report.unchanged.iter().position(|n| *n == name)
+            {
+                report.unchanged.remove(i);
                 report.updated.push(name);
             }
-            Some(_) => report.unchanged.push(name),
         }
     }
     for stack in manifest.stacks {

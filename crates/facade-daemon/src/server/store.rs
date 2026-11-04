@@ -336,6 +336,7 @@ impl Store {
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
         )?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(AUTO_DEPLOY_SCHEMA)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "apps", "commit_sha", "TEXT")?;
         add_column(&conn, "deployments", "commit_sha", "TEXT")?;
@@ -1527,6 +1528,223 @@ impl Store {
     pub fn snapshot(&self, dest: &Path) -> anyhow::Result<()> {
         let dest = dest.to_str().context("backup path is not UTF-8")?;
         self.0.lock().execute("VACUUM INTO ?1", [dest])?;
+        Ok(())
+    }
+}
+
+// ---- auto-deploy
+
+/// A row per app (`app:<name>`) or stack (`stack:<name>`) with auto-deploy on, and
+/// a row per GitHub repository facade put a webhook on.
+const AUTO_DEPLOY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS auto_deploy (
+    target TEXT PRIMARY KEY,
+    seen TEXT,
+    checked_at INTEGER,
+    triggered TEXT,
+    triggered_at INTEGER,
+    triggered_by TEXT,
+    error TEXT,
+    image_repo TEXT
+);
+CREATE TABLE IF NOT EXISTS github_hooks (
+    repo TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    url TEXT NOT NULL,
+    hook_id INTEGER,
+    events TEXT NOT NULL DEFAULT '',
+    secret_hash TEXT,
+    error TEXT,
+    updated_at INTEGER NOT NULL,
+    delivered_at INTEGER
+);
+"#;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AutoDeployRow {
+    pub target: String,
+    /// The commit or image digest last seen at the source, acted on or not.
+    pub seen: Option<String>,
+    pub checked_at: Option<u64>,
+    pub triggered: Option<String>,
+    pub triggered_at: Option<u64>,
+    pub triggered_by: Option<String>,
+    pub error: Option<String>,
+    /// For image apps, the GitHub repository the image says it is built from
+    /// (`github.com/owner/repo`); `""` when it says none.
+    pub image_repo: Option<String>,
+}
+
+/// A webhook facade manages on a GitHub repository.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GithubHookRow {
+    /// `github.com/owner/repo`, lowercase.
+    pub repo: String,
+    /// `Owner/Repo` as GitHub's API takes it.
+    pub path: String,
+    /// Where it delivers.
+    pub url: String,
+    /// `None` while it could not be created (see `error`).
+    pub hook_id: Option<i64>,
+    pub events: Vec<String>,
+    /// Hash of the secret it was given, to notice when that changed.
+    pub secret_hash: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: u64,
+    pub delivered_at: Option<u64>,
+}
+
+impl Store {
+    fn auto_deploy_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AutoDeployRow> {
+        Ok(AutoDeployRow {
+            target: r.get(0)?,
+            seen: r.get(1)?,
+            checked_at: r.get(2)?,
+            triggered: r.get(3)?,
+            triggered_at: r.get(4)?,
+            triggered_by: r.get(5)?,
+            error: r.get(6)?,
+            image_repo: r.get(7)?,
+        })
+    }
+
+    pub fn list_auto_deploy(&self) -> anyhow::Result<Vec<AutoDeployRow>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare(
+            "SELECT target, seen, checked_at, triggered, triggered_at, triggered_by, error, image_repo
+             FROM auto_deploy ORDER BY target",
+        )?;
+        let rows = stmt
+            .query_map([], Self::auto_deploy_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_auto_deploy(&self, target: &str) -> anyhow::Result<Option<AutoDeployRow>> {
+        Ok(self
+            .0
+            .lock()
+            .query_row(
+                "SELECT target, seen, checked_at, triggered, triggered_at, triggered_by, error, image_repo
+                 FROM auto_deploy WHERE target = ?1",
+                [target],
+                Self::auto_deploy_row,
+            )
+            .optional()?)
+    }
+
+    /// Turns auto-deploy on; what was recorded before (if it was on) stays.
+    pub fn enable_auto_deploy(&self, target: &str) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "INSERT OR IGNORE INTO auto_deploy (target) VALUES (?1)",
+            [target],
+        )?;
+        Ok(())
+    }
+
+    pub fn disable_auto_deploy(&self, target: &str) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .execute("DELETE FROM auto_deploy WHERE target = ?1", [target])?;
+        Ok(())
+    }
+
+    /// Records a check; does nothing if auto-deploy was turned off meanwhile.
+    pub fn put_auto_deploy(&self, row: &AutoDeployRow) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE auto_deploy SET seen = ?2, checked_at = ?3, triggered = ?4, triggered_at = ?5,
+             triggered_by = ?6, error = ?7, image_repo = ?8 WHERE target = ?1",
+            params![
+                row.target,
+                row.seen,
+                row.checked_at,
+                row.triggered,
+                row.triggered_at,
+                row.triggered_by,
+                row.error,
+                row.image_repo
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The log of the app's last successful deployment.
+    pub fn last_success_log(&self, app: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .0
+            .lock()
+            .query_row(
+                "SELECT log FROM deployments WHERE app = ?1 AND status = 'succeeded'
+                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                [app],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn list_github_hooks(&self) -> anyhow::Result<Vec<GithubHookRow>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare(
+            "SELECT repo, path, url, hook_id, events, secret_hash, error, updated_at, delivered_at
+             FROM github_hooks ORDER BY repo",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let events: String = r.get(4)?;
+                Ok(GithubHookRow {
+                    repo: r.get(0)?,
+                    path: r.get(1)?,
+                    url: r.get(2)?,
+                    hook_id: r.get(3)?,
+                    events: events
+                        .split(',')
+                        .filter(|e| !e.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    secret_hash: r.get(5)?,
+                    error: r.get(6)?,
+                    updated_at: r.get(7)?,
+                    delivered_at: r.get(8)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn put_github_hook(&self, row: &GithubHookRow) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "INSERT INTO github_hooks (repo, path, url, hook_id, events, secret_hash, error, updated_at, delivered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(repo) DO UPDATE SET path = excluded.path, url = excluded.url,
+               hook_id = excluded.hook_id, events = excluded.events, secret_hash = excluded.secret_hash,
+               error = excluded.error, updated_at = excluded.updated_at",
+            params![
+                row.repo,
+                row.path,
+                row.url,
+                row.hook_id,
+                row.events.join(","),
+                row.secret_hash,
+                row.error,
+                row.updated_at,
+                row.delivered_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_github_hook(&self, repo: &str) -> anyhow::Result<()> {
+        self.0
+            .lock()
+            .execute("DELETE FROM github_hooks WHERE repo = ?1", [repo])?;
+        Ok(())
+    }
+
+    pub fn github_hook_delivered(&self, repo: &str, at: u64) -> anyhow::Result<()> {
+        self.0.lock().execute(
+            "UPDATE github_hooks SET delivered_at = ?2 WHERE repo = ?1",
+            params![repo, at],
+        )?;
         Ok(())
     }
 }

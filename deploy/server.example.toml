@@ -34,6 +34,11 @@ public_host = "203.0.113.10"
 # release = "edge"
 # url = "https://mirror.example.com/facade"   # the release's files elsewhere
 
+# Apps and stacks with auto-deploy on: how often their source is checked when no
+# webhook reports changes (with one, ten times less often).
+# [auto_deploy]
+# poll_secs = 180
+
 [acme]
 # enabled = true
 email = "you@example.com"

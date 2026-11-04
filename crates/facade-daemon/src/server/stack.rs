@@ -594,6 +594,7 @@ pub async fn delete(
             }
         }
     }
+    super::autodeploy::forget(&server, &super::autodeploy::Target::Stack(name.clone()));
     server.store.delete_stack(&name)?;
     server.refresh_routes()?;
     Ok(StatusCode::NO_CONTENT)
@@ -1197,6 +1198,15 @@ pub async fn apply(
                 changed = true;
             }
         }
+    }
+    if let Some(on) = m.auto_deploy {
+        if on && m.spec.repo.is_none() {
+            return Err(at(ApiError::bad_request(
+                "auto_deploy needs a repository to watch",
+            )));
+        }
+        let target = super::autodeploy::Target::Stack(name.clone());
+        changed |= super::autodeploy::set(server, &target, on)?;
     }
     match (existing, changed) {
         (None, _) => report.created.push(name),

@@ -994,3 +994,74 @@ pub struct CommitView {
     /// Unix time.
     pub time: u64,
 }
+
+// ---------------------------------------------------------------- auto-deploy
+
+/// Whether an app (or stack) deploys by itself when its source changes, and how
+/// a change is noticed (`GET /api/apps/{name}/auto-deploy`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoDeployView {
+    pub enabled: bool,
+    /// What is watched: `github.com/me/shop (main)`, `ghcr.io/me/blog:latest`.
+    /// `None` for sources that cannot change by themselves (uploaded executables).
+    pub watching: Option<String>,
+    pub method: AutoDeployMethod,
+    /// Seconds between two checks of the source (longer while a webhook works).
+    pub poll_secs: u64,
+    /// What stands between polling and a webhook, or why nothing is watched.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// The GitHub repository whose webhook reports changes, once facade set it up.
+    #[serde(default)]
+    pub webhook_repo: Option<String>,
+    /// Unix time of the last delivery from that webhook.
+    #[serde(default)]
+    pub webhook_delivered_at: Option<u64>,
+    #[serde(default)]
+    pub checked_at: Option<u64>,
+    /// The commit or image digest last seen at the source.
+    #[serde(default)]
+    pub seen: Option<String>,
+    #[serde(default)]
+    pub triggered_at: Option<u64>,
+    /// What the last automatic deploy deployed: a commit, or an image digest.
+    #[serde(default)]
+    pub triggered: Option<String>,
+    /// `webhook` or `poll`.
+    #[serde(default)]
+    pub triggered_by: Option<String>,
+    /// Why the last check or automatic deploy failed.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoDeployMethod {
+    Off,
+    Polling,
+    Webhook,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetAutoDeploy {
+    pub enabled: bool,
+}
+
+/// One app or stack with auto-deploy on (`GET /api/auto-deploy`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoDeployTarget {
+    /// `app` or `stack`.
+    pub kind: String,
+    pub name: String,
+    #[serde(flatten)]
+    pub status: AutoDeployView,
+}
+
+/// What a webhook set up by hand needs (`GET /api/hooks/github`, admins).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookInfo {
+    /// `None` until the server has a domain (`facade server set --api-domain`).
+    pub url: Option<String>,
+    pub secret: String,
+}

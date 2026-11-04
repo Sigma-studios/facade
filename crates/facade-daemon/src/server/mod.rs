@@ -3,13 +3,16 @@
 mod acme;
 mod api;
 mod artifacts;
+mod autodeploy;
 pub mod backups;
 mod compose;
 mod dns;
 mod git;
+mod github;
 mod hub;
 mod inspect;
 mod monitor;
+mod registry;
 mod release;
 pub mod secrets;
 mod settings;
@@ -69,6 +72,8 @@ pub struct Server {
     pub upgrade_attempts: parking_lot::Mutex<HashMap<String, (String, u64)>>,
     /// Published builds of facade itself (Settings → Updates).
     pub releases: release::Releases,
+    /// Apps and stacks deploying by themselves when their source changes.
+    pub auto_deploy: autodeploy::AutoDeploy,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -530,6 +535,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         settings,
         upgrade_attempts: Default::default(),
         releases: Default::default(),
+        auto_deploy: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -577,6 +583,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tasks.spawn(artifacts::collect_garbage(server.clone()));
     tasks.spawn(backups::run(server.clone()));
     tokio::spawn(release::check_regularly(server.clone()));
+    tokio::spawn(autodeploy::run(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
     let files_dir = server.cfg.data_dir.clone();
