@@ -227,12 +227,25 @@ in
 
       # The node's entry point (HTTP and HTTPS). Reads http_listen, https_listen and
       # ingress_control from the server config when there is one.
+      #
+      # A rebuild with a new facade reloads it instead of restarting it: on reload
+      # (SIGUSR2) it starts the binary at the path it was started from with its
+      # listening sockets, and the old process finishes its open connections,
+      # as `facade server update` does on Ubuntu. That path is /etc/facade/facaded,
+      # which the rebuild points to the new package before it reloads services.
+      # For the reload not to turn into a restart, the unit has no store path in
+      # it (no default PATH: it runs nothing), so only the package as a reload
+      # trigger, and the listen settings as restart triggers, change it.
+      environment.etc."facade/facaded".source = lib.getExe' cfg.package "facaded";
+
       systemd.services.facaded-ingress = mkIf ingressService {
         description = "facade entry point (HTTP and HTTPS)";
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
         inherit environment;
+        enableDefaultPath = false;
+        reloadTriggers = [ cfg.package ];
         # Only what it reads from server.toml: other settings leave traffic alone.
         restartTriggers = lib.optional cfg.server.enable (
           builtins.toJSON (
@@ -242,10 +255,8 @@ in
           )
         );
         serviceConfig = {
-          ExecStart = "${lib.getExe' cfg.package "facaded"} ingress --config ${configPath}";
-          # Hands the sockets to a new process of the same binary. A new facade
-          # package is a new store path, which only a restart picks up.
-          ExecReload = "${pkgs.util-linux}/bin/kill -USR2 $MAINPID";
+          ExecStart = "/etc/facade/facaded ingress --config ${configPath}";
+          ExecReload = "/run/current-system/sw/bin/kill -USR2 $MAINPID";
           Type = "notify";
           NotifyAccess = "all";
           Restart = "always";
@@ -274,9 +285,9 @@ in
     (mkIf cfg.server.enable {
       environment.etc."facade/server.toml".source = settingsFile;
 
-      # Docker is wanted, not required (unlike deploy/facaded.service): with
+      # Docker is wanted, not required (as in deploy/facaded.service): with
       # Requires=, Docker failing once at boot (it restarts by itself) would leave
-      # facaded down for good. Without Docker it exits, and Restart= tries again.
+      # facaded down for good. Without Docker its agent keeps retrying.
       systemd.services.facaded = {
         description = "facade server";
         after = [

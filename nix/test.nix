@@ -10,6 +10,14 @@
 #   nix build .#checks.x86_64-linux.nixos -L     (needs KVM)
 { pkgs, self }:
 let
+  facaded = self.packages.${pkgs.stdenv.hostPlatform.system}.facaded;
+  # The same build at another store path: what a rebuild with a new facade
+  # looks like to the module, without building facade twice.
+  facadedNext = pkgs.runCommand "facaded-next" { } ''
+    mkdir -p $out/bin
+    cp ${facaded}/bin/facaded $out/bin/facaded
+  '';
+
   image = pkgs.dockerTools.buildImage {
     name = "localhost:5000/sleeper";
     tag = "1";
@@ -57,6 +65,9 @@ pkgs.testers.runNixOSTest {
     };
 
     environment.systemPackages = [ pkgs.curl ];
+
+    # A rebuild with a new facade: switched to and back below.
+    specialisation.next.configuration.services.facade.package = pkgs.lib.mkForce facadedNext;
   };
 
   testScript = ''
@@ -126,6 +137,65 @@ pkgs.testers.runNixOSTest {
         # Its own filesystem: 64M, not the VM's disk.
         size = machine.succeed("facade exec sleeper -- df -m /data | tail -1").split()[1]
         assert int(size) < 100, size
+
+    with subtest("Docker restarting leaves facaded running, and the app comes back"):
+        before = machine.succeed("systemctl show -p MainPID --value facaded").strip()
+        machine.succeed("systemctl restart docker")
+        machine.wait_for_unit("docker.service")
+        after = machine.succeed("systemctl show -p MainPID --value facaded").strip()
+        assert before == after, f"facaded restarted with Docker: {before} -> {after}"
+        machine.wait_until_succeeds(
+            "facade exec sleeper -- cat /data/file | grep -x kept", timeout=180
+        )
+        machine.succeed("facade restart sleeper >&2")
+        machine.wait_until_succeeds(
+            "facade exec sleeper -- cat /data/file | grep -x kept", timeout=120
+        )
+        node_online()
+
+    def ingress_state():
+        return machine.succeed(
+            "systemctl show -p MainPID -p NRestarts -p ActiveEnterTimestampMonotonic"
+            " --value facaded-ingress"
+        ).split()
+
+    def switch_to(system, package):
+        pid, restarts, since = ingress_state()
+        # Port 80 answering all along: every failed request is logged.
+        machine.succeed(
+            "rm -f /tmp/refused; (while [ ! -e /tmp/stop ]; do"
+            " curl -s -o /dev/null --max-time 2 http://127.0.0.1/ || echo $? >> /tmp/refused;"
+            " sleep 0.1; done; touch /tmp/stopped) >/dev/null 2>&1 &"
+        )
+        machine.succeed(f"{system}/bin/switch-to-configuration test >&2")
+        server_up()
+
+        def handed_over(_):
+            new_pid, new_restarts, new_since = ingress_state()
+            exe = machine.succeed(f"readlink /proc/{new_pid}/exe").strip()
+            return new_pid != pid and exe.startswith(package)
+
+        retry(handed_over, timeout_seconds=60)
+        new_pid, new_restarts, new_since = ingress_state()
+        assert (new_restarts, new_since) == (restarts, since), "restarted, not reloaded"
+        machine.succeed("touch /tmp/stop")
+        machine.wait_for_file("/tmp/stopped")
+        machine.succeed("rm -f /tmp/stop /tmp/stopped")
+        refused = machine.succeed("cat /tmp/refused 2>/dev/null || true").strip()
+        assert refused == "", f"requests failed during the switch: {refused}"
+
+    with subtest("a rebuild with a new facade hands the entry point over, no restart"):
+        machine.succeed("test -L /etc/facade/facaded")
+        unit = machine.succeed("systemctl cat facaded-ingress")
+        for line in unit.splitlines():
+            if line.startswith(("ExecStart=", "ExecReload=", "Environment=")):
+                assert "/nix/store" not in line, line
+        switch_to("/run/booted-system/specialisation/next", "${facadedNext}")
+        machine.succeed("facade node list >&2")
+        node_online()
+        # And back: the second hand-over starts from the path it was started from too.
+        switch_to("/run/booted-system", "${facaded}")
+        node_online()
 
     with subtest("everything comes back after a reboot"):
         machine.shutdown()

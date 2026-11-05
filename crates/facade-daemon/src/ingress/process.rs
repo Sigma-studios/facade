@@ -356,10 +356,15 @@ async fn control_connection(
     }
 }
 
-/// Starts the installed binary with our arguments and sockets, and waits for it
-/// to report ready. Returns its pid.
+/// Starts the binary at the path we were started from (where an update put the
+/// new version: `/usr/local/bin/facaded`, or on NixOS `/etc/facade/facaded`,
+/// which a rebuild moves) with our arguments and sockets, and waits for it to
+/// report ready. Returns its pid.
 async fn hand_over(sockets: &Sockets) -> anyhow::Result<u32> {
-    let binary = crate::selfbin::installed_path()?;
+    let binary = match crate::selfbin::started_path() {
+        Some(path) => path,
+        None => crate::selfbin::installed_path()?,
+    };
     let (ready_read, ready_write) = pipe()?;
     let (names, sources): (Vec<String>, Vec<RawFd>) = {
         let sockets = sockets.0.lock();

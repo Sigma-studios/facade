@@ -1,8 +1,10 @@
 [Unit]
 Description=facade agent
 After=network-online.target docker.service
-Wants=network-online.target facaded-ingress.service
-Requires=docker.service
+# Docker is wanted, not required: Docker failing once at boot (it then
+# restarts by itself) would otherwise leave facade down for good. Without
+# Docker the agent keeps retrying, and restarting Docker leaves facade running.
+Wants=network-online.target facaded-ingress.service docker.service
 
 [Service]
 # The node's entry point runs on its own (facaded-ingress.service), so updating

@@ -385,7 +385,10 @@ pub fn NodeBadges(#[prop(into)] node: Signal<Option<NodeView>>) -> impl IntoView
                 _ => format!("Built from nixpkgs {rev} ({}).", c.branch),
             });
             if c.eol {
-                tip.push(format!("NixOS {} gets no security fixes any more: move to a newer release.", c.release));
+                tip.push(format!(
+                    "NixOS {} gets no security fixes any more: move to a newer release.",
+                    c.release
+                ));
             }
         }
         if u.reboot_required() {
