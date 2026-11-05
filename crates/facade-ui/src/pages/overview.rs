@@ -119,14 +119,11 @@ fn ProblemRow(problem: Problem) -> impl IntoView {
             </span>
             <div class="problem-body">
                 <div class="problem-message">{problem.message.clone()}</div>
+                // Separated by the stylesheet, so a missing part leaves no stray dot.
                 <div class="problem-meta">
                     {subject.map(|(text, href)| view! { <A href=href attr:class="problem-subject">{text}</A> })}
-                    {app.map(|a| view! {
-                        <span class="problem-sep" aria-hidden="true">"·"</span>
-                        <A href=format!("/apps/{a}")>{format!("app {a}")}</A>
-                    })}
+                    {app.map(|a| view! { <A href=format!("/apps/{a}")>{format!("app {a}")}</A> })}
                     {problem.since.map(|since| view! {
-                        <span class="problem-sep" aria-hidden="true">"·"</span>
                         <span title=format!("since {} {}", date(since), clock(since))>{lasted(since)}</span>
                     })}
                 </div>
