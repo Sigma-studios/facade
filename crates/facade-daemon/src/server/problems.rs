@@ -55,14 +55,23 @@ const CACHE_FOR: Duration = Duration::from_secs(5);
 /// Computed this often even with nobody looking, so first-seen times hold.
 const REFRESH_EVERY: Duration = Duration::from_secs(60);
 const KV_SEEN: &str = "problems.seen";
+/// A problem gone this long is forgotten; back sooner (a flap, or an alert
+/// confirming itself again after a restart), it keeps its first time.
+const FORGET_AFTER: u64 = 5 * 60;
 /// Hints quote errors: their first line, this long at most.
 const HINT_CHARS: usize = 200;
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Seen {
+    first: u64,
+    last: u64,
+}
 
 #[derive(Default)]
 pub struct Problems {
     /// When each current problem was first seen. Kept in the database, so an
     /// update (a restart) does not make them all new.
-    seen: Mutex<HashMap<String, u64>>,
+    seen: Mutex<HashMap<String, Seen>>,
     cache: Mutex<Option<(Instant, Vec<Problem>)>>,
 }
 
@@ -90,7 +99,14 @@ fn visible(server: &Server, user: &User, problem: &Problem) -> bool {
 pub async fn run(server: Arc<Server>) {
     match server.store.kv_get(KV_SEEN) {
         Ok(Some(json)) => {
-            *server.problems.seen.lock() = serde_json::from_str(&json).unwrap_or_default();
+            let mut seen: HashMap<String, Seen> = serde_json::from_str(&json).unwrap_or_default();
+            // Last seen is only saved when the list changes: count them as
+            // seen now, so they get the time to show again.
+            let now = facade_core::now();
+            for s in seen.values_mut() {
+                s.last = now;
+            }
+            *server.problems.seen.lock() = seen;
         }
         Ok(None) => {}
         Err(e) => warn!("reading when problems were first seen: {e:#}"),
@@ -181,6 +197,10 @@ struct AppFact {
     state: Option<AppState>,
     /// Its newest deployment.
     latest: Option<DeploymentView>,
+    /// A deployment before the newest one succeeded: there is an older
+    /// version to keep running when the newest fails. (One whose first deploy
+    /// failed and runs since a settings change has none.)
+    ran_before: bool,
     /// Its health check fails: since when, and what the last one printed.
     unhealthy: Option<(u64, String)>,
 }
@@ -310,6 +330,14 @@ async fn gather(server: &Server) -> Facts {
             .list_deployments(name, 5)
             .ok()
             .and_then(|d| d.into_iter().max_by_key(|d| d.created_at));
+        let ran_before = latest.as_ref().is_some_and(|latest| {
+            server
+                .store
+                .last_success(name)
+                .ok()
+                .flatten()
+                .is_some_and(|(revision, _)| revision < latest.revision)
+        });
         let unhealthy = (health == Some(false))
             .then(|| server.store.health_checks(name).ok())
             .flatten()
@@ -319,6 +347,7 @@ async fn gather(server: &Server) -> Facts {
             stack: row.spec.stack.as_ref().map(|s| s.stack.clone()),
             state,
             latest,
+            ran_before,
             unhealthy,
         });
     }
@@ -564,7 +593,7 @@ fn lasted(secs: u64) -> String {
 
 /// Everything wrong in `facts`, one row per cause, critical first then oldest.
 /// `seen` holds when each was first seen; it is updated to the current ones.
-fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, u64>) -> Vec<Problem> {
+fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, Seen>) -> Vec<Problem> {
     use ProblemSeverity::{Critical, Warning};
     let mut out: Vec<Found> = Vec::new();
     let node_fact = |name: &str| facts.nodes.iter().find(|n| n.name == name);
@@ -824,7 +853,7 @@ fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, u64>) -> Vec<Pro
         if let Some(d) = &a.latest {
             match d.status {
                 // A stack's services deploy together: the stack's row says it.
-                DeploymentStatus::Failed if running && a.stack.is_none() => {
+                DeploymentStatus::Failed if running && a.ran_before && a.stack.is_none() => {
                     let f = Found::new(
                         format!("deploy:{name}"),
                         Warning,
@@ -943,7 +972,7 @@ fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, u64>) -> Vec<Pro
     if let Some(e) = &facts.notify_error {
         out.push(
             Found::new("notify", Warning, "alerts are not reaching Discord")
-                .fix("/settings/alerts", "Settings → Alerts")
+                .fix("/settings/alerts", "Alert settings")
                 .hint(short(e)),
         );
     }
@@ -955,13 +984,21 @@ fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, u64>) -> Vec<Pro
         );
     }
 
-    let keys: HashSet<&str> = out.iter().map(|f| f.problem.key.as_str()).collect();
-    seen.retain(|k, _| keys.contains(k.as_str()));
+    for f in &out {
+        // What it says of itself counts as seen, for when it says later (an
+        // alert confirmed again after a restart).
+        let s = seen.entry(f.problem.key.clone()).or_insert(Seen {
+            first: f.known.unwrap_or(now).min(now),
+            last: now,
+        });
+        s.last = now;
+    }
+    seen.retain(|_, s| now.saturating_sub(s.last) <= FORGET_AFTER);
     let mut list: Vec<Problem> = out
         .into_iter()
         .filter_map(|mut f| {
-            let first = *seen.entry(f.problem.key.clone()).or_insert(now);
-            let since = f.known.unwrap_or(first);
+            let first = seen.get(&f.problem.key).map_or(now, |s| s.first);
+            let since = f.known.map_or(first, |known| known.min(first));
             if now.saturating_sub(since) < f.after {
                 return None;
             }
@@ -1093,6 +1130,7 @@ mod tests {
             stack: None,
             state: Some(state),
             latest: None,
+            ran_before: true,
             unhealthy: None,
         }
     }
@@ -1226,14 +1264,16 @@ mod tests {
         let mut seen = HashMap::new();
         assert!(assemble(&facts, NOW, &mut seen).is_empty());
         // Still seen, so its time counts from the first look.
-        assert_eq!(seen.get("dns:blog.example.com"), Some(&NOW));
+        assert_eq!(seen.get("dns:blog.example.com").map(|s| s.first), Some(NOW));
         let later = assemble(&facts, NOW + DNS_SPREADS_IN, &mut seen);
         assert_eq!(keys(&later), ["dns:blog.example.com"]);
         assert_eq!(later[0].since, Some(NOW));
-        // Fixed: gone, and forgotten.
+        // Fixed: gone at once, forgotten a while later.
         let mut fixed = facts;
         fixed.domains[0].dns_ok = true;
-        assert!(assemble(&fixed, NOW + DNS_SPREADS_IN + 60, &mut seen).is_empty());
+        let at = NOW + DNS_SPREADS_IN + 60;
+        assert!(assemble(&fixed, at, &mut seen).is_empty());
+        assemble(&fixed, at + FORGET_AFTER, &mut seen);
         assert!(seen.is_empty());
     }
 
@@ -1400,6 +1440,18 @@ mod tests {
                 uuid::Uuid::nil()
             )
         );
+        // Its first deploy failed, and it runs since a settings change fixed
+        // it: there was no older version, and nothing is wrong.
+        let mut first = app("blog", AppState::Running);
+        first.latest = Some(deployment("blog", DeploymentStatus::Failed, NOW - 1000));
+        first.ran_before = false;
+        assert!(
+            run(&Facts {
+                apps: vec![first],
+                ..Default::default()
+            })
+            .is_empty()
+        );
         // Down instead: the alert says so, once.
         let mut down = app("blog", AppState::Crashed);
         down.latest = Some(deployment("blog", DeploymentStatus::Failed, NOW - 1000));
@@ -1478,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn first_seen_times_hold_until_fixed() {
+    fn first_seen_times_hold_until_fixed_for_a_while() {
         let facts = Facts {
             notify_error: Some("Discord answered 404".into()),
             ..Default::default()
@@ -1487,9 +1539,30 @@ mod tests {
         assemble(&facts, NOW, &mut seen);
         let later = assemble(&facts, NOW + 600, &mut seen);
         assert_eq!(later[0].since, Some(NOW));
-        assemble(&Facts::default(), NOW + 700, &mut seen);
-        let again = assemble(&facts, NOW + 800, &mut seen);
-        assert_eq!(again[0].since, Some(NOW + 800));
+        // Gone a minute (a restart, before its alert confirms itself again):
+        // the same problem, since the same time.
+        assert!(assemble(&Facts::default(), NOW + 700, &mut seen).is_empty());
+        let back = assemble(&facts, NOW + 760, &mut seen);
+        assert_eq!(back[0].since, Some(NOW));
+        // Gone longer: a new one.
+        assemble(&Facts::default(), NOW + 800, &mut seen);
+        assemble(&Facts::default(), NOW + 800 + FORGET_AFTER + 1, &mut seen);
+        let again = assemble(&facts, NOW + 2000, &mut seen);
+        assert_eq!(again[0].since, Some(NOW + 2000));
+    }
+
+    #[test]
+    fn an_alert_confirmed_again_keeps_the_first_time() {
+        let mut seen = HashMap::new();
+        let down = |since| Facts {
+            alerts: vec![alert("app:blog:down", "app blog is down", since)],
+            ..Default::default()
+        };
+        assemble(&down(NOW), NOW + 30, &mut seen);
+        // The server restarted: the alert fires again, later.
+        assemble(&Facts::default(), NOW + 100, &mut seen);
+        let list = assemble(&down(NOW + 160), NOW + 160, &mut seen);
+        assert_eq!(list[0].since, Some(NOW));
     }
 
     #[test]
