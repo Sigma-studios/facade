@@ -1307,3 +1307,39 @@ a.badge:hover { text-decoration: none; filter: brightness(0.97); }
   .errors .table th, .errors .table td { padding: 8px 10px; }
   .errors .table-filter { width: 100%; }
 }
+
+/* ---------------------------------------------------------------- problems */
+
+/* The Overview's list of what is wrong now: one row per cause, its icon
+   and colour saying how bad, where to fix it on the right. */
+.nav-count-warning { background: var(--serious); }
+.problems-history { font-size: 12.5px; color: var(--text-muted); }
+.problems-none { display: flex; align-items: baseline; gap: 8px; margin: 0 0 20px; font-size: 13px; }
+.problems-none-icon { color: var(--good); }
+.problems-none .problems-history { margin-left: auto; }
+.problems { list-style: none; margin: 0; padding: 0; overflow: hidden; }
+.problem {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+}
+.problem:first-child { border-top: 0; }
+.problem-critical { box-shadow: inset 3px 0 0 var(--critical); }
+.problem-warning { box-shadow: inset 3px 0 0 var(--serious); }
+.problem-icon { flex: none; width: 18px; text-align: center; font-size: 13px; align-self: flex-start; line-height: 20px; }
+.problem-critical .problem-icon { color: var(--critical); }
+.problem-warning .problem-icon { color: var(--serious); }
+.problem-body { flex: 1; min-width: 0; }
+.problem-message { font-weight: 550; overflow-wrap: anywhere; }
+.problem-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; font-size: 12.5px; color: var(--text-muted); }
+.problem-subject { font-weight: 550; }
+.problem-sep { color: var(--border-strong); }
+.problem-hint { font-size: 12.5px; color: var(--text-secondary); margin-top: 2px; overflow-wrap: anywhere; }
+.problem-hint::before { content: "→ "; color: var(--text-muted); }
+.problem-fix { flex: none; padding: 4px 10px; font-size: 12.5px; }
+@media (max-width: 760px) {
+  .problem { flex-wrap: wrap; padding: 12px 14px; }
+  .problem-fix { margin-left: 30px; }
+}

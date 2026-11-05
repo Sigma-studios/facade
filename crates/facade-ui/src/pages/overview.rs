@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AlertView, AppDiskView, AppView, NodeView, StatusView, UsagePoint, WRITTEN_WARNING,
+    AppDiskView, AppView, NodeView, Problem, ProblemSeverity, StatusView, UsagePoint,
+    WRITTEN_WARNING, main_domain,
 };
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -13,7 +14,7 @@ use crate::components::{
     follow_row,
 };
 use crate::gauges::LimitBar;
-use crate::util::{Polled, ago, bytes, cpus, me, percent, polled};
+use crate::util::{Polled, ago, bytes, clock, cpus, date, me, percent, polled, problems};
 
 #[component]
 pub fn Overview() -> impl IntoView {
@@ -21,18 +22,6 @@ pub fn Overview() -> impl IntoView {
     let status = polled(Some(Duration::from_secs(5)), || async {
         api::get::<StatusView>("/api/status").await
     });
-    let alerts = polled(Some(Duration::from_secs(15)), || async {
-        api::get::<Vec<AlertView>>("/api/alerts").await
-    });
-    let firing = move || {
-        alerts.data.with(|a| {
-            a.iter()
-                .flatten()
-                .filter(|x| x.resolved_at.is_none())
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-    };
 
     view! {
         <div class="page">
@@ -55,19 +44,7 @@ pub fn Overview() -> impl IntoView {
                     </div>
                 </section>
             </Show>
-            <Show when=move || !firing().is_empty()>
-                <A href="/settings/alerts" attr:class="banner banner-critical">
-                    <span aria-hidden="true">"⚠"</span>
-                    <span>
-                        <strong>{move || {
-                            let n = firing().len();
-                            format!("{n} alert{} firing", if n == 1 { "" } else { "s" })
-                        }}</strong>
-                        ": "
-                        {move || firing().iter().map(|a| a.message.clone()).collect::<Vec<_>>().join(" · ")}
-                    </span>
-                </A>
-            </Show>
+            <ProblemsSection/>
             <Show when=move || status.loaded() fallback=Loading>
                 <section class="nodes-section">
                     <h2 class="section-title">"Nodes"</h2>
@@ -86,6 +63,88 @@ pub fn Overview() -> impl IntoView {
                 </section>
             </Show>
         </div>
+    }
+}
+
+/// What is wrong right now, critical first then oldest, each with where it is
+/// fixed. A fixed problem leaves the list by itself; what happened before is
+/// the alerts' history (linked) and the Activity's.
+#[component]
+fn ProblemsSection() -> impl IntoView {
+    let problems = problems().0;
+    let list = move || problems.data.get().unwrap_or_default();
+    view! {
+        <Show when=move || problems.loaded()>
+            <Show
+                when=move || problems.data.with(|p| p.as_ref().is_some_and(|p| !p.is_empty()))
+                fallback=|| view! {
+                    <p class="problems-none muted">
+                        <span class="problems-none-icon" aria-hidden="true">"✓"</span>
+                        "No problems."
+                        <a href="/settings/alerts" class="problems-history">"Alert history"</a>
+                    </p>
+                }
+            >
+                <section class="problems-section">
+                    <div class="section-head">
+                        <h2 class="section-title">"Problems"</h2>
+                        <a href="/settings/alerts" class="problems-history">"Alert history"</a>
+                    </div>
+                    <ul class="problems card">
+                        {move || list().into_iter().map(|p| view! { <ProblemRow problem=p/> }).collect_view()}
+                    </ul>
+                </section>
+            </Show>
+        </Show>
+    }
+}
+
+#[component]
+fn ProblemRow(problem: Problem) -> impl IntoView {
+    let critical = problem.severity == ProblemSeverity::Critical;
+    let subject = match problem.subject() {
+        ("domain", d) => Some((d.to_string(), format!("/domains?domain={}", main_domain(d)))),
+        ("app", a) => Some((a.to_string(), format!("/apps/{a}"))),
+        ("stack", s) => Some((format!("stack {s}"), format!("/stacks/{s}"))),
+        ("node", n) => Some((format!("node {n}"), format!("/nodes/{n}"))),
+        _ => None,
+    };
+    // A domain's app, after the domain.
+    let app = problem.app.clone().filter(|_| problem.domain.is_some());
+    view! {
+        <li class=if critical { "problem problem-critical" } else { "problem problem-warning" }>
+            <span class="problem-icon" role="img"
+                aria-label=if critical { "critical" } else { "warning" }>
+                {if critical { "✕" } else { "⚠" }}
+            </span>
+            <div class="problem-body">
+                <div class="problem-message">{problem.message.clone()}</div>
+                <div class="problem-meta">
+                    {subject.map(|(text, href)| view! { <A href=href attr:class="problem-subject">{text}</A> })}
+                    {app.map(|a| view! {
+                        <span class="problem-sep" aria-hidden="true">"·"</span>
+                        <A href=format!("/apps/{a}")>{format!("app {a}")}</A>
+                    })}
+                    {problem.since.map(|since| view! {
+                        <span class="problem-sep" aria-hidden="true">"·"</span>
+                        <span title=format!("since {} {}", date(since), clock(since))>{lasted(since)}</span>
+                    })}
+                </div>
+                {problem.hint.clone().map(|hint| view! { <div class="problem-hint">{hint}</div> })}
+            </div>
+            <A href=problem.fix.clone() attr:class="button problem-fix">{format!("{} →", problem.fix_label)}</A>
+        </li>
+    }
+}
+
+/// `for 5 min`: how long something has been so.
+fn lasted(since: u64) -> String {
+    let secs = crate::util::now().saturating_sub(since);
+    match secs {
+        0..60 => "just now".into(),
+        60..3600 => format!("for {} min", secs / 60),
+        3600..86400 => format!("for {} h", secs / 3600),
+        _ => format!("for {} d", secs / 86400),
     }
 }
 

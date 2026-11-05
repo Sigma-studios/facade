@@ -128,6 +128,28 @@ impl Alerts {
     }
 }
 
+/// What is wrong right now, polled by the shell for the Overview's count and
+/// shared with the Overview.
+#[derive(Clone, Copy)]
+pub struct Problems(pub Polled<Vec<facade_core::api::Problem>>);
+
+pub fn problems() -> Problems {
+    expect_context::<Problems>()
+}
+
+impl Problems {
+    /// How many, and whether any is critical.
+    pub fn count(&self) -> (usize, bool) {
+        self.0.data.with(|p| {
+            let p = p.as_deref().unwrap_or_default();
+            let critical = p
+                .iter()
+                .any(|p| p.severity == facade_core::api::ProblemSeverity::Critical);
+            (p.len(), critical)
+        })
+    }
+}
+
 // ---------------------------------------------------------------- toasts
 
 #[derive(Clone, PartialEq)]

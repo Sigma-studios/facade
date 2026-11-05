@@ -123,6 +123,16 @@ pub fn AppPage() -> impl IntoView {
     let name = Memo::new(move |_| params.read().get("name").unwrap_or_default());
     let tab = Memo::new(move |_| query.read().get("tab").unwrap_or_else(|| "overview".into()));
     let selected_deployment = RwSignal::new(None::<Uuid>);
+    // A link can name the deployment to show (`?tab=deployments&deployment=…`).
+    Effect::new(move |_| {
+        if let Some(id) = query
+            .read()
+            .get("deployment")
+            .and_then(|d| d.parse::<Uuid>().ok())
+        {
+            selected_deployment.set(Some(id));
+        }
+    });
 
     let app = polled(Some(Duration::from_secs(3)), move || {
         let name = name.get();

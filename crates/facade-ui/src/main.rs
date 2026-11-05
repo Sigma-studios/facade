@@ -8,14 +8,14 @@ mod util;
 
 use std::time::Duration;
 
-use facade_core::api::{AlertView, BuildsView, LoginRequest, LoginResponse, WhoAmI};
+use facade_core::api::{AlertView, BuildsView, LoginRequest, LoginResponse, Problem, WhoAmI};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::{A, Outlet, ParentRoute, Redirect, Route, Router, Routes};
 use leptos_router::hooks::use_navigate;
 use leptos_router::path;
 
-use util::{Alerts, Me, polled};
+use util::{Alerts, Me, Problems, polled};
 
 fn main() {
     console_error_panic_hook::set_once();
@@ -70,12 +70,16 @@ fn Shell() -> impl IntoView {
     let me = Me(whoami);
     provide_context(me);
     provide_context(Alerts(alerts));
+    // Listed on the Overview; counted beside it from every page.
+    let problems = Problems(polled(Some(Duration::from_secs(15)), || async {
+        api::get::<Vec<Problem>>("/api/problems").await
+    }));
+    provide_context(problems);
     let must_change_password = move || {
         whoami
             .data
             .with(|w| w.as_ref().is_some_and(|w| w.must_change_password))
     };
-    let firing = move || Alerts(alerts).firing();
     let builds = polled(Some(Duration::from_secs(5)), || async {
         api::get::<BuildsView>("/api/builds").await
     });
@@ -99,7 +103,15 @@ fn Shell() -> impl IntoView {
                     "façade"
                 </A>
                 <ul class="nav">
-                    <li><A href="/" exact=true>"Overview"</A></li>
+                    <li>
+                        <A href="/" exact=true>
+                            "Overview"
+                            <Show when=move || { problems.count().0 > 0 }>
+                                <span class=move || if problems.count().1 { "nav-count" } else { "nav-count nav-count-warning" }
+                                    title="problems">{move || problems.count().0}</span>
+                            </Show>
+                        </A>
+                    </li>
                     <li><A href="/apps">"Apps"</A></li>
                     <li>
                         <A href="/builds">
@@ -115,15 +127,9 @@ fn Shell() -> impl IntoView {
                     <Show when=move || me.is_admin()>
                         <li><A href="/users">"Users"</A></li>
                     </Show>
-                    <li>
-                        // Alerts live in Settings: their count shows here.
-                        <A href="/settings">
-                            "Settings"
-                            <Show when=move || { firing() > 0 }>
-                                <span class="nav-count" title="firing alerts">{firing}</span>
-                            </Show>
-                        </A>
-                    </li>
+                    // Firing alerts are counted with the Overview's problems,
+                    // not here again (Settings → Alerts still counts them).
+                    <li><A href="/settings">"Settings"</A></li>
                 </ul>
                 <button class="nav-logout" on:click=logout>"Log out"</button>
             </nav>
