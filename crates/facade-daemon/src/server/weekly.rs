@@ -164,6 +164,8 @@ pub struct NodeWeek {
     pub served_in: u64,
     /// `7 updates (2 security) · reboot required`.
     pub upkeep: Option<String>,
+    /// `vulnerabilities: 4 critical, 58 high (62 without a fix)`.
+    pub vulns: Option<String>,
     pub disk_errors: bool,
 }
 
@@ -296,6 +298,9 @@ fn node_line(n: &NodeWeek) -> String {
     }
     if let Some(upkeep) = &n.upkeep {
         parts.push(upkeep.clone());
+    }
+    if let Some(vulns) = &n.vulns {
+        parts.push(vulns.clone());
     }
     if n.disk_errors {
         parts.push("⚠ disk errors".into());
@@ -537,6 +542,14 @@ pub fn gather(server: &Server, week: Week) -> anyhow::Result<Facts> {
             .get(&name)
             .and_then(|l| l.platform.clone());
         n.upkeep = upkeep_line(server.activity.upkeep(&name).as_ref(), platform.as_ref());
+        n.vulns = server
+            .vulns
+            .summary(&name)
+            .and_then(|v| match (&v.unknown, v.badge()) {
+                (_, Some(badge)) => Some(format!("vulnerabilities: {badge}")),
+                (Some(_), None) => Some("vulnerabilities not checked".into()),
+                (None, None) => None,
+            });
         n.disk_errors = server.activity.disk_trouble(&name).is_some();
         nodes.push(n);
     }

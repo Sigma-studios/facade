@@ -608,6 +608,23 @@ fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, Seen>) -> Vec<Pr
         let (scope, rest) = alert.key.split_once(':').unwrap_or((&alert.key, ""));
         let (name, kind) = rest.rsplit_once(':').unwrap_or((rest, ""));
         match scope {
+            "node" if rest.contains(":vuln:") => {
+                let (name, cve) = rest.split_once(":vuln:").unwrap_or((rest, ""));
+                let severity = if alert.message.contains("(critical)") {
+                    Critical
+                } else {
+                    Warning
+                };
+                out.push(
+                    Found::new(&alert.key, severity, &alert.message)
+                        .node(name)
+                        .since(Some(alert.since))
+                        .fix(format!("/nodes/{name}?tab=vulnerabilities"), "Vulnerabilities")
+                        .hint(format!(
+                            "no fix yet: mitigate it, then facade vulns ack {cve} --node {name} --note \"why\""
+                        )),
+                );
+            }
             "node" => {
                 match kind {
                     "offline" => offline.insert(name),

@@ -27,6 +27,7 @@ pub mod store;
 mod ui;
 mod updates;
 pub mod users;
+mod vulns;
 mod weekly;
 
 use std::collections::{HashMap, VecDeque};
@@ -92,6 +93,8 @@ pub struct Server {
     pub reach: reach::Reach,
     /// What is wrong right now (the Overview's Problems).
     pub problems: problems::Problems,
+    /// The vulnerability check of what the nodes run.
+    pub vulns: vulns::Vulns,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -620,6 +623,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         edge: Default::default(),
         reach: Default::default(),
         problems: Default::default(),
+        vulns: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -674,6 +678,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(events::run(server.clone()));
     tokio::spawn(weekly::run(server.clone()));
     tokio::spawn(problems::run(server.clone()));
+    tokio::spawn(vulns::run(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
     let files_dir = server.cfg.data_dir.clone();

@@ -7,6 +7,7 @@ mod exec;
 mod insights;
 mod output;
 mod resources;
+mod vulns;
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read, Write};
@@ -60,6 +61,9 @@ enum Command {
     Status,
     /// What is wrong right now and where to fix it; a problem is gone once fixed.
     Problems,
+    /// Vulnerabilities in what the nodes run (high and critical; --all for
+    /// every one); `ack` silences one until its status changes.
+    Vulns(vulns::VulnsArgs),
     /// Firing and recently resolved alerts; `config`, `test` and `weekly` for Discord.
     Alerts {
         #[command(subcommand)]
@@ -1519,6 +1523,7 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
                 println!("{}", problems_count(&problems));
             }
         }
+        Command::Vulns(args) => vulns::run(api, args, json).await?,
         Command::Problems => {
             let problems: Vec<Problem> = api.get("/api/problems").await?;
             if json {
@@ -4472,6 +4477,17 @@ fn node_notes(n: &NodeView) -> Vec<String> {
     }
     if let Some(u) = &n.upkeep {
         notes.extend(u.unknown());
+    }
+    if let Some(v) = &n.vulns {
+        if let Some(badge) = v.badge() {
+            notes.push(format!(
+                "vulnerabilities: {badge} (facade vulns --node {})",
+                n.name
+            ));
+        }
+        if let Some(why) = &v.unknown {
+            notes.push(format!("vulnerabilities not checked: {why}"));
+        }
     }
     notes
 }

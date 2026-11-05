@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 pub mod edge;
 mod resources;
+mod vulns;
+pub use vulns::FindingChanges;
 
 pub struct Store(Mutex<Connection>);
 
@@ -365,6 +367,7 @@ impl Store {
         events::migrate(&conn)?;
         conn.execute_batch(resources::SCHEMA)?;
         conn.execute_batch(edge::SCHEMA)?;
+        conn.execute_batch(vulns::SCHEMA)?;
         edge::migrate(&conn)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "node_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;
@@ -662,6 +665,7 @@ impl Store {
         self.0
             .lock()
             .execute("DELETE FROM nodes WHERE name = ?1", [name])?;
+        self.forget_vulns(name)?;
         Ok(())
     }
 

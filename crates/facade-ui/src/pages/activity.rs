@@ -441,7 +441,29 @@ pub fn NodeBadges(#[prop(into)] node: Signal<Option<NodeView>>) -> impl IntoView
             <span class="badge badge-muted" title=unknown.join("\n")>{format!("couldn't check {what}")}</span>
         }.into_any())
     };
-    view! { {platform} {upkeep} {disk} }
+    let vulns = move || {
+        let n = node.get()?;
+        let v = n.vulns?;
+        let badge = v.badge()?;
+        let class = if v.critical > 0 {
+            "badge badge-critical"
+        } else {
+            "badge badge-warn"
+        };
+        let tip = v
+            .unknown
+            .clone()
+            .map(|u| format!("Not checked: {u}"))
+            .unwrap_or_else(|| {
+                "Vulnerabilities in what the node runs: see its Vulnerabilities tab.".into()
+            });
+        Some(view! {
+            <A href=format!("/nodes/{}?tab=vulnerabilities", n.name) attr:class=class attr:title=tip>
+                <span class="badge-icon" aria-hidden="true">"⚠"</span>{badge}
+            </A>
+        })
+    };
+    view! { {platform} {upkeep} {vulns} {disk} }
 }
 
 /// A node's uptime, leading to its last reboot's entry when there is one.
@@ -591,6 +613,7 @@ fn icon(kind: EventKind) -> &'static str {
         FacadeUpdate => "⇡",
         Upkeep => "▲",
         DiskError => "▣",
+        Vulnerability => "⚠",
         Other => "•",
     }
 }

@@ -1020,6 +1020,52 @@ admins. `GET /api/events?app=&node=&kind=&problems=true&before=&limit=` (a `kind
 category: `deploys`, `restarts`, `health`, `changes`, `alerts`, `logins`, `certificates`,
 `system`, or one kind like `oom_kill`), and `GET /api/events/{id}` with its log lines.
 
+### Vulnerabilities
+
+Each node's packages are matched against vulnerability data the server downloads
+itself: what a node runs never leaves the server. On Ubuntu that is Canonical's OVAL
+file for the release (`com.ubuntu.resolute.cve.oval.xml.bz2`, about 5 MB, checked
+daily), which has every CVE affecting it, fixed or not, and which kernel flavour runs.
+Agents send their package list (`dpkg-query`, and the running kernel) at start-up,
+every 6 hours, and when it changes; only a hash when nothing did.
+
+A finding is a CVE, the source package (`linux`, `openssl`), the installed or running
+version and a status: *no fix released*, *fix available* (an update waits), or *fixed
+after reboot* (the fixed kernel is installed but not running). Severity is Ubuntu's
+priority.
+
+* The node's header shows `4 critical, 58 high (62 without a fix)`; its
+  **Vulnerabilities** tab lists them worst first (medium and low behind a checkbox),
+  with when each was first seen and the date of the data.
+* A finding with no fix released raises an alert of its own (`node:main:vuln:CVE-…`)
+  from `alert_min` up: critical by default, since a kernel always has dozens of high
+  ones waiting for a fix (drivers a server never loads, mostly). High and critical
+  ones an update or a reboot fixes are named in the upkeep alert instead
+  (`3 updates (1 security) (fixes CVE-2026-45447)`).
+* `facade vulns [--node N] [--all] [--json]` lists them; `facade vulns ack CVE-2026-98432
+  --node main --note "mptcp disabled"` silences one until its status changes (a fix
+  comes out, a reboot applies it); `facade vulns unack` undoes it. Acknowledging is
+  also in the tab.
+* The Activity gets a summary at a node's first check, then an entry when a high or
+  critical finding appears, changes status or goes away. The weekly summary has a
+  line per node.
+* If the data could not be refreshed for 2 days, or a node cannot say what it runs,
+  the tab and badge say so rather than showing a stale all-clear.
+
+```toml
+[vulns]
+enabled = true
+alert_min = "critical"        # or "high", "medium", "low"
+ubuntu_oval_url = "https://security-metadata.canonical.com/oval"   # a mirror, for offline use
+```
+
+The check reports vulnerable versions, not whether something else makes them harmless
+(a module not loaded, `net.mptcp.enabled = 0`): acknowledge those with a note. Other
+systems than Ubuntu say *not checked* for now; apps' container images are not scanned.
+`GET /api/nodes/{node}/vulns`, `GET /api/vulns?node=&severity=&status=`,
+`POST /api/vulns/{cve}/ack` (`{"node": "main", "note": "…"}`) and `DELETE
+/api/vulns/{cve}/ack?node=`.
+
 ### Accounts
 
 Admins manage everything; members only the apps they own or were granted.

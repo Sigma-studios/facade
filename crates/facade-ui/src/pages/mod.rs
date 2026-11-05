@@ -13,3 +13,4 @@ pub mod settings;
 pub mod spec_form;
 pub mod stack;
 pub mod users;
+pub mod vulns;

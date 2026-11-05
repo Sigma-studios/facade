@@ -120,6 +120,7 @@ pub enum EventKind {
     FacadeUpdate,
     Upkeep,
     DiskError,
+    Vulnerability,
     #[serde(other)]
     Other,
 }
@@ -182,7 +183,7 @@ impl Category {
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 33] = [
+    pub const ALL: [EventKind; 34] = [
         EventKind::DeployStarted,
         EventKind::Deployed,
         EventKind::DeployFailed,
@@ -215,6 +216,7 @@ impl EventKind {
         EventKind::FacadeUpdate,
         EventKind::Upkeep,
         EventKind::DiskError,
+        EventKind::Vulnerability,
         EventKind::Other,
     ];
 
@@ -252,6 +254,7 @@ impl EventKind {
             EventKind::FacadeUpdate => "facade_update",
             EventKind::Upkeep => "upkeep",
             EventKind::DiskError => "disk_error",
+            EventKind::Vulnerability => "vulnerability",
             EventKind::Other => "other",
         }
     }
@@ -277,9 +280,8 @@ impl EventKind {
             AlertFired | AlertResolved => Category::Alerts,
             SshLogin => Category::Logins,
             CertIssued | CertFailed | DnsRecord => Category::Certificates,
-            Reboot | AgentRestart | ServerStart | FacadeUpdate | Upkeep | DiskError => {
-                Category::System
-            }
+            Reboot | AgentRestart | ServerStart | FacadeUpdate | Upkeep | DiskError
+            | Vulnerability => Category::System,
         }
     }
 }

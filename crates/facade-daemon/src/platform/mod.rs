@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 
 use facade_core::events::{Reboot, Updates};
 use facade_core::platform::{Checked, InstallKind, OsId, PlatformInfo, Support};
+use facade_core::vulns::Inventory;
 
 /// One supported (or best-effort) distribution.
 #[async_trait::async_trait]
@@ -53,6 +54,19 @@ pub trait Platform: Send + Sync {
 
     /// Whether a reboot is needed, and why.
     async fn reboot(&self) -> Checked<Reboot>;
+
+    /// What is installed and running, for the vulnerability check.
+    async fn inventory(&self) -> Checked<Inventory> {
+        Checked::Unsupported(format!(
+            "facade has no vulnerability data for {}",
+            self.os().name()
+        ))
+    }
+
+    /// A path whose modification time changes with the package set.
+    fn inventory_marker(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// A host tool that is not on this node.

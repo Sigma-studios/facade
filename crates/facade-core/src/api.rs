@@ -61,6 +61,9 @@ pub struct NodeView {
     /// Pending system updates and reboot, as the node last said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upkeep: Option<crate::events::Upkeep>,
+    /// High and critical vulnerabilities in what it runs (`None`: not checked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vulns: Option<crate::vulns::VulnSummary>,
     /// Disk errors the kernel reported in the last day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_errors: Option<crate::events::DiskTrouble>,

@@ -1,7 +1,10 @@
 //! Ubuntu: apt for updates, `/run/reboot-required` for reboots.
 
 use facade_core::events::{Reboot, Updates};
+use std::path::PathBuf;
+
 use facade_core::platform::{Checked, OsId, Support};
+use facade_core::vulns::Inventory;
 
 use super::{Platform, pkg, reboot};
 
@@ -35,5 +38,13 @@ impl Platform for Ubuntu {
 
     async fn reboot(&self) -> Checked<Reboot> {
         Checked::Known(reboot::required_file())
+    }
+
+    async fn inventory(&self) -> Checked<Inventory> {
+        pkg::dpkg::inventory().await
+    }
+
+    fn inventory_marker(&self) -> Option<PathBuf> {
+        Some(pkg::dpkg::marker())
     }
 }

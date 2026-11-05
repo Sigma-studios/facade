@@ -7,6 +7,7 @@ mod compress;
 mod edge;
 mod events;
 mod exec;
+mod inventory;
 mod layers;
 mod maintenance;
 mod ports;
@@ -168,6 +169,7 @@ impl Agent {
         tokio::spawn(maintenance::run(self.clone()));
         tokio::spawn(cgroups::watch(self.runtime.clone()));
         tokio::spawn(events::run(self.clone()));
+        tokio::spawn(inventory::watch(self.clone()));
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = std::time::Instant::now();
@@ -460,6 +462,9 @@ impl Agent {
                 return Ok(Some(serde_json::to_value(self.listeners().await)?));
             }
             AgentRequest::Upgrade { sha256 } => self.upgrade(sha256).await?,
+            AgentRequest::Inventory { known } => {
+                return Ok(Some(serde_json::to_value(inventory::answer(known).await)?));
+            }
             AgentRequest::VolumeExport {
                 tunnel,
                 app,

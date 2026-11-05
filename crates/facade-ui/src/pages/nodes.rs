@@ -21,6 +21,7 @@ const TABS: &[(&str, &str)] = &[
     ("activity", "Activity"),
     ("ports", "Ports"),
     ("volumes", "Volumes"),
+    ("vulnerabilities", "Vulnerabilities"),
 ];
 
 /// One node at a time, laid out as an app's page: the one in the URL
@@ -217,6 +218,7 @@ pub fn Nodes() -> impl IntoView {
             "ports" => view! { <Ports node=name/> }.into_any(),
             "activity" => view! { <super::activity::ActivityTab node=name/> }.into_any(),
             "volumes" => view! { <NodeVolumes node=name volumes/> }.into_any(),
+            "vulnerabilities" => view! { <super::vulns::VulnsTab node=name/> }.into_any(),
             _ => {
                 let storage = Signal::derive(move || node.with(|n| n.as_ref()?.storage.clone()));
                 let live = Signal::derive(move || node.with(|n| n.as_ref()?.stats.clone()));

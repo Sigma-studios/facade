@@ -395,9 +395,12 @@ pub fn conditions(server: &Server, out: &mut HashMap<String, String>) {
                 && u.needs_attention()
                 && let Some(badge) = u.badge()
             {
+                let note = server
+                    .vulns
+                    .upkeep_note(name, u.security() > 0, u.reboot_required());
                 out.insert(
                     format!("node:{name}:upkeep"),
-                    format!("node {name}: {badge}"),
+                    format!("node {name}: {badge}{note}"),
                 );
             }
             if let Some(d) = &track.disk

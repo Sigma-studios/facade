@@ -15,6 +15,7 @@ pub mod resources;
 pub mod spec;
 pub mod stack;
 pub mod templates;
+pub mod vulns;
 
 pub use spec::*;
 

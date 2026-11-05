@@ -430,6 +430,7 @@ async fn control(
         entry.protocol = protocol;
         entry.platform = platform;
     }
+    server.vulns.inventory_due(&node);
     info!(%node, %peer, %hostname, "node connected");
     super::events::agent_connected(
         &server,
@@ -678,6 +679,10 @@ fn on_event(server: &Server, node: &str, event: AgentEvent) {
             }
             None => server.store.deployment_built(deployment),
         },
+        AgentEvent::InventoryChanged { .. } => {
+            server.vulns.inventory_due(node);
+            Ok(())
+        }
         AgentEvent::Activity { event } => {
             super::events::from_agent(server, node, *event);
             Ok(())

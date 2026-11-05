@@ -39,6 +39,7 @@ pub struct ServerConfig {
     pub auto_deploy: AutoDeployConfig,
     pub checks: ChecksConfig,
     pub alerts: AlertsConfig,
+    pub vulns: VulnsConfig,
     /// The file this was read from (handed to the binary checking an update).
     #[serde(skip)]
     pub path: PathBuf,
@@ -63,6 +64,7 @@ impl Default for ServerConfig {
             update: UpdateConfig::default(),
             auto_deploy: AutoDeployConfig::default(),
             checks: ChecksConfig::default(),
+            vulns: VulnsConfig::default(),
             alerts: AlertsConfig::default(),
             path: "/etc/facade/server.toml".into(),
         }
@@ -190,6 +192,31 @@ pub struct ChecksConfig {
     pub resolve: std::collections::BTreeMap<String, std::net::IpAddr>,
     /// A CA certificate to trust besides the public ones (test CAs).
     pub root_ca: Option<PathBuf>,
+}
+
+/// `[vulns]`: the vulnerability check of what the nodes run.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VulnsConfig {
+    pub enabled: bool,
+    /// The least severe finding with no fix that raises an alert: `critical`,
+    /// `high`, `medium` or `low`. Not `high` by default: a kernel always has
+    /// dozens of high ones waiting for a fix (drivers a server never loads,
+    /// mostly), which would bury the critical ones.
+    pub alert_min: String,
+    /// Where Ubuntu's OVAL files are (`com.ubuntu.<codename>.cve.oval.xml.bz2`),
+    /// for a mirror or offline use.
+    pub ubuntu_oval_url: String,
+}
+
+impl Default for VulnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            alert_min: "critical".into(),
+            ubuntu_oval_url: "https://security-metadata.canonical.com/oval".into(),
+        }
+    }
 }
 
 impl Default for ChecksConfig {

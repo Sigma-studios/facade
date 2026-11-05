@@ -16,6 +16,7 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 blake3 = "1"
+bzip2 = "0.6"
 bollard = "0.21"
 bytes = "1"
 chacha20poly1305 = "0.10"
@@ -27,8 +28,10 @@ hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen", "time"] }
 parking_lot = "0.12"
+quick-xml = "0.37"
 rand = "0.9"
 rcgen = "0.14"
+regex = "1"
 rust-embed = { version = "8", features = ["mime-guess"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }

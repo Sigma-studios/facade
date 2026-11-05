@@ -184,6 +184,7 @@ fn conditions(server: &Server) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let now = facade_core::now();
     super::events::conditions(server, &mut out);
+    super::vulns::conditions(server, &mut out);
     let live = server.live.read();
 
     for (name, node) in &live.nodes {

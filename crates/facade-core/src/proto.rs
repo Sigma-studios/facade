@@ -25,7 +25,9 @@ use crate::spec::AppSpec;
 /// ([`AgentRequest::ExecStream`]); the server asks only agents speaking 6.
 /// 7: nothing new on the wire: a feature that came with it was taken out, and
 /// the number stays so that agents already at 7 are not refused.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// 8: agents send what is installed for the vulnerability check
+/// ([`AgentRequest::Inventory`]); the server asks only agents speaking 8.
+pub const PROTOCOL_VERSION: u32 = 8;
 /// The first protocol with [`AgentRequest::ExecStream`].
 pub const EXEC_STREAM_PROTOCOL: u32 = 6;
 /// The oldest agent protocol the server still talks to. Agents in between are
@@ -226,6 +228,12 @@ pub enum AgentRequest {
     Upgrade {
         sha256: String,
     },
+    /// What is installed, for the vulnerability check: answers
+    /// `Checked<Option<Inventory>>`, `None` when its hash is still `known`.
+    Inventory {
+        #[serde(default)]
+        known: Option<String>,
+    },
     /// Dial a data connection and write a gzipped tar of the volume (by its Docker
     /// name) to it. A running
     /// app is paused meanwhile, so files are copied as they were at one instant.
@@ -330,6 +338,11 @@ pub enum AgentMsg {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
     Report(Box<NodeReport>),
+    /// The node's packages changed (an upgrade, a rebuild): the server asks
+    /// for the new inventory.
+    InventoryChanged {
+        hash: String,
+    },
     AppState {
         app: String,
         state: AppState,

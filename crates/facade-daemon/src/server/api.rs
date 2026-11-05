@@ -78,6 +78,9 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/nodes/{name}/ip", put(set_node_ip))
         .route("/api/nodes/{name}/prune", post(prune_node))
         .route("/api/nodes/{name}/ports", get(node_ports))
+        .route("/api/nodes/{name}/vulns", get(node_vulns))
+        .route("/api/vulns", get(list_vulns))
+        .route("/api/vulns/{cve}/ack", post(ack_vuln).delete(unack_vuln))
         .route(
             "/api/nodes/{node}/volumes/{volume}",
             axum::routing::delete(delete_volume),
@@ -583,6 +586,7 @@ fn node_views(server: &Server) -> anyhow::Result<Vec<NodeView>> {
                     .unwrap_or_default(),
                 platform: live.nodes.get(&n.name).and_then(|l| l.platform.clone()),
                 upkeep: server.activity.upkeep(&n.name),
+                vulns: server.vulns.summary(&n.name),
                 disk_errors: server.activity.disk_trouble(&n.name),
                 name: n.name,
             }
@@ -2802,6 +2806,142 @@ async fn node_ports(
             .map(|n| n.listeners.clone())
             .unwrap_or_default(),
     ))
+}
+
+// ---------------------------------------------------------------- vulnerabilities
+
+async fn node_vulns(
+    State(server): S,
+    user: User,
+    Path(name): Path<String>,
+) -> ApiResult<Json<facade_core::vulns::NodeVulns>> {
+    user.require_admin()?;
+    if !server.store.node_exists(&name)? {
+        return Err(not_found(format!("no node named {name}")));
+    }
+    let platform = server
+        .live
+        .read()
+        .nodes
+        .get(&name)
+        .and_then(|n| n.platform.clone());
+    Ok(Json(facade_core::vulns::NodeVulns {
+        summary: server.vulns.summary(&name).unwrap_or_default(),
+        findings: server.store.findings(Some(&name))?,
+        source: server.vulns.source_label(platform.as_ref()),
+        node: name,
+    }))
+}
+
+#[derive(Deserialize)]
+struct VulnsQuery {
+    node: Option<String>,
+    /// The least severe to list (`high`: high and critical).
+    severity: Option<String>,
+    status: Option<String>,
+}
+
+async fn list_vulns(
+    State(server): S,
+    user: User,
+    Query(q): Query<VulnsQuery>,
+) -> ApiResult<Json<Vec<facade_core::vulns::Finding>>> {
+    use facade_core::vulns::{FindingStatus, VulnSeverity};
+    user.require_admin()?;
+    let min = q.severity.as_deref().map(VulnSeverity::parse);
+    let status =
+        match q.status.as_deref() {
+            Some(s) => Some(FindingStatus::parse(s).ok_or_else(|| {
+                bad_request("status: no_fix, fix_available or fixed_after_reboot")
+            })?),
+            None => None,
+        };
+    let mut findings = server.store.findings(q.node.as_deref())?;
+    findings.retain(|f| {
+        min.is_none_or(|m| f.severity.at_least(m)) && status.is_none_or(|s| f.status == s)
+    });
+    Ok(Json(findings))
+}
+
+async fn ack_vuln(
+    State(server): S,
+    user: User,
+    Path(cve): Path<String>,
+    Json(req): Json<facade_core::vulns::AckRequest>,
+) -> ApiResult<Json<usize>> {
+    user.require_admin()?;
+    let nodes: Vec<String> = match &req.node {
+        Some(n) => vec![n.clone()],
+        None => server
+            .store
+            .list_nodes()?
+            .into_iter()
+            .map(|n| n.name)
+            .collect(),
+    };
+    let now = facade_core::now();
+    let mut covered = 0;
+    for node in &nodes {
+        let n = server
+            .store
+            .ack_finding(node, &cve, &user.username, req.note.trim(), now)?;
+        if n > 0 {
+            covered += n;
+            let note = if req.note.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", req.note.trim())
+            };
+            events::Entry::node(
+                node,
+                facade_core::events::EventKind::Vulnerability,
+                facade_core::events::Severity::Info,
+                format!("{cve} acknowledged{note}"),
+            )
+            .by(&user.username)
+            .record(&server);
+            super::vulns::refresh(&server, node);
+        }
+    }
+    if covered == 0 {
+        return Err(not_found(format!(
+            "{cve} affects no {}",
+            req.node
+                .as_deref()
+                .map(|n| format!("package on node {n}"))
+                .unwrap_or_else(|| "node".into())
+        )));
+    }
+    Ok(Json(covered))
+}
+
+#[derive(Deserialize)]
+struct UnackQuery {
+    node: Option<String>,
+}
+
+async fn unack_vuln(
+    State(server): S,
+    user: User,
+    Path(cve): Path<String>,
+    Query(q): Query<UnackQuery>,
+) -> ApiResult<StatusCode> {
+    user.require_admin()?;
+    let nodes: Vec<String> = match q.node {
+        Some(n) => vec![n],
+        None => server
+            .store
+            .list_nodes()?
+            .into_iter()
+            .map(|n| n.name)
+            .collect(),
+    };
+    for node in &nodes {
+        if server.store.unack_finding(node, &cve)? {
+            super::vulns::refresh(&server, node);
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------- registry logins
