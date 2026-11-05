@@ -12,6 +12,7 @@ path = "src/main.rs"
 facade-core = { path = "../facade-core", features = ["pinned-tls"] }
 anyhow = "1"
 argon2 = "0.5"
+async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 blake3 = "1"

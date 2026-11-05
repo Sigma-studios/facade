@@ -56,6 +56,9 @@ pub enum Hello {
         /// The commit its binary was built from, when known.
         #[serde(default)]
         commit: Option<String>,
+        /// The system it runs on; `None` from agents before platforms.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platform: Option<crate::platform::PlatformInfo>,
     },
     Data {
         node: String,

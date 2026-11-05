@@ -119,6 +119,8 @@ pub struct NodeLive {
     pub arch: Option<String>,
     /// The protocol its agent speaks, as said when it last connected.
     pub protocol: u32,
+    /// The system it runs on, as said when it last connected.
+    pub platform: Option<facade_core::platform::PlatformInfo>,
     /// Its apps' traffic added up since the server started, from what each of
     /// their readings adds to the one before (`since` is when it started).
     pub traffic: Option<facade_core::proto::Traffic>,

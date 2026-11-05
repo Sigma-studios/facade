@@ -9,6 +9,7 @@ pub mod insights;
 pub mod manifest;
 #[cfg(feature = "pinned-tls")]
 pub mod pinned;
+pub mod platform;
 pub mod proto;
 pub mod resources;
 pub mod spec;

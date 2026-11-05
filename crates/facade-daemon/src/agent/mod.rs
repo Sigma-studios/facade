@@ -201,6 +201,7 @@ impl Agent {
                 started: Some(self.activity.started),
                 boot: events::boot_time(),
                 commit: crate::selfbin::commit().map(str::to_string),
+                platform: Some(crate::platform::info()),
             },
         )
         .await?;

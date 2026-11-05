@@ -7,6 +7,8 @@
 //! certificates, DNS records, auto-deploy).
 
 use serde::{Deserialize, Serialize};
+
+pub use crate::platform::Checked;
 use uuid::Uuid;
 
 /// How an entry reads: grey, green, orange or red.
@@ -389,49 +391,204 @@ pub struct NodeEvent {
     pub details: EventDetails,
 }
 
-/// A node's pending system upkeep, read every few hours (Ubuntu and Debian;
-/// nothing known elsewhere).
+/// A node's pending system upkeep, read every few hours. facade reports it and
+/// never installs anything: the system does (unattended-upgrades, a rebuild).
+///
+/// Each part is [`Checked`]: "nothing to do" and "this node cannot tell" read
+/// differently. On the wire it also carries the fields servers before these
+/// had (and reads them from agents before these).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "UpkeepWire", into = "UpkeepWire")]
 pub struct Upkeep {
     pub at: u64,
-    /// Packages with an update, when the node can tell (`apt-check`).
+    pub updates: Checked<Updates>,
+    pub reboot: Checked<Reboot>,
+}
+
+/// Pending system updates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Updates {
+    /// A package manager's count (apt).
+    Packages {
+        count: u32,
+        /// Of which security updates.
+        security: u32,
+        /// Their names (at most a hundred).
+        #[serde(default)]
+        names: Vec<String>,
+    },
+    /// A system built from a channel (NixOS): how far behind it its build is.
+    Channel(ChannelState),
+}
+
+/// Where a NixOS node's nixpkgs stands. The agent says what it runs; the
+/// server, which knows the channel's head, adds how far behind it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelState {
+    /// `26.05`.
+    pub release: String,
+    /// The nixpkgs commit the running system was built from.
+    pub revision: String,
+    /// The branch it follows: `nixos-26.05`.
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_commits: Option<u32>,
+    /// The release no longer gets security fixes.
     #[serde(default)]
-    pub updates: Option<u32>,
-    /// Of which security updates.
+    pub eol: bool,
+}
+
+/// Whether the node needs a reboot to run what is installed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reboot {
+    pub required: bool,
+    /// What asks for it: packages (`linux-image-…`), or `kernel 6.12.40 → 6.12.44`.
     #[serde(default)]
-    pub security: Option<u32>,
-    /// Their names (at most a hundred).
-    #[serde(default)]
-    pub packages: Vec<String>,
-    /// `/var/run/reboot-required` exists.
-    #[serde(default)]
-    pub reboot_required: bool,
-    /// The packages asking for it.
-    #[serde(default)]
-    pub reboot_packages: Vec<String>,
+    pub reasons: Vec<String>,
 }
 
 impl Upkeep {
-    /// `7 updates · reboot required`, or `None` when there is nothing to do.
+    /// `7 updates · reboot required`, or `None` when there is nothing to do (or
+    /// nothing known: see [`Upkeep::unknown`]).
     pub fn badge(&self) -> Option<String> {
         let mut parts = vec![];
-        match (self.updates.unwrap_or(0), self.security.unwrap_or(0)) {
-            (0, _) => {}
-            (n, 0) => parts.push(format!("{n} update{}", if n == 1 { "" } else { "s" })),
-            (n, s) => parts.push(format!(
-                "{n} update{} ({s} security)",
-                if n == 1 { "" } else { "s" }
-            )),
+        match self.updates.known() {
+            Some(Updates::Packages {
+                count, security, ..
+            }) => match (*count, *security) {
+                (0, _) => {}
+                (n, 0) => parts.push(format!("{n} update{}", plural(n))),
+                (n, s) => parts.push(format!("{n} update{} ({s} security)", plural(n))),
+            },
+            Some(Updates::Channel(c)) => {
+                if c.eol {
+                    parts.push(format!("NixOS {} past end of life", c.release));
+                } else if let Some(days) = c.behind_days.filter(|d| *d > 0) {
+                    parts.push(format!(
+                        "nixpkgs {days} day{} behind {}",
+                        plural(days),
+                        c.branch
+                    ));
+                }
+            }
+            None => {}
         }
-        if self.reboot_required {
+        if self.reboot_required() {
             parts.push("reboot required".into());
         }
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
-    /// Worth an alert: a reboot waits, or security updates do.
+    /// What the node could not check: `updates: not available: …`.
+    pub fn unknown(&self) -> Vec<String> {
+        let mut out = vec![];
+        if let Some(why) = self.updates.why_unknown() {
+            out.push(format!("updates: {why}"));
+        }
+        if let Some(why) = self.reboot.why_unknown() {
+            out.push(format!("reboot: {why}"));
+        }
+        out
+    }
+
+    pub fn reboot_required(&self) -> bool {
+        self.reboot.known().is_some_and(|r| r.required)
+    }
+
+    /// What asks for a reboot.
+    pub fn reboot_reasons(&self) -> &[String] {
+        self.reboot.known().map_or(&[], |r| &r.reasons)
+    }
+
+    /// Security updates waiting (package managers only).
+    pub fn security(&self) -> u32 {
+        match self.updates.known() {
+            Some(Updates::Packages { security, .. }) => *security,
+            _ => 0,
+        }
+    }
+
+    /// Worth an alert: a reboot waits, security updates do, or the system's
+    /// release gets no fixes any more.
     pub fn needs_attention(&self) -> bool {
-        self.reboot_required || self.security.unwrap_or(0) > 0
+        self.reboot_required()
+            || self.security() > 0
+            || matches!(self.updates.known(), Some(Updates::Channel(c)) if c.eol)
+    }
+}
+
+fn plural(n: u32) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct UpkeepWire {
+    at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending: Option<Checked<Updates>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reboot: Option<Checked<Reboot>>,
+    // What agents and servers before `Checked` send and read.
+    #[serde(default)]
+    updates: Option<u32>,
+    #[serde(default)]
+    security: Option<u32>,
+    #[serde(default)]
+    packages: Vec<String>,
+    #[serde(default)]
+    reboot_required: bool,
+    #[serde(default)]
+    reboot_packages: Vec<String>,
+}
+
+impl From<UpkeepWire> for Upkeep {
+    fn from(w: UpkeepWire) -> Self {
+        let updates = w.pending.unwrap_or_else(|| match w.updates {
+            Some(count) => Checked::Known(Updates::Packages {
+                count,
+                security: w.security.unwrap_or(0),
+                names: w.packages,
+            }),
+            None => Checked::Unsupported("the node's agent does not say (update it)".into()),
+        });
+        let reboot = w.reboot.unwrap_or(Checked::Known(Reboot {
+            required: w.reboot_required,
+            reasons: w.reboot_packages,
+        }));
+        Upkeep {
+            at: w.at,
+            updates,
+            reboot,
+        }
+    }
+}
+
+impl From<Upkeep> for UpkeepWire {
+    fn from(u: Upkeep) -> Self {
+        let mut w = UpkeepWire {
+            at: u.at,
+            ..Default::default()
+        };
+        if let Some(Updates::Packages {
+            count,
+            security,
+            names,
+        }) = u.updates.known()
+        {
+            w.updates = Some(*count);
+            w.security = Some(*security);
+            w.packages = names.clone();
+        }
+        if let Some(r) = u.reboot.known() {
+            w.reboot_required = r.required;
+            w.reboot_packages = r.reasons.clone();
+        }
+        w.pending = Some(u.updates);
+        w.reboot = Some(u.reboot);
+        w
     }
 }
 
@@ -465,14 +622,68 @@ mod tests {
         let mut u = Upkeep::default();
         assert_eq!(u.badge(), None);
         assert!(!u.needs_attention());
-        u.updates = Some(7);
+        assert_eq!(u.unknown().len(), 2);
+        u.updates = Checked::Known(Updates::Packages {
+            count: 7,
+            security: 0,
+            names: vec![],
+        });
         assert_eq!(u.badge().as_deref(), Some("7 updates"));
-        u.security = Some(2);
-        u.reboot_required = true;
+        u.updates = Checked::Known(Updates::Packages {
+            count: 7,
+            security: 2,
+            names: vec![],
+        });
+        u.reboot = Checked::Known(Reboot {
+            required: true,
+            reasons: vec![],
+        });
         assert_eq!(
             u.badge().as_deref(),
             Some("7 updates (2 security) · reboot required")
         );
         assert!(u.needs_attention());
+        assert!(u.unknown().is_empty());
+        u.updates = Checked::Known(Updates::Channel(ChannelState {
+            release: "26.05".into(),
+            branch: "nixos-26.05".into(),
+            behind_days: Some(12),
+            ..Default::default()
+        }));
+        u.reboot = Checked::Known(Reboot::default());
+        assert_eq!(
+            u.badge().as_deref(),
+            Some("nixpkgs 12 days behind nixos-26.05")
+        );
+        assert!(!u.needs_attention());
+    }
+
+    #[test]
+    fn upkeep_reads_and_writes_the_old_fields() {
+        // From an agent before `Checked`.
+        let old: Upkeep = serde_json::from_str(
+            r#"{"at":5,"updates":7,"security":2,"packages":["openssl"],
+                "reboot_required":true,"reboot_packages":["linux-image-7.0.0-43-generic"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old.updates,
+            Checked::Known(Updates::Packages {
+                count: 7,
+                security: 2,
+                names: vec!["openssl".into()]
+            })
+        );
+        assert!(old.reboot_required());
+        assert_eq!(old.reboot_reasons(), ["linux-image-7.0.0-43-generic"]);
+        // From an agent that could not run apt.
+        let silent: Upkeep = serde_json::from_str(r#"{"at":5}"#).unwrap();
+        assert!(silent.updates.why_unknown().is_some());
+        assert_eq!(silent.reboot, Checked::Known(Reboot::default()));
+        // Round trip, and what an older server reads of a new one.
+        let json = serde_json::to_value(&old).unwrap();
+        assert_eq!(json["updates"], 7);
+        assert_eq!(json["reboot_required"], true);
+        assert_eq!(serde_json::from_value::<Upkeep>(json).unwrap(), old);
     }
 }

@@ -1335,94 +1335,14 @@ async fn upkeep_loop(agent: Arc<Agent>) {
     }
 }
 
-/// Pending updates and reboot, as the system already knows them: nothing is
-/// downloaded (no `apt update`), the lists are those the system refreshes.
+/// Pending updates and reboot, as the node's platform knows them.
 async fn read_upkeep() -> Upkeep {
-    let run = PathBuf::from;
-    let reboot_required =
-        run("/var/run/reboot-required").exists() || run("/run/reboot-required").exists();
-    let reboot_packages = ["/var/run/reboot-required.pkgs", "/run/reboot-required.pkgs"]
-        .iter()
-        .find_map(|p| std::fs::read_to_string(run(p)).ok())
-        .map(|t| unique_lines(&t))
-        .unwrap_or_default();
-    let mut upkeep = Upkeep {
+    let platform = crate::platform::current();
+    Upkeep {
         at: facade_core::now(),
-        reboot_required,
-        reboot_packages,
-        ..Default::default()
-    };
-    let apt_check = run("/usr/lib/update-notifier/apt-check");
-    if apt_check.exists() {
-        // Counts on stderr (`7;2`), then names with --package-names.
-        if let Ok(out) = tokio::process::Command::new(&apt_check).output().await
-            && let Some((updates, security)) =
-                parse_apt_check(&String::from_utf8_lossy(&out.stderr))
-        {
-            upkeep.updates = Some(updates);
-            upkeep.security = Some(security);
-            if updates > 0
-                && let Ok(out) = tokio::process::Command::new(&apt_check)
-                    .arg("--package-names")
-                    .output()
-                    .await
-            {
-                upkeep.packages = unique_lines(&String::from_utf8_lossy(&out.stderr));
-                upkeep.packages.truncate(100);
-            }
-            return upkeep;
-        }
+        updates: platform.updates().await,
+        reboot: platform.reboot().await,
     }
-    if let Ok(out) = tokio::process::Command::new("apt")
-        .args(["list", "--upgradable"])
-        .env("LANG", "C")
-        .output()
-        .await
-        && out.status.success()
-    {
-        let (packages, security) = parse_apt_list(&String::from_utf8_lossy(&out.stdout));
-        upkeep.updates = Some(packages.len() as u32);
-        upkeep.security = Some(security);
-        upkeep.packages = packages.into_iter().take(100).collect();
-    }
-    upkeep
-}
-
-fn unique_lines(text: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && seen.insert(l.to_string()))
-        .map(str::to_string)
-        .collect()
-}
-
-/// `apt-check`'s `updates;security`.
-fn parse_apt_check(text: &str) -> Option<(u32, u32)> {
-    let line = text.lines().map(str::trim).find(|l| l.contains(';'))?;
-    let (a, b) = line.split_once(';')?;
-    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-}
-
-/// Package names of `apt list --upgradable`, and how many come from a
-/// security suite.
-fn parse_apt_list(text: &str) -> (Vec<String>, u32) {
-    let mut names = Vec::new();
-    let mut security = 0;
-    for line in text.lines() {
-        let Some((name, rest)) = line.split_once('/') else {
-            continue;
-        };
-        if !line.contains("[upgradable from") {
-            continue;
-        }
-        let suites = rest.split_whitespace().next().unwrap_or("");
-        if suites.split(',').any(|s| s.ends_with("-security")) {
-            security += 1;
-        }
-        names.push(name.to_string());
-    }
-    (names, security)
 }
 
 #[cfg(test)]
@@ -1572,24 +1492,6 @@ mod tests {
                 "Connection closed by authenticating user root 1.2.3.4 port 5555 [preauth]"
             ),
             None
-        );
-    }
-
-    #[test]
-    fn upkeep_outputs() {
-        assert_eq!(parse_apt_check("7;2"), Some((7, 2)));
-        assert_eq!(parse_apt_check("0;0\n"), Some((0, 0)));
-        assert_eq!(parse_apt_check("nonsense"), None);
-        let list = "Listing...\n\
-            libssl3t64/noble-updates,noble-security 3.0.13-0ubuntu3.4 amd64 [upgradable from: 3.0.13-0ubuntu3.1]\n\
-            snapd/noble-updates 2.65.3+24.04 amd64 [upgradable from: 2.63+24.04]\n";
-        assert_eq!(
-            parse_apt_list(list),
-            (vec!["libssl3t64".to_string(), "snapd".to_string()], 1)
-        );
-        assert_eq!(
-            unique_lines("linux-image-6.8.0-48-generic\nlinux-base\nlinux-base\n"),
-            vec!["linux-image-6.8.0-48-generic", "linux-base"]
         );
     }
 

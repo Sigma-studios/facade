@@ -303,6 +303,27 @@ fn node_line(n: &NodeWeek) -> String {
     parts.join(" · ")
 }
 
+/// `7 updates · reboot required`, else what could not be checked: a node is
+/// never all clear only because nothing was known.
+fn upkeep_line(
+    upkeep: Option<&facade_core::events::Upkeep>,
+    platform: Option<&facade_core::platform::PlatformInfo>,
+) -> Option<String> {
+    use facade_core::platform::Support;
+    let mut parts: Vec<String> = upkeep.and_then(|u| u.badge()).into_iter().collect();
+    match platform {
+        Some(p) if p.support == Support::BestEffort => parts.push(p.label()),
+        _ => {
+            let unknown = upkeep.map(|u| u.unknown()).unwrap_or_default();
+            if !unknown.is_empty() {
+                let what: Vec<&str> = unknown.iter().filter_map(|u| u.split(':').next()).collect();
+                parts.push(format!("couldn't check {}", what.join(" or ")));
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// Lines joined into parts of at most `limit` characters, cut between lines
 /// (a single longer line is cut too).
 fn split(lines: &[String], limit: usize) -> Vec<String> {
@@ -509,7 +530,13 @@ pub fn gather(server: &Server, week: Week) -> anyhow::Result<Facts> {
                 n.served_out += sent;
             }
         }
-        n.upkeep = server.activity.upkeep(&name).and_then(|u| u.badge());
+        let platform = server
+            .live
+            .read()
+            .nodes
+            .get(&name)
+            .and_then(|l| l.platform.clone());
+        n.upkeep = upkeep_line(server.activity.upkeep(&name).as_ref(), platform.as_ref());
         n.disk_errors = server.activity.disk_trouble(&name).is_some();
         nodes.push(n);
     }
@@ -843,5 +870,35 @@ mod tests {
             parts,
             ["aaaaaaaaaa", "bbbbbbbbbbbb", "bbbbbbbbbbbb", "b\nccc"]
         );
+    }
+
+    #[test]
+    fn upkeep_lines_say_what_was_not_checked() {
+        use facade_core::events::{Checked, Reboot, Upkeep};
+        use facade_core::platform::{InstallKind, OsId, PlatformInfo, Support};
+        let mut u = Upkeep {
+            at: 1,
+            updates: Checked::Failed("apt list: locked".into()),
+            reboot: Checked::Known(Reboot {
+                required: true,
+                reasons: vec![],
+            }),
+        };
+        assert_eq!(
+            upkeep_line(Some(&u), None).as_deref(),
+            Some("reboot required · couldn't check updates")
+        );
+        let debian = PlatformInfo {
+            os: OsId::parse("ID=debian\nPRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"\n"),
+            support: Support::BestEffort,
+            install: InstallKind::SelfManaged,
+            kernel: None,
+        };
+        u.reboot = Checked::Unsupported("no".into());
+        assert_eq!(
+            upkeep_line(Some(&u), Some(&debian)).as_deref(),
+            Some("best effort: Debian GNU/Linux 13 (trixie)")
+        );
+        assert_eq!(upkeep_line(None, None), None);
     }
 }

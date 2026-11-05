@@ -4404,6 +4404,9 @@ fn print_nodes(nodes: &[NodeView]) {
         for e in &n.ingress_errors {
             println!("warning: node {}: {e}", n.name);
         }
+        for note in node_notes(n) {
+            println!("note: node {}: {note}", n.name);
+        }
     }
 }
 
@@ -4417,6 +4420,7 @@ fn print_node_table(nodes: &[NodeView]) {
             "MEMORY",
             "DISK",
             "IMAGES / BUILD CACHE",
+            "SYSTEM",
             "SEEN",
         ],
         nodes.iter().map(|n| {
@@ -4439,12 +4443,37 @@ fn print_node_table(nodes: &[NodeView]) {
                     .as_ref()
                     .map(|st| format!("{} / {}", bytes(st.images), bytes(st.build_cache)))
                     .unwrap_or_default(),
+                n.platform
+                    .as_ref()
+                    .map(|p| p.label())
+                    .unwrap_or_else(|| "unknown".into()),
                 n.last_seen
                     .map(output::ago)
                     .unwrap_or_else(|| "never".into()),
             ]
         }),
     );
+}
+
+/// What facade could not check on a node, and why.
+fn node_notes(n: &NodeView) -> Vec<String> {
+    let mut notes = vec![];
+    if let Some(p) = &n.platform
+        && p.support == facade_core::platform::Support::BestEffort
+    {
+        notes.push(format!(
+            "{}: facade supports Ubuntu and NixOS, so it runs apps here but does not check updates or reboots",
+            p.os.name()
+        ));
+        return notes;
+    }
+    if n.connected && n.platform.is_none() {
+        notes.push("platform unknown: its agent predates platforms (it updates itself)".into());
+    }
+    if let Some(u) = &n.upkeep {
+        notes.extend(u.unknown());
+    }
+    notes
 }
 
 /// `no problems`, or `3 problems (1 critical): facade problems`.

@@ -324,8 +324,8 @@ pub fn on_report(server: &Server, node: &str, report: &NodeReport) {
         let track = nodes.entry(node.to_string()).or_default();
         track.upkeep.replace(upkeep.clone())
     };
-    let was_required = before.as_ref().is_some_and(|u| u.reboot_required);
-    if upkeep.reboot_required && !was_required {
+    let was_required = before.as_ref().is_some_and(|u| u.reboot_required());
+    if upkeep.reboot_required() && !was_required {
         // A server restart forgets the upkeep it was told: the entries say
         // whether this reboot was asked for already (since the last one).
         let last = |kind| server.store.last_node_event(node, kind, 0).ok().flatten();
@@ -333,10 +333,11 @@ pub fn on_report(server: &Server, node: &str, report: &NodeReport) {
         let rebooted = last(EventKind::Reboot);
         let recent = asked.is_some_and(|a| rebooted.is_none_or(|r| a.at > r.at));
         if !recent {
-            let why = if upkeep.reboot_packages.is_empty() {
+            let reasons = upkeep.reboot_reasons();
+            let why = if reasons.is_empty() {
                 String::new()
             } else {
-                format!(" ({})", upkeep.reboot_packages.join(", "))
+                format!(" ({})", reasons.join(", "))
             };
             Entry::node(
                 node,
@@ -344,7 +345,7 @@ pub fn on_report(server: &Server, node: &str, report: &NodeReport) {
                 Severity::Warn,
                 format!("Reboot required{why}"),
             )
-            .items(upkeep.reboot_packages.clone())
+            .items(reasons.to_vec())
             .record(server);
         }
     }

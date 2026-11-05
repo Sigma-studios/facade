@@ -14,6 +14,7 @@ mod gitauth;
 mod hll;
 mod ingress;
 mod lang;
+mod platform;
 mod selfbin;
 mod server;
 mod tls;

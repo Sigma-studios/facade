@@ -136,7 +136,7 @@ impl SizedVolume {
             what = self.image().display(),
             where_ = self.mountpoint().display(),
         );
-        let path = Path::new(UNIT_DIR).join(&unit);
+        let path = crate::platform::current().unit_dir().join(&unit);
         if std::fs::read_to_string(&path).ok().as_deref() != Some(content.as_str()) {
             std::fs::write(&path, content)?;
             run("systemctl", &["daemon-reload"]).await?;
@@ -193,7 +193,7 @@ impl SizedVolume {
         if self.is_mounted()? {
             run("umount", &[path(&self.mountpoint())?]).await?;
         }
-        let path = Path::new(UNIT_DIR).join(&unit);
+        let path = crate::platform::current().unit_dir().join(&unit);
         if path.exists() {
             std::fs::remove_file(&path)?;
             run("systemctl", &["daemon-reload"]).await?;
@@ -205,8 +205,6 @@ impl SizedVolume {
         Ok(())
     }
 }
-
-const UNIT_DIR: &str = "/etc/systemd/system";
 
 /// What the image files of every sized volume under `agent_dir` take on the
 /// node's disk, the volumes no app declares any more included.
@@ -241,13 +239,10 @@ pub fn unsupported() -> Option<String> {
     if !Path::new("/run/systemd/system").exists() {
         return Some("systemd on the node".into());
     }
+    let platform = crate::platform::current();
     for tool in ["mkfs.ext4", "resize2fs", "losetup", "systemd-escape"] {
-        let found = std::env::var_os("PATH")
-            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(tool).exists()))
-            || Path::new("/sbin").join(tool).exists()
-            || Path::new("/usr/sbin").join(tool).exists();
-        if !found {
-            return Some(format!("{tool} on the node (apt install e2fsprogs mount)"));
+        if let Err(missing) = platform.tool(tool) {
+            return Some(missing.to_string());
         }
     }
     None
@@ -271,10 +266,7 @@ async fn run_within(
 ) -> anyhow::Result<String> {
     let output = Command::new(program)
         .args(args)
-        .env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        )
+        .env("PATH", crate::platform::tool_path())
         .kill_on_drop(true)
         .output();
     let output = tokio::time::timeout(within, output)

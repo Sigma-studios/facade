@@ -1044,8 +1044,8 @@ fn node_alert(alert: &AlertView, name: &str, kind: &str, node: Option<&NodeFact>
             if kind == "upkeep"
                 && let Some(u) = node.and_then(|n| n.upkeep.as_ref())
             {
-                let security = u.security.unwrap_or(0) > 0;
-                f = match (security, u.reboot_required) {
+                let security = u.security() > 0;
+                f = match (security, u.reboot_required()) {
                     (true, true) => f.hint("run sudo apt upgrade on the node, then reboot it"),
                     (true, false) => f.hint("run sudo apt upgrade on the node"),
                     (false, true) => f.hint("reboot the node when you can: sudo reboot"),
@@ -1203,11 +1203,12 @@ mod tests {
         let mut facts = facts;
         facts.nodes[0].upkeep = Some(Upkeep {
             at: NOW,
-            updates: Some(3),
-            security: Some(1),
-            packages: vec![],
-            reboot_required: false,
-            reboot_packages: vec![],
+            updates: facade_core::events::Checked::Known(facade_core::events::Updates::Packages {
+                count: 3,
+                security: 1,
+                names: vec![],
+            }),
+            reboot: facade_core::events::Checked::Known(Default::default()),
         });
         let list = run(&facts);
         // Critical first, oldest first among them.

@@ -54,6 +54,10 @@ pub struct NodeView {
     /// them); it keeps retrying.
     #[serde(default)]
     pub ingress_errors: Vec<String>,
+    /// The system it runs on, as its agent last said (`None`: an agent from
+    /// before platforms, or never connected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<crate::platform::PlatformInfo>,
     /// Pending system updates and reboot, as the node last said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upkeep: Option<crate::events::Upkeep>,

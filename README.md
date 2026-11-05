@@ -1008,8 +1008,11 @@ Entries are kept 90 days.
   the agent reads what the system already knows about updates (Ubuntu's `apt-check`,
   or `apt list --upgradable`; it never runs `apt update`) and `/var/run/reboot-required`:
   the node's header shows `7 updates (2 security) · reboot required`, its packages in
-  the tooltip, and a pending reboot or security update is an alert. The node's uptime
-  links to its last reboot.
+  the tooltip, and a pending reboot or security update is an alert. A check that could
+  not run says so (`couldn't check updates`, the reason in its tooltip) instead of
+  reading as nothing to do; on a system facade doesn't support, the node shows a grey
+  `best effort: Debian GNU/Linux 13` badge. `facade node list` has the system of each
+  node and notes what it couldn't check. The node's uptime links to its last reboot.
 
 Agents keep their entries while the server is away and send them when it is back.
 Members see the entries of the apps they manage; node and server-wide entries are for

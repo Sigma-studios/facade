@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Installs facade on an Ubuntu/Debian machine, as root.
+# Installs facade on an Ubuntu machine, as root. NixOS installs come from the
+# flake's module instead (see the README); other systems are best effort, with
+# --unsupported-distro.
 #
 #   install.sh server [public_host] [--domain facade.example.com] [--email you@example.com]
 #       the control plane (also runs apps on this machine). With --domain, the web UI
@@ -27,14 +29,31 @@ die() { echo "error: $*" >&2; exit 1; }
 positional=()
 domain=""
 email=""
+unsupported=no
 while [[ $# -gt 0 ]]; do
     case $1 in
         --domain) domain=${2:?--domain needs a value}; shift 2 ;;
         --email) email=${2:?--email needs a value}; shift 2 ;;
+        --unsupported-distro) unsupported=yes; shift ;;
         -*) die "unknown option $1" ;;
         *) positional+=("$1"); shift ;;
     esac
 done
+
+# Supported: Ubuntu. NixOS has its own way in; anything else runs apps, best effort.
+os_id=$( (. /etc/os-release 2>/dev/null && echo "${ID:-}") || true)
+os_name=$( (. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$ID}") || true)
+case $os_id in
+    ubuntu) ;;
+    nixos)
+        die "on NixOS, install facade with its flake's module (services.facade), not this script: see the README" ;;
+    *)
+        if [[ $unsupported != yes ]]; then
+            die "facade supports Ubuntu and NixOS; this machine runs ${os_name:-an unknown system}.
+  Apps would still run (best effort), without update or reboot checks: add --unsupported-distro to install anyway."
+        fi
+        echo "warning: ${os_name:-an unknown system} is not supported: installing anyway (best effort)" >&2 ;;
+esac
 
 if ! command -v docker >/dev/null; then
     echo "installing Docker…"
@@ -42,7 +61,11 @@ if ! command -v docker >/dev/null; then
 fi
 # git fetches repositories, over SSH for deploy keys.
 if ! command -v git >/dev/null || ! command -v ssh >/dev/null; then
-    apt-get update -qq && apt-get install -y -qq git openssh-client
+    if command -v apt-get >/dev/null; then
+        apt-get update -qq && apt-get install -y -qq git openssh-client
+    else
+        die "install git and an SSH client, then run this again"
+    fi
 fi
 
 install -m 0755 "$binary" /usr/local/bin/facaded

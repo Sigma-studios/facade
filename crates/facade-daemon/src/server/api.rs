@@ -581,6 +581,7 @@ fn node_views(server: &Server) -> anyhow::Result<Vec<NodeView>> {
                     .filter(|_| conn.is_some())
                     .map(|l| l.ingress_errors.clone())
                     .unwrap_or_default(),
+                platform: live.nodes.get(&n.name).and_then(|l| l.platform.clone()),
                 upkeep: server.activity.upkeep(&n.name),
                 disk_errors: server.activity.disk_trouble(&n.name),
                 name: n.name,

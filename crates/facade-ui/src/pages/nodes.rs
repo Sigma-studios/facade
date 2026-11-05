@@ -412,6 +412,11 @@ fn node_facts(node: &NodeView) -> String {
         facts.push(format!("{} memory", bytes(s.mem_total)));
         facts.push(format!("{} disk", bytes(s.disk_total)));
     }
+    match &node.platform {
+        Some(p) => facts.push(p.os.name()),
+        None if node.connected => facts.push("platform unknown (update its agent)".into()),
+        None => {}
+    }
     facts.push(match (&node.public_ip, node.public_ip_manual) {
         (Some(ip), true) => format!("{ip} (set by hand)"),
         (Some(ip), false) => ip.clone(),

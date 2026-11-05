@@ -327,6 +327,7 @@ async fn accept(
             started,
             boot,
             commit,
+            platform,
             ..
         } => {
             if protocol > PROTOCOL_VERSION {
@@ -351,6 +352,7 @@ async fn accept(
                 started,
                 boot,
                 commit,
+                platform,
             };
             control(server, stream, peer, node, hostname, build).await
         }
@@ -367,6 +369,7 @@ struct AgentBuild {
     started: Option<u64>,
     boot: Option<u64>,
     commit: Option<String>,
+    platform: Option<facade_core::platform::PlatformInfo>,
 }
 
 async fn control(
@@ -385,6 +388,7 @@ async fn control(
         started,
         boot,
         commit,
+        platform,
     } = build;
     let (read, mut write) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(256);
@@ -424,6 +428,7 @@ async fn control(
         entry.binary = binary.clone();
         entry.arch = arch.clone();
         entry.protocol = protocol;
+        entry.platform = platform;
     }
     info!(%node, %peer, %hostname, "node connected");
     super::events::agent_connected(

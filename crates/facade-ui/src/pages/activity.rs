@@ -6,7 +6,8 @@
 use std::time::Duration;
 
 use facade_core::api::{AppView, NodeView};
-use facade_core::events::{Category, EventKind, EventView, EventsPage, Scope, Severity};
+use facade_core::events::{Category, EventKind, EventView, EventsPage, Scope, Severity, Updates};
+use facade_core::platform::Support;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
@@ -363,19 +364,22 @@ pub fn NodeBadges(#[prop(into)] node: Signal<Option<NodeView>>) -> impl IntoView
         let u = n.upkeep?;
         let badge = u.badge()?;
         let mut tip = vec![];
-        if !u.packages.is_empty() {
-            let more = u.updates.unwrap_or(0) as usize > u.packages.len();
+        if let Some(Updates::Packages { count, names, .. }) = u.updates.known()
+            && !names.is_empty()
+        {
+            let more = *count as usize > names.len();
             tip.push(format!(
                 "Updates: {}{}",
-                u.packages.join(", "),
+                names.join(", "),
                 if more { ", …" } else { "" }
             ));
         }
-        if u.reboot_required {
-            tip.push(if u.reboot_packages.is_empty() {
+        if u.reboot_required() {
+            let reasons = u.reboot_reasons();
+            tip.push(if reasons.is_empty() {
                 "A reboot is required.".to_string()
             } else {
-                format!("Reboot required by {}.", u.reboot_packages.join(", "))
+                format!("Reboot required by {}.", reasons.join(", "))
             });
         }
         tip.push(format!("Read {}; façade never installs them.", ago(u.at)));
@@ -395,7 +399,49 @@ pub fn NodeBadges(#[prop(into)] node: Signal<Option<NodeView>>) -> impl IntoView
             </A>
         })
     };
-    view! { {upkeep} {disk} }
+    // A system facade only does its best on, or checks it could not run.
+    let platform = move || {
+        let n = node.get()?;
+        let p = n.platform.as_ref()?;
+        let unknown = n.upkeep.as_ref().map(|u| u.unknown()).unwrap_or_default();
+        let kernel = p
+            .kernel
+            .as_ref()
+            .map(|k| format!("Kernel {k}."))
+            .unwrap_or_default();
+        if p.support == Support::BestEffort {
+            let mut tip = vec![format!(
+                "facade supports Ubuntu and NixOS. It runs apps on {}, but cannot check everything there.",
+                p.os.name()
+            )];
+            tip.extend(unknown);
+            tip.push(kernel);
+            return Some(
+                view! {
+                    <span class="badge badge-neutral" title=tip.join("\n")>{p.label()}</span>
+                }
+                .into_any(),
+            );
+        }
+        if unknown.is_empty() {
+            return None;
+        }
+        let what = n
+            .upkeep
+            .as_ref()
+            .map(
+                |u| match (u.updates.known().is_none(), u.reboot.known().is_none()) {
+                    (true, true) => "updates and reboot",
+                    (true, false) => "updates",
+                    _ => "reboot",
+                },
+            )
+            .unwrap_or("updates");
+        Some(view! {
+            <span class="badge badge-muted" title=unknown.join("\n")>{format!("couldn't check {what}")}</span>
+        }.into_any())
+    };
+    view! { {platform} {upkeep} {disk} }
 }
 
 /// A node's uptime, leading to its last reboot's entry when there is one.
