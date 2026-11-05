@@ -43,6 +43,14 @@ everything scriptable from a CLI with `--json` output.
 | `facade-cli` | `facade` | the CLI |
 | `facade-ui` | | web UI (Leptos, WebAssembly), embedded in `facaded` |
 
+## Supported systems
+
+facade supports **Ubuntu** (install below) and **NixOS** (a flake with a NixOS module,
+and a template installing NixOS with facade on a fresh VPS: see
+[nix/README.md](nix/README.md)). Every feature works on both. Any other Linux with
+systemd and Docker runs apps too, best effort: `install.sh --unsupported-distro`, and the
+node says which host checks (updates, reboots, vulnerabilities) it cannot do there.
+
 ## Install on a VPS (Ubuntu)
 
 On the VPS, with the latest build of main (`aarch64` instead of `x86_64` for ARM):

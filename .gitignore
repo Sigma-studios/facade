@@ -1,3 +1,4 @@
 /target
 /dist
 crates/facade-ui/dist
+/result*

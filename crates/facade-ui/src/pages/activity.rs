@@ -374,6 +374,20 @@ pub fn NodeBadges(#[prop(into)] node: Signal<Option<NodeView>>) -> impl IntoView
                 if more { ", …" } else { "" }
             ));
         }
+        if let Some(Updates::Channel(c)) = u.updates.known() {
+            let rev = c.revision.get(..7).unwrap_or(&c.revision);
+            tip.push(match (c.behind_days, c.behind_commits) {
+                (Some(d), Some(n)) if n > 0 => format!(
+                    "Built from nixpkgs {rev}: {n} commits ({d} days) behind {}.",
+                    c.branch
+                ),
+                (Some(_), _) => format!("Built from nixpkgs {rev}, the head of {}.", c.branch),
+                _ => format!("Built from nixpkgs {rev} ({}).", c.branch),
+            });
+            if c.eol {
+                tip.push(format!("NixOS {} gets no security fixes any more: move to a newer release.", c.release));
+            }
+        }
         if u.reboot_required() {
             let reasons = u.reboot_reasons();
             tip.push(if reasons.is_empty() {
