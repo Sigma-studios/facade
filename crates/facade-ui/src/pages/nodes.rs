@@ -573,21 +573,28 @@ fn NodeMetrics(
                 {connected.then(|| view! { <DiskMeter storage used=disk_used total=disk_total bare=true/> })}
                 <Sparkline title="Disk" points=disk span=span gap=gap max=Signal::stored(Some(disk_total as f64))
                     format=|v| bytes(v as u64) bare=true axis=true/>
-                <Show when=move || has_disk_io.get()>
-                    <div class="metric-sub metric-sub-split">
-                        <span>"Activity"</span>
+            </section>
+            // Its own card: under the space chart it made the row twice as tall.
+            <Show when=move || has_disk_io.get()>
+                <section class="metric-panel">
+                    <div class="metric-label">"Disk activity"</div>
+                    {figure(
+                        Signal::derive(move || match (last(disk_read), last(disk_write)) {
+                            (Some(r), Some(w)) => format!("↓ {} · ↑ {}", rate(r), rate(w)),
+                            _ => "—".into(),
+                        }),
+                        String::new(),
+                    )}
+                    <div class="metric-sub">
+                        "read · write"
                         {move || disk_wait().filter(|_| connected).map(|(v, why)| view! {
-                            <span class="muted" title=why>{format!("waiting {} of the time", share(v / 100.0))}</span>
+                            <span title=format!("{why} (time spent waiting on the disk)")>{format!(" · waiting {}", share(v / 100.0))}</span>
                         })}
                     </div>
                     <Sparkline title="Disk activity" points=disk_read span=span gap=gap max=Signal::stored(None)
                         format=rate bare=true axis=true extra=disk_write extra_label="write" calm=true/>
-                    <div class="spark-legend small muted">
-                        <span class="spark-key-avg"></span>"read"
-                        <span class="spark-key-extra spark-key-calm"></span>"write"
-                    </div>
-                </Show>
-            </section>
+                </section>
+            </Show>
             <section class="metric-panel">
                 <div class="metric-label">"Network"</div>
                 {figure(
@@ -595,15 +602,11 @@ fn NodeMetrics(
                         (Some(i), Some(o)) => format!("↓ {} · ↑ {}", rate(i), rate(o)),
                         _ => "—".into(),
                     }),
-                    "in · out".into(),
+                    String::new(),
                 )}
-                <div class="metric-sub">"In"</div>
+                <div class="metric-sub">"in · out · "<super::insights::NodeMonth name=name.clone()/></div>
                 <Sparkline title="Received" points=net_in span=span gap=gap max=Signal::stored(None)
-                    format=rate bare=true/>
-                <div class="metric-sub">"Out"</div>
-                <Sparkline title="Sent" points=net_out span=span gap=gap max=Signal::stored(None)
-                    format=rate bare=true axis=true/>
-                <super::insights::NodeMonth name=name.clone()/>
+                    format=rate bare=true axis=true extra=net_out extra_label="out" calm=true/>
             </section>
             // How often tasks waited for CPU, memory or disk (Linux PSI).
             <Show when=move || has_pressure.get()>
@@ -613,22 +616,24 @@ fn NodeMetrics(
                         Signal::derive(move || pressure.get().and_then(|p| p.strain()).map(|s| s.to_string()).unwrap_or_else(|| "—".into())),
                         "strain".into(),
                     )}
-                    {[
-                        ("Memory", pressure_mem, false, (|p| p.memory) as fn(&facade_core::resources::Pressure) -> _),
-                        ("CPU", pressure_cpu, false, |p| p.cpu),
-                        ("Disk waiting", pressure_io, true, |p| p.io),
-                    ].into_iter().map(|(label, series, axis, pick)| view! {
-                        <div class="metric-sub metric-sub-split">
-                            <span>{label}</span>
-                            // The last minute's, as the strain is judged; else the chart's last.
-                            <span class="muted">{move || {
-                                let now = pressure.get().as_ref().and_then(pick).map(|p| p.avg60).filter(|_| connected);
-                                now.or_else(|| last(series)).map(|v| format!("{v:.1} %")).unwrap_or_default()
-                            }}</span>
-                        </div>
-                        <Sparkline title=label points=series span=span gap=gap max=Signal::stored(Some(10.0))
-                            format=|v| format!("{v:.1} %") bare=true axis=axis/>
-                    }).collect_view()}
+                    // The last minute's, as the strain is judged; else the chart's last.
+                    <div class="metric-sub">{move || {
+                        let now = |series: Signal<Vec<crate::components::Sample>>, pick: fn(&facade_core::resources::Pressure) -> Option<facade_core::resources::Psi>| {
+                            pressure.get().as_ref().and_then(pick).map(|p| p.avg60).filter(|_| connected)
+                                .or_else(|| last(series))
+                                .map(|v| format!("{v:.1} %"))
+                                .unwrap_or_else(|| "—".into())
+                        };
+                        format!(
+                            "mem {} · CPU {} · disk {}",
+                            now(pressure_mem, |p| p.memory),
+                            now(pressure_cpu, |p| p.cpu),
+                            now(pressure_io, |p| p.io),
+                        )
+                    }}</div>
+                    // Memory and disk waits hurt first; CPU waits are in the line above.
+                    <Sparkline title="Memory waiting" points=pressure_mem span=span gap=gap max=Signal::stored(Some(10.0))
+                        format=|v| format!("{v:.1} %") bare=true axis=true extra=pressure_io extra_label="disk" calm=true/>
                 </section>
             </Show>
             // Its apps' requests through its entry point, added up.

@@ -277,7 +277,11 @@ p { margin: 0 0 12px; }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px 16px 12px;
+  /* Charts side by side keep their plots level when one head wraps (a legend). */
+  display: flex;
+  flex-direction: column;
 }
+.spark > .spark-plot, .spark > .spark-empty { margin-top: auto; }
 .spark-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
 .spark-title { font-size: 12.5px; color: var(--text-secondary); font-weight: 500; }
 .spark-now { font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -596,7 +600,10 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 
 /* ---------------------------------------------------------------- app page */
 
-.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 20px; overflow-x: auto; }
+.tabs { display: flex; gap: 2px; box-shadow: inset 0 -1px 0 var(--border); margin-bottom: 20px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+/* Swiped sideways on a narrow screen; a scrollbar (with arrows, where the system
+   always shows them) would only clutter the line. */
+.tabs::-webkit-scrollbar { display: none; }
 .tab {
   background: none;
   border: 0;
@@ -606,7 +613,7 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
   color: var(--text-secondary);
   padding: 8px 14px;
   cursor: pointer;
-  margin-bottom: -1px;
+  white-space: nowrap;
 }
 .tab:hover { color: var(--text-primary); }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
@@ -861,9 +868,17 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
 }
 .metric-label { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); font-weight: 500; }
 .metric-figure { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; margin-top: -4px; }
-.metric-value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.metric-value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; white-space: nowrap; }
+/* One line each, so the cards of a row keep one height: long speeds (in · out)
+   shrink a little in narrow cards, details end in … with the rest on hover. */
+.metric-panel { container-type: inline-size; }
+@container (max-width: 260px) { .metric-value { font-size: 18px; } }
+.metric-panel > .metric-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .metric-of { font-size: 12.5px; color: var(--text-muted); }
 .spark-bare { border: 0; padding: 0; background: none; }
+/* Cards in a row are as tall as the tallest: their charts line up at the bottom,
+   any spare room goes above them. */
+.metric-panel > .spark { margin-top: auto; }
 .spark-bare .spark-plot, .spark-bare .spark-empty { height: 84px; }
 /* The scale above the plot, clear of the line. */
 .spark-bare .spark-plot { margin-top: 18px; }

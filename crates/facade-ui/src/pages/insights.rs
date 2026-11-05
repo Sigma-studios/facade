@@ -356,11 +356,12 @@ pub fn NodeMonth(name: String) -> impl IntoView {
         data.data.get().map(|i| {
             let b = i.bandwidth;
             view! {
-                <div class="metric-sub">"This month"</div>
-                <div class="metric-month" title="Served to visitors through the entry point since the 1st (UTC), TLS included: what a provider's traffic quota counts">
-                    <strong>{format!("{} served", bytes(b.month_out))}</strong>
-                    <span class="muted">{format!(" · {} received", bytes(b.month_in))}</span>
-                </div>
+                <span class="metric-month" title=format!(
+                    "Served to visitors through the entry point since the 1st (UTC), TLS included: what a provider's traffic quota counts. Received: {}",
+                    bytes(b.month_in)
+                )>
+                    {format!("{} this month", bytes(b.month_out))}
+                </span>
             }
         })
     }
