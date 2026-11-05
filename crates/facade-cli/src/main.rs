@@ -58,6 +58,8 @@ enum Command {
     Passwd,
     /// Nodes and apps at a glance.
     Status,
+    /// What is wrong right now and where to fix it; a problem is gone once fixed.
+    Problems,
     /// Firing and recently resolved alerts; `config`, `test` and `weekly` for Discord.
     Alerts {
         #[command(subcommand)]
@@ -1511,6 +1513,18 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
             print_nodes(&status.nodes);
             println!();
             print_apps(&status.apps);
+            // Servers from before problems answer 404: nothing to say then.
+            if let Ok(problems) = api.get::<Vec<Problem>>("/api/problems").await {
+                println!();
+                println!("{}", problems_count(&problems));
+            }
+        }
+        Command::Problems => {
+            let problems: Vec<Problem> = api.get("/api/problems").await?;
+            if json {
+                return print_json(&problems);
+            }
+            print_problems(&problems, api.saved.server.trim_end_matches('/'));
         }
         Command::Alerts {
             action: Some(AlertsCommand::Test),
@@ -4430,6 +4444,63 @@ fn print_node_table(nodes: &[NodeView]) {
                     .unwrap_or_else(|| "never".into()),
             ]
         }),
+    );
+}
+
+/// `no problems`, or `3 problems (1 critical): facade problems`.
+fn problems_count(problems: &[Problem]) -> String {
+    let critical = problems
+        .iter()
+        .filter(|p| p.severity == ProblemSeverity::Critical)
+        .count();
+    match problems.len() {
+        0 => "no problems".into(),
+        n => format!(
+            "{n} problem{}{}: facade problems",
+            if n == 1 { "" } else { "s" },
+            if critical > 0 {
+                format!(" ({critical} critical)")
+            } else {
+                String::new()
+            }
+        ),
+    }
+}
+
+/// Each problem on a line, then what it concerns, since when and where it is
+/// fixed in the web UI (`web` is its address), then what to do.
+fn print_problems(problems: &[Problem], web: &str) {
+    if problems.is_empty() {
+        println!("no problems");
+        return;
+    }
+    for p in problems {
+        let icon = match p.severity {
+            ProblemSeverity::Critical => "✕",
+            ProblemSeverity::Warning => "⚠",
+        };
+        println!("{icon} {}", p.message);
+        let mut facts = Vec::new();
+        match p.subject() {
+            ("server", _) => {}
+            (kind, name) => facts.push(format!("{kind} {name}")),
+        }
+        if let Some(since) = p.since {
+            facts.push(format!(
+                "for {}",
+                output::ago(since).trim_end_matches(" ago")
+            ));
+        }
+        facts.push(format!("{}: {web}{}", p.fix_label, p.fix));
+        println!("  {}", facts.join(" · "));
+        if let Some(hint) = &p.hint {
+            println!("  → {hint}");
+        }
+    }
+    println!();
+    println!(
+        "{}",
+        problems_count(problems).replace(": facade problems", "")
     );
 }
 
