@@ -793,7 +793,9 @@ requests and the share answered 5xx. `facade metrics <app>` prints them, with th
 last five minutes summed up (also in `facade app show`). Apps with no domain show none.
 
 An entry point starts counting from zero when it starts, including when it hands over
-to a new version: the period of the handover shows as a gap. Entry points from before
+to a new version: the period of the handover shows as a gap, and what the old process
+counted since the agent's last reading (up to 15 seconds of requests, bytes and failed
+requests) is left out of the totals. Entry points from before
 this counting (until the first handover to a newer `facaded`) report no traffic.
 
 ### Limits, disks and pressure

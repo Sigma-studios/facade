@@ -9,8 +9,9 @@ use super::Store;
 use crate::hll;
 
 pub const SCHEMA: &str = "
--- Bytes through the entry point (as on the wire) and a HyperLogLog sketch of
--- the visitors, per app and UTC day.
+-- Bytes through the entry point (as on the wire), requests and those answered
+-- 5xx (`requests` and `errors_5xx`, NULL on days from before they were counted),
+-- and a HyperLogLog sketch of the visitors, per app and UTC day.
 CREATE TABLE IF NOT EXISTS edge_daily (
     app TEXT NOT NULL,
     day INTEGER NOT NULL,
@@ -75,29 +76,70 @@ pub struct ErrorAdd<'a> {
     pub last_seen: u64,
 }
 
+/// `(day, requests, 5xx)`, the counts `None` on days from before they were kept.
+pub type DayRequests = (u64, Option<u64>, Option<u64>);
+
+/// What a reading of an app's counters adds to its day.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DayAdd {
+    pub received: u64,
+    pub sent: u64,
+    pub requests: u64,
+    pub errors_5xx: u64,
+}
+
+pub(super) fn migrate(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    super::add_column(conn, "edge_daily", "requests", "INTEGER")?;
+    super::add_column(conn, "edge_daily", "errors_5xx", "INTEGER")?;
+    Ok(())
+}
+
 impl Store {
-    pub fn add_bytes(
-        &self,
-        app: &str,
-        node: &str,
-        day: u64,
-        received: u64,
-        sent: u64,
-    ) -> anyhow::Result<()> {
+    /// Adds to an app's day (and its node's bytes).
+    pub fn add_day(&self, app: &str, node: &str, day: u64, add: DayAdd) -> anyhow::Result<()> {
         let conn = self.0.lock();
         conn.execute(
-            "INSERT INTO edge_daily (app, day, bytes_in, bytes_out) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO edge_daily (app, day, bytes_in, bytes_out, requests, errors_5xx)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (app, day) DO UPDATE SET
-                bytes_in = bytes_in + excluded.bytes_in, bytes_out = bytes_out + excluded.bytes_out",
-            params![app, day as i64, received as i64, sent as i64],
+                bytes_in = bytes_in + excluded.bytes_in, bytes_out = bytes_out + excluded.bytes_out,
+                requests = COALESCE(requests, 0) + excluded.requests,
+                errors_5xx = COALESCE(errors_5xx, 0) + excluded.errors_5xx",
+            params![
+                app,
+                day as i64,
+                add.received as i64,
+                add.sent as i64,
+                add.requests as i64,
+                add.errors_5xx as i64
+            ],
         )?;
         conn.execute(
             "INSERT INTO edge_node_daily (node, day, bytes_in, bytes_out) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (node, day) DO UPDATE SET
                 bytes_in = bytes_in + excluded.bytes_in, bytes_out = bytes_out + excluded.bytes_out",
-            params![node, day as i64, received as i64, sent as i64],
+            params![node, day as i64, add.received as i64, add.sent as i64],
         )?;
         Ok(())
+    }
+
+    /// An app's `(day, requests, 5xx)` from `from` on; `None` for days from
+    /// before requests were counted per day.
+    pub fn requests_by_day(&self, app: &str, from: u64) -> anyhow::Result<Vec<DayRequests>> {
+        let conn = self.0.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT day, requests, errors_5xx FROM edge_daily WHERE app = ?1 AND day >= ?2 ORDER BY day",
+        )?;
+        let rows = stmt
+            .query_map(params![app, from as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, Option<i64>>(1)?.map(|n| n as u64),
+                    r.get::<_, Option<i64>>(2)?.map(|n| n as u64),
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Bytes `(day, received, sent)` of an app (or, `node`, a node) from `from` on.
@@ -341,9 +383,17 @@ mod tests {
     #[test]
     fn bytes_visitors_and_errors_add_up() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        store.add_bytes("a", "main", 10, 100, 1000).unwrap();
-        store.add_bytes("a", "main", 10, 1, 10).unwrap();
-        store.add_bytes("a", "eu", 11, 5, 50).unwrap();
+        let add = |received, sent, requests, errors_5xx| DayAdd {
+            received,
+            sent,
+            requests,
+            errors_5xx,
+        };
+        store
+            .add_day("a", "main", 10, add(100, 1000, 7, 1))
+            .unwrap();
+        store.add_day("a", "main", 10, add(1, 10, 3, 0)).unwrap();
+        store.add_day("a", "eu", 11, add(5, 50, 2, 2)).unwrap();
         assert_eq!(
             store.bytes_by_day("a", false, 0).unwrap(),
             [(10, 101, 1010), (11, 5, 50)]
@@ -352,6 +402,20 @@ mod tests {
             store.bytes_by_day("main", true, 0).unwrap(),
             [(10, 101, 1010)]
         );
+        assert_eq!(
+            store.requests_by_day("a", 0).unwrap(),
+            [(10, Some(10), Some(1)), (11, Some(2), Some(2))]
+        );
+        // A day from before requests were counted says so.
+        store
+            .0
+            .lock()
+            .execute(
+                "INSERT INTO edge_daily (app, day, bytes_in, bytes_out) VALUES ('a', 9, 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.requests_by_day("a", 9).unwrap()[0], (9, None, None));
 
         let mut a = vec![0u8; hll::REGISTERS];
         a[0] = 3;

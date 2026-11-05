@@ -24,7 +24,7 @@ use tracing::warn;
 use super::Server;
 use super::api::{ApiError, ApiResult, User};
 use super::store::Store;
-use super::store::edge::{ERROR_BUCKET, ErrorAdd};
+use super::store::edge::{DayAdd, ERROR_BUCKET, ErrorAdd};
 use super::users::load_app_for;
 use crate::hll;
 
@@ -42,9 +42,47 @@ pub struct Edge {
 struct Marks {
     /// Nodes heard from since the server started.
     nodes: HashSet<String>,
-    /// App → its last byte counters: `(since, received, sent)`.
-    bytes: HashMap<String, (u64, u64, u64)>,
+    /// App → its last counters.
+    counts: HashMap<String, Counts>,
     errors: HashMap<String, ErrorMarks>,
+}
+
+/// An app's counters in one reading: when its entry point started counting,
+/// bytes received and sent, requests and those answered 5xx.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Counts {
+    since: u64,
+    received: u64,
+    sent: u64,
+    requests: u64,
+    errors_5xx: u64,
+}
+
+impl Counts {
+    /// What `self` adds to `before` (all of it, from a new entry point).
+    fn after(&self, before: &Counts) -> DayAdd {
+        let continues = before.since == self.since
+            && self.received >= before.received
+            && self.sent >= before.sent
+            && self.requests >= before.requests;
+        let base = if continues {
+            *before
+        } else {
+            Counts {
+                since: self.since,
+                received: 0,
+                sent: 0,
+                requests: 0,
+                errors_5xx: 0,
+            }
+        };
+        DayAdd {
+            received: self.received - base.received,
+            sent: self.sent - base.sent,
+            requests: self.requests - base.requests,
+            errors_5xx: self.errors_5xx.saturating_sub(base.errors_5xx),
+        }
+    }
 }
 
 struct ErrorMarks {
@@ -83,20 +121,30 @@ impl Edge {
 
         for stats in &report.apps {
             let Some(t) = &stats.traffic else { continue };
-            let now = (t.since, t.bytes_in, t.bytes_out);
-            let delta = match marks.bytes.insert(stats.app.clone(), now) {
-                Some((since, i, o)) if since == t.since && t.bytes_in >= i && t.bytes_out >= o => {
-                    Some((t.bytes_in - i, t.bytes_out - o))
-                }
-                // A new entry point counts from zero: all of it is new.
-                Some(_) => Some((t.bytes_in, t.bytes_out)),
-                None if heard_before => Some((t.bytes_in, t.bytes_out)),
+            let now = Counts {
+                since: t.since,
+                received: t.bytes_in,
+                sent: t.bytes_out,
+                requests: t.requests,
+                errors_5xx: t.server_errors,
+            };
+            // A new entry point counts from zero: all of it is new.
+            let zero = Counts {
+                since: t.since,
+                received: 0,
+                sent: 0,
+                requests: 0,
+                errors_5xx: 0,
+            };
+            let add = match marks.counts.insert(stats.app.clone(), now) {
+                Some(before) => Some(now.after(&before)),
+                None if heard_before => Some(now.after(&zero)),
                 None => None,
             };
-            if let Some((received, sent)) = delta.filter(|d| *d != (0, 0))
-                && let Err(e) = store.add_bytes(&stats.app, node, day, received, sent)
+            if let Some(add) = add.filter(|a| *a != DayAdd::default())
+                && let Err(e) = store.add_day(&stats.app, node, day, add)
             {
-                warn!("recording bytes of {}: {e:#}", stats.app);
+                warn!("recording bytes and requests of {}: {e:#}", stats.app);
             }
         }
 
@@ -403,6 +451,22 @@ mod tests {
             &report(&[("a", 9, 5, 7)], &[("a", 9, vec![tally("/y", 1, 50)])]),
         );
         assert_eq!(counts("a"), [("/x".into(), 4), ("/y".into(), 3)]);
+    }
+
+    #[test]
+    fn requests_add_up_across_a_new_entry_point() {
+        let c = |since, requests, errors_5xx| Counts {
+            since,
+            received: requests * 10,
+            sent: requests * 100,
+            requests,
+            errors_5xx,
+        };
+        let add = c(1, 120, 7).after(&c(1, 100, 5));
+        assert_eq!((add.requests, add.errors_5xx, add.sent), (20, 2, 2000));
+        // The entry point handed over: the new one's counts are all new.
+        let add = c(9, 30, 1).after(&c(1, 120, 7));
+        assert_eq!((add.requests, add.errors_5xx, add.received), (30, 1, 300));
     }
 
     #[test]

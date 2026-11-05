@@ -365,6 +365,7 @@ impl Store {
         events::migrate(&conn)?;
         conn.execute_batch(resources::SCHEMA)?;
         conn.execute_batch(edge::SCHEMA)?;
+        edge::migrate(&conn)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "node_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;
         add_column(&conn, "node_usage", "net_tx", "INTEGER NOT NULL DEFAULT 0")?;

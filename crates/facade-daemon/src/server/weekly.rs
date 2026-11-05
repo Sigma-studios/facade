@@ -445,9 +445,15 @@ pub fn gather(server: &Server, week: Week) -> anyhow::Result<Facts> {
             a.down += u64::from(d.down);
         }
         if !spec.domains.is_empty() || !spec.tls_ports.is_empty() {
-            let (this, last, errors) = requests(server, &name, before, start, week.until)?;
+            let (this, last, errors) = match daily_requests(server, &name, week)? {
+                Some(counts) => counts,
+                // Days from before requests were counted per day: from the
+                // usage history instead, which leaves out the 5 minutes
+                // around each restart of the entry point.
+                None => requests(server, &name, before, start, week.until)?,
+            };
             a.requests = Some(this);
-            a.requests_before = Some(last);
+            a.requests_before = last;
             a.errors_5xx = errors;
             let days: Vec<u64> = server
                 .store
@@ -517,6 +523,32 @@ pub fn gather(server: &Server, week: Week) -> anyhow::Result<Facts> {
     })
 }
 
+/// An app's requests in `week` and the week before, and its 5xx in the first,
+/// from what the entry point counted each day; `None` when a day of `week`
+/// is from before that (the week before is then `None` alone).
+fn daily_requests(
+    server: &Server,
+    app: &str,
+    week: Week,
+) -> anyhow::Result<Option<(u64, Option<u64>, u64)>> {
+    let (mut this, mut last, mut errors) = (0, Some(0u64), 0);
+    for (day, requests, errors_5xx) in server.store.requests_by_day(app, week.from_day - 7)? {
+        if day >= week.to_day {
+            continue;
+        }
+        if day >= week.from_day {
+            let Some(requests) = requests else {
+                return Ok(None);
+            };
+            this += requests;
+            errors += errors_5xx.unwrap_or(0);
+        } else {
+            last = last.zip(requests).map(|(a, b)| a + b);
+        }
+    }
+    Ok(Some((this, last, errors)))
+}
+
 /// An app's requests in `[start, until)` and in `[before, start)`, and its 5xx
 /// in the first, from its usage buckets: each one's rate times the time since
 /// the bucket before it (what the counters grew by).
@@ -526,7 +558,7 @@ fn requests(
     before: u64,
     start: u64,
     until: u64,
-) -> anyhow::Result<(u64, u64, u64)> {
+) -> anyhow::Result<(u64, Option<u64>, u64)> {
     let points = server
         .store
         .usage(UsageOf::App, app, before, USAGE_BUCKET)?;
@@ -548,7 +580,7 @@ fn requests(
     }
     Ok((
         this.round() as u64,
-        last.round() as u64,
+        Some(last.round() as u64),
         errors.round() as u64,
     ))
 }
