@@ -576,7 +576,7 @@ fn NodeMetrics(
             </section>
             // Its own card: under the space chart it made the row twice as tall.
             <Show when=move || has_disk_io.get()>
-                <section class="metric-panel">
+                <section class="metric-panel metric-long">
                     <div class="metric-label">"Disk activity"</div>
                     {figure(
                         Signal::derive(move || match (last(disk_read), last(disk_write)) {
@@ -595,7 +595,7 @@ fn NodeMetrics(
                         format=rate bare=true axis=true extra=disk_write extra_label="write" calm=true/>
                 </section>
             </Show>
-            <section class="metric-panel">
+            <section class="metric-panel metric-long">
                 <div class="metric-label">"Network"</div>
                 {figure(
                     Signal::derive(move || match (last(net_in), last(net_out)) {

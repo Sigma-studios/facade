@@ -873,6 +873,9 @@ input:disabled, textarea:disabled { background: var(--surface-2); color: var(--t
    shrink a little in narrow cards, details end in … with the rest on hover. */
 .metric-panel { container-type: inline-size; }
 @container (max-width: 260px) { .metric-value { font-size: 18px; } }
+/* Two speeds in one figure: sized to the card, whatever its width. */
+.metric-long .metric-value { font-size: min(22px, 7.6cqi); }
+.metric-long .metric-figure { overflow: hidden; }
 .metric-panel > .metric-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .metric-of { font-size: 12.5px; color: var(--text-muted); }
 .spark-bare { border: 0; padding: 0; background: none; }
