@@ -4,11 +4,17 @@
 //!
 //! Readings are cumulative (since the entry point started counting for the
 //! app), so the server keeps the last one of each app and adds the difference.
-//! Its first report from a node after the server starts only sets where counts
-//! stand: what came in while the server was away is not known. After that, an
-//! app or error group it has not heard of is new, and counts whole.
+//! The first reading of an app whose counting started before the server did
+//! only sets where counts stand: what came in while the server was away is not
+//! known, and what came before may be stored already. Counting that started
+//! since (a new app, a new entry point) is new, and counts whole, as does an
+//! error group not heard of before in an app already heard of.
+//!
+//! This is decided per app, not per node: the server's own agent restarts with
+//! it, and its first reports can come before it reaches the entry point, so a
+//! node heard of says nothing about the counts of its apps.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -33,15 +39,20 @@ const ERROR_ROWS: usize = 500;
 /// Days the visitors chart covers.
 pub const VISITOR_DAYS: u64 = 30;
 
-#[derive(Default)]
 pub struct Edge {
     marks: Mutex<Marks>,
+    /// When the server started.
+    started: u64,
+}
+
+impl Default for Edge {
+    fn default() -> Self {
+        Self::started_at(facade_core::now())
+    }
 }
 
 #[derive(Default)]
 struct Marks {
-    /// Nodes heard from since the server started.
-    nodes: HashSet<String>,
     /// App → its last counters.
     counts: HashMap<String, Counts>,
     errors: HashMap<String, ErrorMarks>,
@@ -113,10 +124,17 @@ fn added(
 }
 
 impl Edge {
+    fn started_at(started: u64) -> Self {
+        Self {
+            marks: Default::default(),
+            started,
+        }
+    }
+
     /// Takes what a node's report adds: bytes, failed requests, visitors.
     pub fn record(&self, store: &Store, node: &str, at: u64, report: &NodeReport) {
         let mut marks = self.marks.lock();
-        let heard_before = !marks.nodes.insert(node.to_string());
+        let started = self.started;
         let day = day_of(at);
 
         for stats in &report.apps {
@@ -138,7 +156,7 @@ impl Edge {
             };
             let add = match marks.counts.insert(stats.app.clone(), now) {
                 Some(before) => Some(now.after(&before)),
-                None if heard_before => Some(now.after(&zero)),
+                None if t.since >= started => Some(now.after(&zero)),
                 None => None,
             };
             if let Some(add) = add.filter(|a| *a != DayAdd::default())
@@ -165,7 +183,7 @@ impl Edge {
                     groups: HashMap::new(),
                 };
             }
-            let whole = !fresh || heard_before || restarted;
+            let whole = !fresh || reading.since >= started || restarted;
             let mut adds = Vec::new();
             for e in &reading.errors {
                 let key = (e.status, e.method.clone(), e.path.clone());
@@ -393,7 +411,8 @@ mod tests {
     #[test]
     fn readings_add_what_they_grew_by() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let edge = Edge::default();
+        // Counting that started at 1 is from before the server; at 7 and 9, since.
+        let edge = Edge::started_at(5);
         let at = 86_400 * 10 + 60;
         // The first report after the server started: where counts stand.
         edge.record(
@@ -451,6 +470,31 @@ mod tests {
             &report(&[("a", 9, 5, 7)], &[("a", 9, vec![tally("/y", 1, 50)])]),
         );
         assert_eq!(counts("a"), [("/x".into(), 4), ("/y".into(), 3)]);
+    }
+
+    #[test]
+    fn a_first_report_without_counters_does_not_make_them_new() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let edge = Edge::started_at(5);
+        let at = 86_400 * 10 + 60;
+        // The server's own agent, restarted with it, before it reached the
+        // entry point: no counters yet.
+        edge.record(&store, "main", at, &report(&[], &[]));
+        // Then the entry point's counts since it started, before the server.
+        edge.record(
+            &store,
+            "main",
+            at + 15,
+            &report(&[("a", 1, 100, 1000)], &[]),
+        );
+        assert!(store.bytes_by_day("a", false, 0).unwrap().is_empty());
+        edge.record(
+            &store,
+            "main",
+            at + 30,
+            &report(&[("a", 1, 150, 1200)], &[]),
+        );
+        assert_eq!(store.bytes_by_day("a", false, 0).unwrap(), [(10, 50, 200)]);
     }
 
     #[test]
