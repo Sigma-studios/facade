@@ -551,6 +551,18 @@ async fn offer_upgrade(server: &Server, node: &str, binary: Option<&str>, arch: 
     if node == server.cfg.local_node || binary == Some(own.sha256.as_str()) {
         return;
     }
+    // Nix installs the node's facade, or built the server's (for its own
+    // store paths): neither is sent.
+    let node_managed = server
+        .live
+        .read()
+        .nodes
+        .get(node)
+        .and_then(|l| l.platform.as_ref())
+        .is_some_and(|p| p.install.is_managed());
+    if node_managed || super::release::managed_hint().is_some() {
+        return;
+    }
     let target = if arch == Some(std::env::consts::ARCH) {
         own.sha256.clone()
     } else {

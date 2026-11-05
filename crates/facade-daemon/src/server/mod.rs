@@ -6,6 +6,7 @@ mod artifacts;
 mod autodeploy;
 pub mod backup_store;
 pub mod backups;
+mod channels;
 mod compose;
 mod dns;
 mod edge;
@@ -95,6 +96,8 @@ pub struct Server {
     pub problems: problems::Problems,
     /// The vulnerability check of what the nodes run.
     pub vulns: vulns::Vulns,
+    /// How far NixOS nodes are behind their nixpkgs branch.
+    pub channels: channels::Channels,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -624,6 +627,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         reach: Default::default(),
         problems: Default::default(),
         vulns: Default::default(),
+        channels: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -679,6 +683,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(weekly::run(server.clone()));
     tokio::spawn(problems::run(server.clone()));
     tokio::spawn(vulns::run(server.clone()));
+    tokio::spawn(channels::run(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
     let files_dir = server.cfg.data_dir.clone();

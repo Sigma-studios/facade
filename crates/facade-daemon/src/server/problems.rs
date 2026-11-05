@@ -1062,7 +1062,15 @@ fn node_alert(alert: &AlertView, name: &str, kind: &str, node: Option<&NodeFact>
                 && let Some(u) = node.and_then(|n| n.upkeep.as_ref())
             {
                 let security = u.security() > 0;
+                let channel = matches!(
+                    u.updates.known(),
+                    Some(facade_core::events::Updates::Channel(_))
+                );
                 f = match (security, u.reboot_required()) {
+                    _ if channel && !u.reboot_required() => f.hint(
+                        "update nixpkgs and rebuild: nix flake update nixpkgs, then nixos-rebuild switch",
+                    ),
+                    _ if channel => f.hint("rebuild with an updated nixpkgs, or reboot into the current system: sudo reboot"),
                     (true, true) => f.hint("run sudo apt upgrade on the node, then reboot it"),
                     (true, false) => f.hint("run sudo apt upgrade on the node"),
                     (false, true) => f.hint("reboot the node when you can: sudo reboot"),

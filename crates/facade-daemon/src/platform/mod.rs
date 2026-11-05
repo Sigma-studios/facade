@@ -1,6 +1,6 @@
 //! Everything facade does that depends on the node's distribution goes through
-//! here: how facade is installed, where runtime units go, where host tools are,
-//! pending updates, whether a reboot is needed.
+//! here: how facade is installed, where host tools are, pending updates,
+//! whether a reboot is needed, and what is installed.
 //!
 //! At start-up the daemon reads `/etc/os-release` and picks one backend; the
 //! rest only talks to [`Platform`]. A new distribution is one file implementing
@@ -8,6 +8,7 @@
 //! from each other: package managers in [`pkg`], reboot rules in [`reboot`].
 
 mod generic;
+pub mod nixos;
 pub mod pkg;
 pub mod reboot;
 mod ubuntu;
@@ -29,11 +30,6 @@ pub trait Platform: Send + Sync {
     /// How facade itself is installed, so how it updates.
     fn install_kind(&self) -> InstallKind {
         install_kind_from_exe()
-    }
-
-    /// Where the units facade writes at run time go (sized volumes).
-    fn unit_dir(&self) -> PathBuf {
-        PathBuf::from("/etc/systemd/system")
     }
 
     /// A host tool (`mkfs.ext4`, `losetup`, …), or how to get it.
@@ -102,6 +98,7 @@ pub fn current() -> &'static dyn Platform {
 pub fn detect(os: OsId) -> Box<dyn Platform> {
     match os.id.as_str() {
         "ubuntu" => Box::new(ubuntu::Ubuntu::new(os)),
+        "nixos" => Box::new(nixos::NixOs::new(os)),
         _ => Box::new(generic::Generic::new(os)),
     }
 }
@@ -195,6 +192,8 @@ mod tests {
         assert_eq!(debian.support(), Support::BestEffort);
         let mint = detect(os("ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n"));
         assert_eq!(mint.support(), Support::BestEffort);
+        let nixos = detect(os("ID=nixos\nVERSION_ID=\"26.05\"\n"));
+        assert_eq!(nixos.support(), Support::Supported);
     }
 
     #[test]

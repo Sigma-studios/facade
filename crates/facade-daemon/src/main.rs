@@ -94,6 +94,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Mount the volumes with a size kept under an agent's data directory (run
+    /// at boot by facade-volumes.service, before Docker).
+    MountVolumes {
+        /// The agent's data directory: /var/lib/facade/agent on a server,
+        /// /var/lib/facade-agent on another node.
+        dirs: Vec<PathBuf>,
+        /// Also install facade-volumes.service and take out the mount units
+        /// of older versions, as the agent does when it starts.
+        #[arg(long, hide = true)]
+        setup: bool,
+    },
     /// Copy the server's database and master key to <data_dir>/backups/_server.
     BackupState {
         #[arg(long, short, default_value = "/etc/facade/server.toml")]
@@ -130,6 +141,25 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::UpgradeCheck { config, json } => {
             upgrade::check(&config::ServerConfig::load(&config)?, json).await
+        }
+        Command::MountVolumes { dirs, setup } => {
+            let dirs = if dirs.is_empty() {
+                ["/var/lib/facade/agent", "/var/lib/facade-agent"]
+                    .map(PathBuf::from)
+                    .into_iter()
+                    .filter(|d| d.exists())
+                    .collect()
+            } else {
+                dirs
+            };
+            let mut result = Ok(());
+            for dir in dirs {
+                if let Err(e) = agent::mount_volumes(&dir, setup).await {
+                    eprintln!("{}: {e:#}", dir.display());
+                    result = Err(e);
+                }
+            }
+            result
         }
         Command::BackupState { config } => {
             upgrade::backup_state(&config::ServerConfig::load(&config)?)

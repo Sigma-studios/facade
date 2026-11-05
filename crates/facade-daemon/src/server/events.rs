@@ -52,6 +52,24 @@ impl Activity {
         self.nodes.read().get(node)?.upkeep.clone()
     }
 
+    /// Every node's upkeep.
+    pub fn all_upkeep(&self) -> Vec<Upkeep> {
+        self.nodes
+            .read()
+            .values()
+            .filter_map(|t| t.upkeep.clone())
+            .collect()
+    }
+
+    /// Adds what the server learnt since to every node's upkeep.
+    pub fn enrich_upkeep(&self, f: impl Fn(&mut Upkeep)) {
+        for track in self.nodes.write().values_mut() {
+            if let Some(u) = track.upkeep.as_mut() {
+                f(u);
+            }
+        }
+    }
+
     /// Disk errors of the last day.
     pub fn disk_trouble(&self, node: &str) -> Option<DiskTrouble> {
         let disk = self.nodes.read().get(node)?.disk.clone()?;
@@ -319,6 +337,9 @@ pub fn on_report(server: &Server, node: &str, report: &NodeReport) {
     let Some(upkeep) = &report.upkeep else {
         return;
     };
+    let mut upkeep = upkeep.clone();
+    server.channels.enrich(&mut upkeep);
+    let upkeep = &upkeep;
     let before = {
         let mut nodes = server.activity.nodes.write();
         let track = nodes.entry(node.to_string()).or_default();

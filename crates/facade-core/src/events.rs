@@ -513,14 +513,19 @@ impl Upkeep {
         }
     }
 
-    /// Worth an alert: a reboot waits, security updates do, or the system's
-    /// release gets no fixes any more.
+    /// Worth an alert: a reboot waits, security updates do, the system's
+    /// release gets no fixes any more, or its nixpkgs is two weeks behind its
+    /// branch (security fixes come that way on NixOS).
     pub fn needs_attention(&self) -> bool {
         self.reboot_required()
             || self.security() > 0
-            || matches!(self.updates.known(), Some(Updates::Channel(c)) if c.eol)
+            || matches!(self.updates.known(),
+                Some(Updates::Channel(c)) if c.eol || c.behind_days.is_some_and(|d| d >= CHANNEL_BEHIND_ALERT))
     }
 }
+
+/// Days behind its branch from which a NixOS node's upkeep is an alert.
+pub const CHANNEL_BEHIND_ALERT: u32 = 14;
 
 fn plural(n: u32) -> &'static str {
     if n == 1 { "" } else { "s" }

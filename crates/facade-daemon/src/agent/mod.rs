@@ -40,6 +40,15 @@ use crate::framing::{JsonLines, write_json};
 use crate::tls;
 use queue::BuildQueue;
 pub use routes::IngressMode;
+
+/// `facaded mount-volumes`.
+pub async fn mount_volumes(agent_dir: &std::path::Path, setup: bool) -> anyhow::Result<()> {
+    if setup {
+        let managed = crate::platform::current().install_kind().is_managed();
+        return sized::boot_setup(agent_dir, managed).await;
+    }
+    sized::mount_all(agent_dir).await
+}
 use runtime::Runtime;
 pub use runtime::{planned_image, run_key_matches};
 
@@ -170,6 +179,15 @@ impl Agent {
         tokio::spawn(cgroups::watch(self.runtime.clone()));
         tokio::spawn(events::run(self.clone()));
         tokio::spawn(inventory::watch(self.clone()));
+        {
+            let dir = self.runtime.dir().to_path_buf();
+            tokio::spawn(async move {
+                let managed = crate::platform::current().install_kind().is_managed();
+                if let Err(e) = sized::boot_setup(&dir, managed).await {
+                    warn!("mounting volumes with a size at boot: {e:#}");
+                }
+            });
+        }
         let mut backoff = Duration::from_secs(1);
         loop {
             let started = std::time::Instant::now();
@@ -743,6 +761,11 @@ impl Agent {
     async fn upgrade(&self, sha256: String) -> anyhow::Result<()> {
         if crate::selfbin::current().is_some_and(|b| b.sha256 == sha256) {
             return Ok(());
+        }
+        if let facade_core::platform::InstallKind::Managed { by, hint } =
+            crate::platform::current().install_kind()
+        {
+            bail!("facade is installed by {by} on this node: {hint}");
         }
         let path = crate::selfbin::installed_path()?;
         let name = path

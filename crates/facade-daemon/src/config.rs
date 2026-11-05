@@ -207,6 +207,9 @@ pub struct VulnsConfig {
     /// Where Ubuntu's OVAL files are (`com.ubuntu.<codename>.cve.oval.xml.bz2`),
     /// for a mirror or offline use.
     pub ubuntu_oval_url: String,
+    /// OSV's archive of upstream kernel vulnerabilities, matched against the
+    /// running kernel of NixOS nodes.
+    pub kernel_osv_url: String,
 }
 
 impl Default for VulnsConfig {
@@ -215,6 +218,8 @@ impl Default for VulnsConfig {
             enabled: true,
             alert_min: "critical".into(),
             ubuntu_oval_url: "https://security-metadata.canonical.com/oval".into(),
+            kernel_osv_url: "https://osv-vulnerabilities.storage.googleapis.com/Linux/all.zip"
+                .into(),
         }
     }
 }

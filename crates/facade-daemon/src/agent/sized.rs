@@ -2,10 +2,14 @@
 //!
 //! Docker's volumes share the node's disk, and its local driver cannot mount an
 //! image file. So the agent formats one (ext4, sparse: it takes the room its data
-//! takes), mounts it through a systemd mount unit, which brings it back at boot
-//! before Docker starts the containers, and makes the Docker volume a bind of a
-//! directory inside it. That directory only exists on the mounted filesystem: a
-//! container never starts writing to the node's disk instead.
+//! takes), mounts it, and makes the Docker volume a bind of a directory inside
+//! it. That directory only exists on the mounted filesystem: a container never
+//! starts writing to the node's disk instead.
+//!
+//! At boot, `facade-volumes.service` (`facaded mount-volumes`) mounts them all
+//! before Docker starts the containers. The agent writes it where it installed
+//! itself; on NixOS the module has it. Before it, each volume had a mount unit
+//! of its own in `/etc/systemd/system`: [`boot_setup`] replaces those.
 
 use std::path::{Path, PathBuf};
 
@@ -84,19 +88,19 @@ impl SizedVolume {
                 // No blocks kept for root: the container runs as root and would get
                 // them, so the size it sees is the size asked for.
                 run("mkfs.ext4", &["-q", "-F", "-m", "0", path(&image)?]).await?;
-                self.install_unit().await?;
             }
             Some(current) if bytes < current => bail!(
                 "volume {} is {}: a volume cannot shrink",
                 self.name(),
                 facade_core::format_size_mb(current / (1024 * 1024))
             ),
-            Some(_) => self.install_unit().await?,
+            Some(_) => {}
         }
-        if !self.is_mounted()? {
-            run(
-                "mount",
-                &["-o", "loop", path(&image)?, path(&self.mountpoint())?],
+        self.mount().await?;
+        if let Some(agent_dir) = self.dir.parent().and_then(Path::parent) {
+            boot_setup(
+                agent_dir,
+                crate::platform::current().install_kind().is_managed(),
             )
             .await?;
         }
@@ -113,39 +117,26 @@ impl SizedVolume {
             .unwrap_or_default()
     }
 
-    /// The mount unit, enabled: systemd mounts the volume at boot, before Docker.
-    /// The agent mounts it itself otherwise: asking systemd to start a mount unit
-    /// that is already active can wait forever on its loop device's unit.
-    async fn install_unit(&self) -> anyhow::Result<()> {
-        let unit = self.unit_name().await?;
-        let content = format!(
-            "# Written by facade for volume {name}.\n\
-             [Unit]\n\
-             Description=facade volume {name}\n\
-             Before=docker.service\n\
-             \n\
-             [Mount]\n\
-             What={what}\n\
-             Where={where_}\n\
-             Type=ext4\n\
-             Options=loop,nofail\n\
-             \n\
-             [Install]\n\
-             WantedBy=local-fs.target\n",
-            name = self.name(),
-            what = self.image().display(),
-            where_ = self.mountpoint().display(),
-        );
-        let path = crate::platform::current().unit_dir().join(&unit);
-        if std::fs::read_to_string(&path).ok().as_deref() != Some(content.as_str()) {
-            std::fs::write(&path, content)?;
-            run("systemctl", &["daemon-reload"]).await?;
+    /// Mounts it, unless it is.
+    async fn mount(&self) -> anyhow::Result<()> {
+        if !self.is_mounted()? {
+            run(
+                "mount",
+                &[
+                    "-o",
+                    "loop",
+                    path(&self.image())?,
+                    path(&self.mountpoint())?,
+                ],
+            )
+            .await?;
         }
-        run("systemctl", &["enable", &unit]).await?;
         Ok(())
     }
 
-    async fn unit_name(&self) -> anyhow::Result<String> {
+    /// The name of the mount unit a version before `facade-volumes.service`
+    /// gave it.
+    async fn legacy_unit(&self) -> anyhow::Result<String> {
         Ok(run(
             "systemd-escape",
             &["--path", "--suffix=mount", path(&self.mountpoint())?],
@@ -153,6 +144,21 @@ impl SizedVolume {
         .await?
         .trim()
         .to_string())
+    }
+
+    /// Takes out its mount unit from before `facade-volumes.service`, if it
+    /// has one, without unmounting it; whether it had one.
+    async fn drop_legacy_unit(&self) -> anyhow::Result<bool> {
+        let unit = self.legacy_unit().await?;
+        let file = Path::new(LEGACY_UNIT_DIR).join(&unit);
+        let ours = std::fs::read_to_string(&file)
+            .is_ok_and(|c| c.starts_with("# Written by facade for volume"));
+        if !ours {
+            return Ok(false);
+        }
+        run("systemctl", &["disable", &unit]).await?;
+        std::fs::remove_file(&file)?;
+        Ok(true)
     }
 
     fn is_mounted(&self) -> anyhow::Result<bool> {
@@ -188,15 +194,11 @@ impl SizedVolume {
         if !self.exists() {
             return Ok(());
         }
-        let unit = self.unit_name().await?;
-        run("systemctl", &["disable", &unit]).await?;
+        if self.drop_legacy_unit().await? {
+            run("systemctl", &["daemon-reload"]).await?;
+        }
         if self.is_mounted()? {
             run("umount", &[path(&self.mountpoint())?]).await?;
-        }
-        let path = crate::platform::current().unit_dir().join(&unit);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-            run("systemctl", &["daemon-reload"]).await?;
         }
         if self.is_mounted()? {
             bail!("{} is still mounted", self.mountpoint().display());
@@ -204,6 +206,110 @@ impl SizedVolume {
         std::fs::remove_dir_all(&self.dir)?;
         Ok(())
     }
+}
+
+/// Where mount units went before `facade-volumes.service`.
+const LEGACY_UNIT_DIR: &str = "/etc/systemd/system";
+const BOOT_UNIT: &str = "facade-volumes.service";
+
+/// Every sized volume under `agent_dir`.
+fn all(agent_dir: &Path) -> Vec<SizedVolume> {
+    let Ok(entries) = std::fs::read_dir(agent_dir.join("volumes")) else {
+        return vec![];
+    };
+    let mut out: Vec<SizedVolume> = entries
+        .flatten()
+        .map(|e| SizedVolume::new(agent_dir, &e.file_name().to_string_lossy()))
+        .filter(SizedVolume::exists)
+        .collect();
+    out.sort_by(|a, b| a.dir.cmp(&b.dir));
+    out
+}
+
+/// `facaded mount-volumes`: mounts every sized volume under `agent_dir` that
+/// is not. Run at boot by `facade-volumes.service`, before Docker. One that
+/// cannot be mounted does not stop the others.
+pub async fn mount_all(agent_dir: &Path) -> anyhow::Result<()> {
+    let mut failed = vec![];
+    for v in all(agent_dir) {
+        if let Err(e) = v.mount().await {
+            eprintln!("volume {}: {e:#}", v.name());
+            failed.push(v.name());
+        }
+    }
+    if !failed.is_empty() {
+        bail!("could not mount {}", failed.join(", "));
+    }
+    Ok(())
+}
+
+/// Makes sure the sized volumes under `agent_dir` come back at boot: writes
+/// and enables `facade-volumes.service` (unless the system's configuration
+/// provides it: `managed`), mounts what is not, then takes out the mount units
+/// of each volume from before it. Nothing is unmounted, and the old units go
+/// only once the new one is in place. Nothing at all without sized volumes.
+pub async fn boot_setup(agent_dir: &Path, managed: bool) -> anyhow::Result<()> {
+    let volumes = all(agent_dir);
+    if volumes.is_empty() || unsupported().is_some() {
+        return Ok(());
+    }
+    if !managed {
+        install_boot_unit(agent_dir).await?;
+    }
+    for v in &volumes {
+        v.mount().await?;
+    }
+    let mut dropped = vec![];
+    for v in &volumes {
+        if v.drop_legacy_unit().await? {
+            dropped.push(v.name());
+        }
+    }
+    if !dropped.is_empty() {
+        run("systemctl", &["daemon-reload"]).await?;
+        tracing::info!(
+            "volumes {} are mounted at boot by {BOOT_UNIT} now (their own mount units are gone)",
+            dropped.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The unit mounting them at boot, for the facaded installed here.
+fn boot_unit(exe: &Path, agent_dir: &Path) -> String {
+    format!(
+        "# Written by facade: mounts the volumes with a size before Docker starts\n\
+         # the containers using them.\n\
+         [Unit]\n\
+         Description=facade volumes with a size\n\
+         After=local-fs.target\n\
+         Before=docker.service\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         ExecStart={exe} mount-volumes {dir}\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        exe = exe.display(),
+        dir = agent_dir.display(),
+    )
+}
+
+async fn install_boot_unit(agent_dir: &Path) -> anyhow::Result<()> {
+    let exe = crate::selfbin::installed_path()?;
+    let content = boot_unit(&exe, agent_dir);
+    let file = Path::new(LEGACY_UNIT_DIR).join(BOOT_UNIT);
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(content.as_str()) {
+        let partial = file.with_extension("partial");
+        std::fs::write(&partial, &content)
+            .with_context(|| format!("writing {}", file.display()))?;
+        std::fs::rename(&partial, &file)?;
+        run("systemctl", &["daemon-reload"]).await?;
+    }
+    run("systemctl", &["enable", BOOT_UNIT]).await?;
+    Ok(())
 }
 
 /// What the image files of every sized volume under `agent_dir` take on the
@@ -310,6 +416,20 @@ pub async fn copy_into(from: &Path, to: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_boot_unit_runs_this_facaded_before_docker() {
+        let unit = boot_unit(
+            Path::new("/usr/local/bin/facaded"),
+            Path::new("/var/lib/facade/agent"),
+        );
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/facaded mount-volumes /var/lib/facade/agent\n")
+        );
+        assert!(unit.contains("Before=docker.service\n"));
+        assert!(unit.contains("Type=oneshot\n"));
+        assert!(unit.lines().all(|l| !l.starts_with(' ')), "{unit}");
+    }
 
     #[test]
     fn measures_a_filesystem_without_walking_it() {

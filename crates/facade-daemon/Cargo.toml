@@ -50,6 +50,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util = { version = "0.7", features = ["io", "io-util"] }
 toml = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "set-status"] }
 tracing = "0.1"

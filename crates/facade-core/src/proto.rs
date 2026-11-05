@@ -799,6 +799,25 @@ mod tests {
     const GB: u64 = 1_000_000_000;
 
     #[test]
+    fn hellos_from_agents_before_platforms_still_read() {
+        let old = r#"{"t":"control","node":"eu-2","secret":"s","protocol":7,"agent_version":"0.1.0",
+            "hostname":"h","binary":"ab","arch":"x86_64","started":1,"boot":2,"commit":"c"}"#;
+        let hello: Hello = serde_json::from_str(old).unwrap();
+        let Hello::Control {
+            platform, protocol, ..
+        } = hello
+        else {
+            panic!("not a control hello");
+        };
+        assert_eq!(protocol, 7);
+        assert_eq!(platform, None);
+        // What the server asks agents speaking 8.
+        let request: AgentRequest =
+            serde_json::from_str(r#"{"op":"inventory","known":"abc"}"#).unwrap();
+        assert!(matches!(request, AgentRequest::Inventory { known: Some(k) } if k == "abc"));
+    }
+
+    #[test]
     fn measured_docker_keeps_parts_within_the_disk() {
         // Docker's figures overlap: 20 + 19 GB on a disk with 32.7 GB used.
         let mut report = StorageReport {

@@ -1181,6 +1181,10 @@ pub struct ServerUpdate {
     pub run: Option<UpdateRun>,
     #[serde(default)]
     pub nodes: Vec<NodeBuild>,
+    /// Another tool installs facade on the server (Nix): how to update it
+    /// instead of installing a build from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1271,6 +1275,8 @@ pub enum NodeBuildState {
     Manual,
     /// It has not said which build it runs.
     Unknown,
+    /// Another tool installs facade there (Nix): it is never sent a build.
+    Managed,
 }
 
 /// The build a prepare or install is meant for, as last shown to the user.

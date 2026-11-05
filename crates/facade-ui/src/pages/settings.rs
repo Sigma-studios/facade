@@ -496,6 +496,7 @@ fn Updates() -> impl IntoView {
                                             "runs another build, and the server has none for its CPU ({}): update it by hand",
                                             n.arch.as_deref().unwrap_or("unknown")
                                         ),
+                                        NodeBuildState::Managed => "installed by Nix: bump its facade input and rebuild".to_string(),
                                         _ => "has not said which build it runs".to_string(),
                                     };
                                     view! { <li><span>{n.name}</span><span class="muted">{what}</span></li> }
@@ -509,7 +510,10 @@ fn Updates() -> impl IntoView {
                         on:click=check>
                         {move || if checking.get() { "Checking…" } else { "Check now" }}
                     </button>
-                    <Show when=move || current().is_some_and(|s| s.available)>
+                    {move || current().and_then(|s| s.managed.clone().filter(|_| s.available)).map(|hint| view! {
+                        <span class="muted small">{format!("façade is {hint}.")}</span>
+                    })}
+                    <Show when=move || current().is_some_and(|s| s.available && s.managed.is_none())>
                         <button class="button button-primary" disabled=updating on:click=open_dialog>
                             {move || format!("Update to {}…", target().map(|c| short_hash(&c).to_string()).unwrap_or_default())}
                         </button>

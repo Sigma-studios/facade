@@ -541,8 +541,12 @@ A **volume** (`-v data:/var/lib/data`) keeps what an app writes there across res
 and deploys. Volumes live on the app's node; an app with volumes moves to another node with
 `--move-data`, which copies them over (see [Volumes and backups](#volumes-and-backups)). Volumes share the node's disk unless given a **size**
 (`-v data:/var/lib/data:20G`): the node then gives the volume a filesystem of its own,
-in an image file under the agent's data directory, mounted at boot by a systemd unit
-before Docker starts, and the app gets "no space left" once it is full. A size can
+in an image file under the agent's data directory, mounted at boot by
+`facade-volumes.service` (`facaded mount-volumes`) before Docker starts, and the app
+gets "no space left" once it is full. The agent writes that unit itself (on NixOS the
+module has it); nodes from before it had a mount unit per volume in
+`/etc/systemd/system`, which the agent replaces when it starts, without unmounting
+anything. A size can
 grow later (the filesystem grows while the app runs), not shrink; a volume that had
 no size moves its data into its new filesystem when it gets one. Nodes need
 `e2fsprogs` (on Ubuntu already). In a compose file, a named volume's size goes in
@@ -1008,7 +1012,13 @@ Entries are kept 90 days.
   the agent reads what the system already knows about updates (Ubuntu's `apt-check`,
   or `apt list --upgradable`; it never runs `apt update`) and `/var/run/reboot-required`:
   the node's header shows `7 updates (2 security) · reboot required`, its packages in
-  the tooltip, and a pending reboot or security update is an alert. A check that could
+  the tooltip, and a pending reboot or security update is an alert. On NixOS the agent
+  says which nixpkgs revision the system was built from (`nixos-version --json`) and
+  the server compares it with its branch's head (`nixpkgs 12 days behind nixos-26.05`;
+  the branch is `nixos-<release>`, or `services.facade.nixpkgsBranch`); two weeks
+  behind, or a release past its end of life, is an alert. A reboot is required when
+  the booted system's kernel, initrd or modules are not the current system's
+  (`reboot required (kernel 6.12.40 → 6.12.44)`). A check that could
   not run says so (`couldn't check updates`, the reason in its tooltip) instead of
   reading as nothing to do; on a system facade doesn't support, the node shows a grey
   `best effort: Debian GNU/Linux 13` badge. `facade node list` has the system of each
@@ -1057,11 +1067,21 @@ priority.
 enabled = true
 alert_min = "critical"        # or "high", "medium", "low"
 ubuntu_oval_url = "https://security-metadata.canonical.com/oval"   # a mirror, for offline use
+kernel_osv_url = "https://osv-vulnerabilities.storage.googleapis.com/Linux/all.zip"
 ```
+
+On NixOS the running kernel is matched against upstream kernel records (OSV's `Linux`
+archive, about 60 MB a day, downloaded only when a NixOS node is there): NixOS ships
+the stable releases close to upstream, so the first fixed release on each branch says
+whether it is affected. Severity comes from the records' CVSS. A fix released upstream
+reads as *fix available* (an updated nixpkgs brings it), and as *fixed after reboot*
+once the current system's kernel has it. Other NixOS packages are not checked yet:
+matching them by name and version against general CVE data would be noisy and blind
+to nixpkgs' patches.
 
 The check reports vulnerable versions, not whether something else makes them harmless
 (a module not loaded, `net.mptcp.enabled = 0`): acknowledge those with a note. Other
-systems than Ubuntu say *not checked* for now; apps' container images are not scanned.
+systems say *not checked*; apps' container images are not scanned.
 `GET /api/nodes/{node}/vulns`, `GET /api/vulns?node=&severity=&status=`,
 `POST /api/vulns/{cve}/ack` (`{"node": "main", "note": "…"}`) and `DELETE
 /api/vulns/{cve}/ack?node=`.

@@ -136,6 +136,18 @@ pub fn view(server: &Server) -> ServerUpdate {
         prepared: known.prepared.clone(),
         run: crate::upgrade::read_run(&server.cfg.data_dir),
         nodes: node_builds(server),
+        managed: managed_hint(),
+    }
+}
+
+/// How to update a server another tool installed (Nix), which facade never
+/// replaces itself.
+pub fn managed_hint() -> Option<String> {
+    match crate::platform::current().install_kind() {
+        facade_core::platform::InstallKind::Managed { by, hint } => {
+            Some(format!("installed by {by}: {hint}"))
+        }
+        facade_core::platform::InstallKind::SelfManaged => None,
     }
 }
 
@@ -149,7 +161,12 @@ fn node_builds(server: &Server) -> Vec<NodeBuild> {
             let reported = live.nodes.get(&n.name);
             let binary = reported.and_then(|l| l.binary.clone());
             let arch = reported.and_then(|l| l.arch.clone());
-            let state = if n.name == server.cfg.local_node {
+            let managed = reported
+                .and_then(|l| l.platform.as_ref())
+                .is_some_and(|p| p.install.is_managed());
+            let state = if managed {
+                NodeBuildState::Managed
+            } else if n.name == server.cfg.local_node {
                 // Its agent runs inside the server.
                 NodeBuildState::Current
             } else {
@@ -523,6 +540,9 @@ impl std::error::Error for PrepareError {}
 /// outlives the restart.
 async fn install(server: &Server, commit: &str) -> anyhow::Result<()> {
     let prepared = server.releases.0.lock().prepared.clone();
+    if let Some(hint) = managed_hint() {
+        bail!("facade is {hint}");
+    }
     if prepared.as_ref().is_none_or(|p| p.commit != commit) {
         bail!(PrepareError::Changed);
     }

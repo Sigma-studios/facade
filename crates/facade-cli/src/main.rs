@@ -1400,7 +1400,19 @@ async fn update_server(api: &Api, check: bool, yes: bool, json: bool) -> anyhow:
                 node.arch.as_deref().unwrap_or("unknown")
             ),
             NodeBuildState::Unknown => println!("node {}: build unknown", node.name),
+            NodeBuildState::Managed => println!(
+                "node {}: installed by Nix: bump its facade input and rebuild",
+                node.name
+            ),
         }
+    }
+    if let Some(hint) = &status.managed {
+        if status.available {
+            println!("newer commits are published; facade is {hint}");
+        } else {
+            println!("up to date");
+        }
+        return Ok(());
     }
     if !status.available {
         println!("up to date");
