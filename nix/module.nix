@@ -234,8 +234,11 @@ in
       # as `facade server update` does on Ubuntu. That path is /etc/facade/facaded,
       # which the rebuild points to the new package before it reloads services.
       # For the reload not to turn into a restart, the unit has no store path in
-      # it (no default PATH: it runs nothing), so only the package as a reload
-      # trigger, and the listen settings as restart triggers, change it.
+      # it, so only the package as a reload trigger, and the listen settings as
+      # restart triggers, change it: no default PATH (it runs nothing), and none
+      # of the variables NixOS gives every unit (systemd.globalEnvironment: the
+      # locales and time zones of the day's nixpkgs), but the stable paths
+      # sessions get for those.
       environment.etc."facade/facaded".source = lib.getExe' cfg.package "facaded";
 
       systemd.services.facaded-ingress = mkIf ingressService {
@@ -243,7 +246,13 @@ in
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
-        inherit environment;
+        environment =
+          lib.mapAttrs (_: _: null) config.systemd.globalEnvironment
+          // {
+            LOCALE_ARCHIVE = "/run/current-system/sw/lib/locale/locale-archive";
+            TZDIR = "/etc/zoneinfo";
+          }
+          // environment;
         enableDefaultPath = false;
         reloadTriggers = [ cfg.package ];
         # Only what it reads from server.toml: other settings leave traffic alone.
