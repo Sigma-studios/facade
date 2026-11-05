@@ -273,7 +273,8 @@ template in `lang::generated_dockerfile`.
 
 | | |
 |---|---|
-| `facade status` / `facade alerts` | nodes, apps, CPU/memory, firing alerts |
+| `facade status` / `facade alerts` | nodes, apps, CPU/memory, how many problems; firing and past alerts |
+| `facade problems` | what is wrong right now and where to fix it (see [Problems](#problems)) |
 | `facade activity [--app X] [--node N] [--kind K] [--problems]` | what happened, newest first (see [Activity](#activity)); `--id N` for one entry |
 | `facade alerts config --webhook URL --mention @here` / `facade alerts test` | Discord notifications |
 | `facade alerts weekly [--preview]` / `alerts config --weekly on\|off` | the weekly summary (see [Alerts on Discord](#alerts-on-discord)) |
@@ -888,6 +889,38 @@ server was away. The header of the app page says the share of minutes up over 30
 ("up 99.95 % · 30 days"); a click shows each day, outages in red (`facade insights
 <app>` prints them). `[checks]` in `server.toml` turns the outside check off (`enabled =
 false`: availability then comes from containers alone) or changes its pace.
+
+### Problems
+
+The Overview starts with what is wrong right now, critical first then oldest, and the
+sidebar counts it next to Overview (red when one is critical). Each problem says what,
+what it concerns (an app, a domain, a node), since when, and where it is fixed: a link
+to the page or tab, with what to do when it is plain (`create an A record for
+shop.example.com pointing to 51.83.42.59`, `run sudo apt upgrade on the node`, the
+renewal's error). A problem lasts as long as its cause: once fixed it leaves the list by
+itself. What happened before is the alerts' history (linked from there) and the
+[Activity](#activity)'s. `facade problems` prints the same list (`--json` for scripts;
+`GET /api/problems`), and `facade status` ends with how many there are.
+
+* Every firing alert (see below).
+* A domain whose DNS record is missing or points elsewhere. One facade manages
+  (Porkbun) counts after 15 minutes, the time records take to show; a name resolving
+  elsewhere that still answers (a CDN in front) is not one.
+* A certificate missing 30 minutes after its domain appeared (at once when its request
+  fails), failing to renew, or expiring within 14 days (critical within 7).
+* An app whose latest deploy failed while its previous version keeps running, a
+  stack whose latest deploy failed, a deployment queued for 2 hours or building for
+  75 minutes, a failing health check, auto-deploy unable to check its source.
+* A volume with a size 90 % full; alerts not reaching Discord; the DNS provider
+  unreachable.
+
+Stopped apps, and apps never deployed, have none, nor do their domains. One cause makes
+one row: a site unreachable because its record is wrong is the DNS row (made critical),
+one whose certificate expired is the certificate's, one on an offline node or a node
+whose entry point cannot bind its ports is the node's; an app that is down does not
+also answer errors or fail its health check. Members see their apps' problems; nodes,
+stacks and the server's are for admins. When a problem was first seen is kept (across
+restarts too), for those that do not say themselves.
 
 ### Alerts on Discord
 
