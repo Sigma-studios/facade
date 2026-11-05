@@ -154,10 +154,17 @@ pkgs.testers.runNixOSTest {
         node_online()
 
     def ingress_state():
-        return machine.succeed(
+        # By name: systemctl prints properties in its own order.
+        shown = machine.succeed(
             "systemctl show -p MainPID -p NRestarts -p ActiveEnterTimestampMonotonic"
-            " --value facaded-ingress"
-        ).split()
+            " facaded-ingress"
+        )
+        props = dict(line.split("=", 1) for line in shown.split())
+        return (
+            props["MainPID"],
+            props["NRestarts"],
+            props["ActiveEnterTimestampMonotonic"],
+        )
 
     def switch_to(system, package):
         pid, restarts, since = ingress_state()
