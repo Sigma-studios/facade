@@ -15,6 +15,7 @@ mod github;
 mod hub;
 mod inspect;
 mod monitor;
+mod problems;
 mod reach;
 mod registry;
 mod release;
@@ -89,6 +90,8 @@ pub struct Server {
     pub edge: edge::Edge,
     /// The outside check of every domain, and apps' availability.
     pub reach: reach::Reach,
+    /// What is wrong right now (the Overview's Problems).
+    pub problems: problems::Problems,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -614,6 +617,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         activity: Default::default(),
         edge: Default::default(),
         reach: Default::default(),
+        problems: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -667,6 +671,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(autodeploy::run(server.clone()));
     tokio::spawn(events::run(server.clone()));
     tokio::spawn(weekly::run(server.clone()));
+    tokio::spawn(problems::run(server.clone()));
 
     let agent_dir = server.cfg.data_dir.join("agent");
     let files_dir = server.cfg.data_dir.clone();

@@ -59,6 +59,7 @@ pub fn router(server: Arc<Server>) -> Router {
         )
         .route("/api/status", get(status))
         .route("/api/alerts", get(alerts))
+        .route("/api/problems", get(super::problems::list))
         .route("/api/alerts/test", post(test_alert))
         .route("/api/alerts/weekly", get(weekly_preview))
         .route(

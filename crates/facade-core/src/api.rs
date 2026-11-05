@@ -733,6 +733,63 @@ pub struct AlertView {
     pub resolved_at: Option<u64>,
 }
 
+/// Something wrong right now (`GET /api/problems`): it is listed while it lasts
+/// and goes away by itself once fixed. Alerts and the Activity keep the history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Problem {
+    /// Stable while it lasts: `app:blog:down`, `dns:blog.example.com`.
+    pub key: String,
+    pub severity: ProblemSeverity,
+    pub message: String,
+    /// What it concerns; several for a domain of an app, none for the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Since when it is known to be wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
+    /// Web UI path of where it gets fixed (`/apps/blog?tab=logs`).
+    pub fix: String,
+    /// That place, in a word or two (`Logs`, `Domains`).
+    pub fix_label: String,
+    /// What to do, when it is plain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// Critical sorts first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProblemSeverity {
+    /// Down or broken now.
+    Critical,
+    /// Will break, or works worse, unless looked at.
+    Warning,
+}
+
+impl Problem {
+    /// What it is about first: `("domain", "blog.example.com")`, then an app, a
+    /// stack, a node; `("server", "")` for the rest.
+    pub fn subject(&self) -> (&'static str, &str) {
+        if let Some(d) = &self.domain {
+            ("domain", d)
+        } else if let Some(a) = &self.app {
+            ("app", a)
+        } else if let Some(s) = &self.stack {
+            ("stack", s)
+        } else if let Some(n) = &self.node {
+            ("node", n)
+        } else {
+            ("server", "")
+        }
+    }
+}
+
 /// The DNS provider facade manages records (and wildcard certificates) with.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DnsSettings {
@@ -777,6 +834,38 @@ pub struct DomainStatus {
     /// without it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<crate::insights::Reach>,
+}
+
+/// Public suffixes of more than one label that people register under, so
+/// `shop.example.co.uk` belongs to `example.co.uk`. Not the whole list: the
+/// common ones, separated by spaces.
+const SUFFIXES: &str = "\
+    co.uk org.uk me.uk ltd.uk plc.uk net.uk ac.uk gov.uk com.au net.au org.au edu.au gov.au \
+    co.nz net.nz org.nz co.jp ne.jp or.jp ac.jp co.kr or.kr com.br net.br org.br com.mx com.ar \
+    com.tr com.cn net.cn org.cn com.tw com.hk com.sg com.my co.in net.in org.in co.id co.il \
+    co.za org.za com.ua com.pl co.at or.at com.es com.pt co.it eu.org github.io gitlab.io \
+    pages.dev netlify.app vercel.app fly.dev herokuapp.com duckdns.org";
+
+/// The registered domain a host name belongs to: `www.example.com` →
+/// `example.com`. Addresses stay as they are. The Domains page groups names by
+/// it (`/domains?domain=example.com`).
+pub fn main_domain(host: &str) -> String {
+    let host = host.trim_end_matches('.').to_lowercase();
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let n = labels.len();
+    let keep = if n >= 3
+        && SUFFIXES
+            .split_whitespace()
+            .any(|s| s == labels[n - 2..].join("."))
+    {
+        3
+    } else {
+        2
+    };
+    labels[n.saturating_sub(keep)..].join(".")
 }
 
 /// Where alerts go. Read with the webhook partly hidden.

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use facade_core::api::{DnsSettings, DnsUpdate, DomainStatus};
+use facade_core::api::{DnsSettings, DnsUpdate, DomainStatus, main_domain};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
@@ -10,37 +10,6 @@ use super::insights::ReachBadge;
 use crate::api;
 use crate::components::{ErrorNote, FilterSelect, Loading, Sort, SortKey, SortTh};
 use crate::util::{me, polled, run, toasts};
-
-/// Public suffixes of more than one label that people register under, so
-/// `shop.example.co.uk` belongs to `example.co.uk`. Not the whole list: the
-/// common ones, separated by spaces.
-const SUFFIXES: &str = "\
-    co.uk org.uk me.uk ltd.uk plc.uk net.uk ac.uk gov.uk com.au net.au org.au edu.au gov.au \
-    co.nz net.nz org.nz co.jp ne.jp or.jp ac.jp co.kr or.kr com.br net.br org.br com.mx com.ar \
-    com.tr com.cn net.cn org.cn com.tw com.hk com.sg com.my co.in net.in org.in co.id co.il \
-    co.za org.za com.ua com.pl co.at or.at com.es com.pt co.it eu.org github.io gitlab.io \
-    pages.dev netlify.app vercel.app fly.dev herokuapp.com duckdns.org";
-
-/// The registered domain a host name belongs to: `www.example.com` →
-/// `example.com`. Addresses stay as they are.
-fn main_domain(host: &str) -> String {
-    let host = host.trim_end_matches('.').to_lowercase();
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return host;
-    }
-    let labels: Vec<&str> = host.split('.').collect();
-    let n = labels.len();
-    let keep = if n >= 3
-        && SUFFIXES
-            .split_whitespace()
-            .any(|s| s == labels[n - 2..].join("."))
-    {
-        3
-    } else {
-        2
-    };
-    labels[n.saturating_sub(keep)..].join(".")
-}
 
 #[component]
 pub fn Domains() -> impl IntoView {

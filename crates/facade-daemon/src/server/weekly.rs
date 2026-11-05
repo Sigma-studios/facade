@@ -354,7 +354,7 @@ fn trim(x: f64, decimals: usize) -> String {
     }
 }
 
-fn bytes(n: u64) -> String {
+pub(super) fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
     let mut unit = 0;
@@ -368,7 +368,7 @@ fn bytes(n: u64) -> String {
     }
 }
 
-fn minutes(m: u64) -> String {
+pub(super) fn minutes(m: u64) -> String {
     match m {
         0..60 => format!("{m} min"),
         60..1440 => format!("{} h {} min", m / 60, m % 60).replace(" 0 min", ""),
