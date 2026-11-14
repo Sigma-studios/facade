@@ -2,7 +2,13 @@ use facade_core::api::UsagePoint;
 use facade_core::proto::{AppState, StorageReport};
 use leptos::prelude::*;
 
-use crate::util::{bytes, copy_to_clipboard, cpus, percent, toasts};
+use crate::util::{ago, bytes, copy_to_clipboard, cpus, exact, iso, percent, toasts};
+
+/// An approximate time, `3m ago`, whose exact time shows on hover.
+#[component]
+pub fn Ago(at: u64) -> impl IntoView {
+    view! { <time datetime=iso(at) title=exact(at)>{ago(at)}</time> }
+}
 
 /// App state as icon + label; the colour only reinforces it.
 #[component]

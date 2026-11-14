@@ -15,7 +15,7 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 
 use crate::api;
 use crate::components::{ErrorNote, FilterSelect, Loading};
-use crate::util::{ago, clock, date, day, me, now, polled, strip_ansi};
+use crate::util::{ago_exact, clock, date, day, me, now, polled, strip_ansi};
 
 /// Entries per page.
 const PAGE: u32 = 50;
@@ -342,7 +342,7 @@ pub fn LastRestart(
                 .unwrap_or_else(|| e.summary.clone());
             let href = format!("/apps/{}?tab=activity&event={}", app.get_untracked(), e.id);
             view! {
-                <A href=href attr:class="tile-sub ev-tile-link" attr:title=format!("{} · {}", e.summary, ago(e.at))>
+                <A href=href attr:class="tile-sub ev-tile-link" attr:title=format!("{} · {}", e.summary, ago_exact(e.at))>
                     {format!("last: {reason}")}
                 </A>
             }
@@ -399,7 +399,10 @@ pub fn NodeBadges(#[prop(into)] node: Signal<Option<NodeView>>) -> impl IntoView
                 format!("Reboot required by {}.", reasons.join(", "))
             });
         }
-        tip.push(format!("Read {}; façade never installs them.", ago(u.at)));
+        tip.push(format!(
+            "Read {}; façade never installs them.",
+            ago_exact(u.at)
+        ));
         Some(view! {
             <span class="badge badge-warn" title=tip.join("\n")>
                 <span class="badge-icon" aria-hidden="true">"▲"</span>{badge}
@@ -411,7 +414,7 @@ pub fn NodeBadges(#[prop(into)] node: Signal<Option<NodeView>>) -> impl IntoView
         let d = n.disk_errors?;
         Some(view! {
             <A href=format!("/nodes/{}?tab=activity&event={}", n.name, d.event)
-                attr:class="badge badge-critical" attr:title=format!("{} ({})", d.summary, ago(d.at))>
+                attr:class="badge badge-critical" attr:title=format!("{} ({})", d.summary, ago_exact(d.at))>
                 <span class="badge-icon" aria-hidden="true">"✕"</span>"disk errors"
             </A>
         })
@@ -502,7 +505,7 @@ pub fn NodeUptime(
             Some(e) => view! {
                 " · "
                 <A href=format!("/nodes/{}?tab=activity&event={}", node.get_untracked(), e.id)
-                    attr:title=format!("Last reboot {}", ago(e.at))>{text}</A>
+                    attr:title=format!("Last reboot {}", ago_exact(e.at))>{text}</A>
             }
             .into_any(),
             None => view! { {format!(" · {text}")} }.into_any(),

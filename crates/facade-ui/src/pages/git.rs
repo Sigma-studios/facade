@@ -10,8 +10,8 @@ use leptos::task::spawn_local;
 use leptos_router::components::A;
 
 use crate::api;
-use crate::components::{CopyField, ErrorNote, Loading, Modal};
-use crate::util::{ago, copy_to_clipboard, me, polled, run, toasts};
+use crate::components::{Ago, CopyField, ErrorNote, Loading, Modal};
+use crate::util::{copy_to_clipboard, me, polled, run, toasts};
 
 /// A scope naming exactly one repository (`github.com/owner/repo`), as opposed
 /// to an account, an organisation or a whole host.
@@ -179,7 +179,7 @@ pub fn GitAccess() -> impl IntoView {
                                         let public_key = c.public_key.clone();
                                         view! {
                                             <tr>
-                                                <td><strong>{c.name.clone()}</strong><div class="muted small">{format!("added {}", ago(c.created_at))}</div></td>
+                                                <td><strong>{c.name.clone()}</strong><div class="muted small">"added " <Ago at=c.created_at/></div></td>
                                                 <td>{kind_label(c.kind)}</td>
                                                 <td><code>{c.scope.clone()}</code></td>
                                                 <td class="small">{if c.apps.is_empty() { "—".to_string() } else { c.apps.join(", ") }}</td>
@@ -530,7 +530,7 @@ pub fn AppGitAccess(#[prop(into)] app: Signal<Option<AppView>>) -> impl IntoView
                                                     <td>
                                                         <strong>{c.name.clone()}</strong>
                                                         <div class="muted small">
-                                                            {format!("added {}", ago(c.created_at))}
+                                                            "added " <Ago at=c.created_at/>
                                                             {(!used).then_some(" · not used: another covers the repository")}
                                                         </div>
                                                     </td>

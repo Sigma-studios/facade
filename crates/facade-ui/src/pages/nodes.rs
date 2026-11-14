@@ -9,12 +9,12 @@ use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
 
 use crate::api;
 use crate::components::{
-    CopyField, DiskMeter, ErrorNote, Loading, Menu, Meter, Modal, OnlineBadge, Range, RangePicker,
-    Sort, SortKey, SortTh, Sparkline, TabBar, UsageFeed, byte_rate as rate, latest as last,
-    per_second, usage_feed,
+    Ago, CopyField, DiskMeter, ErrorNote, Loading, Menu, Meter, Modal, OnlineBadge, Range,
+    RangePicker, Sort, SortKey, SortTh, Sparkline, TabBar, UsageFeed, byte_rate as rate,
+    latest as last, per_second, usage_feed,
 };
 use crate::gauges::StrainBadge;
-use crate::util::{Polled, ago, bytes, me, percent, polled, run, toasts};
+use crate::util::{Polled, bytes, me, percent, polled, run, toasts};
 
 const TABS: &[(&str, &str)] = &[
     ("overview", "Overview"),
@@ -411,7 +411,7 @@ pub fn Nodes() -> impl IntoView {
 
 /// What the node is, on one line under its name, as an app's page says what
 /// the app runs: hardware, address, uptime (or when it was last seen), agent.
-fn node_facts(node: &NodeView) -> String {
+fn node_facts(node: &NodeView) -> AnyView {
     let mut facts = vec![];
     if let Some(s) = &node.stats {
         if !s.arch.is_empty() {
@@ -435,19 +435,21 @@ fn node_facts(node: &NodeView) -> String {
         (Some(ip), false) => ip.clone(),
         (None, _) => "no public IP yet".into(),
     });
-    match (&node.stats, node.connected, node.last_seen) {
-        // Uptime follows, leading to the last reboot.
-        (Some(_), true, _) => {}
-        (_, false, Some(at)) => facts.push(format!("last seen {}", ago(at))),
-        _ => {}
-    }
+    // Uptime follows when connected, leading to the last reboot.
+    let last_seen = node.last_seen.filter(|_| !node.connected);
+    let mut after = vec![];
     if node.local {
-        facts.push("this server".into());
+        after.push("this server".to_string());
     }
     if let Some(v) = &node.agent_version {
-        facts.push(format!("agent {v}"));
+        after.push(format!("agent {v}"));
     }
-    facts.join(" · ")
+    let after: String = after.iter().map(|f| format!(" · {f}")).collect();
+    let before = facts.join(" · ");
+    match last_seen {
+        Some(at) => view! { {before} " · last seen " <Ago at/> {after} }.into_any(),
+        None => format!("{before}{after}").into_any(),
+    }
 }
 
 fn uptime(secs: u64) -> String {
@@ -460,10 +462,10 @@ fn uptime(secs: u64) -> String {
 }
 
 /// What stands in for the meters of a node that does not report.
-pub fn not_reporting(node: &NodeView) -> String {
+pub fn not_reporting(node: &NodeView) -> AnyView {
     match node.last_seen {
-        Some(at) => format!("Last seen {}", ago(at)),
-        None => "Not connected yet: start its agent with the join command.".into(),
+        Some(at) => view! { "Last seen " <Ago at/> }.into_any(),
+        None => "Not connected yet: start its agent with the join command.".into_any(),
     }
 }
 
@@ -968,12 +970,11 @@ fn StorageNotes(
     let cleanup = move || {
         storage.with(|s| {
             s.as_ref()?.last_cleanup.as_ref().map(|c| {
-                format!(
-                    "{}leaned {}, freed {}.",
-                    if c.aggressive { "Deep-c" } else { "C" },
-                    ago(c.at),
-                    bytes(c.freed)
-                )
+                view! {
+                    {if c.aggressive { "Deep-cleaned " } else { "Cleaned " }}
+                    <Ago at=c.at/>
+                    {format!(", freed {}.", bytes(c.freed))}
+                }
             })
         })
     };

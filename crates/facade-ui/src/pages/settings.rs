@@ -13,8 +13,8 @@ use super::alerts::AlertsTab;
 use super::app::CommitRow;
 use super::git::GitAccess;
 use crate::api;
-use crate::components::{CopyField, ErrorNote, Loading, Modal};
-use crate::util::{ago, alerts, download, me, polled, run, short_hash, toasts};
+use crate::components::{Ago, CopyField, ErrorNote, Loading, Modal};
+use crate::util::{alerts, download, me, polled, run, short_hash, toasts};
 
 /// Settings tabs: `(key, label, admins only)`.
 const TABS: &[(&str, &str, bool)] = &[
@@ -429,7 +429,7 @@ fn Updates() -> impl IntoView {
                         1 => "façade is 1 commit behind main.".to_string(),
                         n => format!("façade is {n} commits behind main."),
                     };
-                    let since = s.latest.map(|l| format!(" Latest build {}.", ago(l.time))).unwrap_or_default();
+                    let since = s.latest.map(|l| view! { " Latest build " <Ago at=l.time/> "." });
                     view! {
                         <div class="note note-warning" role="status">
                             <span aria-hidden="true">"⚠ "</span>
@@ -458,14 +458,14 @@ fn Updates() -> impl IntoView {
                         (Some(l), None) => view! {
                             <p class="small">
                                 {commit_link(l.commit.clone())}
-                                {format!(" {} · {}", l.subject, ago(l.time))}
+                                {format!(" {} · ", l.subject)} <Ago at=l.time/>
                                 {(!s.available).then_some(" (running)")}
                             </p>
                         }.into_any(),
                     })}
                     <small>
                         {move || current().and_then(|s| s.checked_at)
-                            .map(|t| format!("Checked {} on github.com/{}.", ago(t), repo()))}
+                            .map(|t| view! { "Checked " <Ago at=t/> {format!(" on github.com/{}.", repo())} })}
                     </small>
                     {move || current().filter(|s| s.available && !s.commits.is_empty()).map(|s| view! {
                         <details class="build-details commit-details">
@@ -569,20 +569,29 @@ fn Updates() -> impl IntoView {
 #[component]
 fn RunNote(run: UpdateRun) -> impl IntoView {
     let to = short_hash(&run.to).to_string();
-    let when = run.finished.map(ago).unwrap_or_default();
+    let finished = run.finished;
+    // ` 3m ago`, or ` (3m ago)`: nothing when it is not known.
+    let when = move |parens: bool| {
+        finished.map(|at| match parens {
+            true => view! { " (" <Ago at/> ")" }.into_any(),
+            false => view! { " " <Ago at/> }.into_any(),
+        })
+    };
+    let message = run.message;
     let (class, text) = match run.state {
-        UpdateState::Running => ("note", format!("Updating to {to}: {}…", run.message)),
-        UpdateState::Done => ("note", format!("Updated to {to} {when}.")),
+        UpdateState::Running => ("note", format!("Updating to {to}: {message}…").into_any()),
+        UpdateState::Done => ("note", view! { {format!("Updated to {to}")} {when(false)} "." }.into_any()),
         UpdateState::RolledBack => (
             "note note-error",
-            format!(
-                "The update to {to} ({when}) was rolled back: {}",
-                run.message
-            ),
+            view! {
+                {format!("The update to {to}")} {when(true)} {format!(" was rolled back: {message}")}
+            }
+            .into_any(),
         ),
         UpdateState::Failed => (
             "note note-error",
-            format!("The update to {to} ({when}) failed: {}", run.message),
+            view! { {format!("The update to {to}")} {when(true)} {format!(" failed: {message}")} }
+                .into_any(),
         ),
     };
     view! { <div class=class>{text}</div> }

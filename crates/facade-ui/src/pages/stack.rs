@@ -20,8 +20,8 @@ use uuid::Uuid;
 use super::app::{DeployStatus, EnvTab};
 use super::overview::AppsTable;
 use crate::api;
-use crate::components::{ErrorNote, Loading, Modal};
-use crate::util::{ago, polled, run, strip_ansi, toasts};
+use crate::components::{Ago, ErrorNote, Loading, Modal};
+use crate::util::{polled, run, strip_ansi, toasts};
 
 const TABS: &[(&str, &str)] = &[
     ("services", "Services"),
@@ -454,7 +454,7 @@ fn StackDeployments(
                                 on:click=move |_| selected.set(Some(d.id))>
                                 <DeployStatus status=d.status/>
                                 <span class="deploy-rev">{d.commit.as_deref().map(short).unwrap_or_else(|| "—".into())}</span>
-                                <span class="muted small">{ago(d.created_at)}</span>
+                                <span class="muted small"><Ago at=d.created_at/></span>
                                 {d.commit_title.clone().map(|t| view! { <span class="deploy-title small">{t}</span> })}
                             </button>
                         </li>
@@ -472,7 +472,7 @@ fn StackDeployments(
                                 <DeployStatus status=status/>
                                 {d.commit.clone().map(|c| view! { <code title=c.clone()>{c.chars().take(12).collect::<String>()}</code> })}
                                 <span class="muted small">
-                                    {format!("requested {}", ago(d.created_at))}
+                                    "requested " <Ago at=d.created_at/>
                                     {match (d.started_at, d.finished_at) {
                                         (Some(s), Some(f)) => Some(format!(" · took {}s", f.saturating_sub(s))),
                                         _ => None,

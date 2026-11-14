@@ -14,7 +14,7 @@ use crate::components::{
     follow_row,
 };
 use crate::gauges::LimitBar;
-use crate::util::{Polled, ago, bytes, clock, cpus, date, me, percent, polled, problems};
+use crate::util::{Polled, ago_exact, bytes, cpus, exact, me, percent, polled, problems};
 
 #[component]
 pub fn Overview() -> impl IntoView {
@@ -124,7 +124,7 @@ fn ProblemRow(problem: Problem) -> impl IntoView {
                     {subject.map(|(text, href)| view! { <A href=href attr:class="problem-subject">{text}</A> })}
                     {app.map(|a| view! { <A href=format!("/apps/{a}")>{format!("app {a}")}</A> })}
                     {problem.since.map(|since| view! {
-                        <span title=format!("since {} {}", date(since), clock(since))>{lasted(since)}</span>
+                        <span title=format!("since {}", exact(since))>{lasted(since)}</span>
                     })}
                 </div>
                 {problem.hint.clone().map(|hint| view! { <div class="problem-hint">{hint}</div> })}
@@ -440,7 +440,7 @@ fn DiskCell(disk: AppDiskView) -> impl IntoView {
                 {warn.then(|| view! {
                     <div class="cell-tip-warn">"Written inside the container is lost on redeploy: keep it in a volume."</div>
                 })}
-                <div class="muted">{format!("Measured {}", ago(disk.at))}</div>
+                <div class="muted">{format!("Measured {}", ago_exact(disk.at))}</div>
             </div>
         })}
     }

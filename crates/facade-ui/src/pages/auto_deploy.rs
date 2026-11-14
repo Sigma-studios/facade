@@ -8,7 +8,8 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
-use crate::util::{ago, polled, toasts};
+use crate::components::Ago;
+use crate::util::{polled, toasts};
 
 /// A commit's 7 characters, or a digest's first 12 hex digits.
 fn short(hash: &str) -> String {
@@ -55,34 +56,30 @@ pub fn AutoDeployPanel(#[prop(into)] path: Signal<String>) -> impl IntoView {
         status.data.get().filter(|s| s.watching.is_some()).map(|s| {
             let watching = s.watching.clone().unwrap_or_default();
             let how = match s.method {
-                AutoDeployMethod::Webhook => format!(
-                    "Webhook on {}{} · checked every {} as well",
-                    s.webhook_repo.clone().unwrap_or_default(),
-                    s.webhook_delivered_at
-                        .map(|at| format!(", last delivery {}", ago(at)))
-                        .unwrap_or_default(),
-                    every(s.poll_secs)
-                ),
-                _ => format!("Polling every {}", every(s.poll_secs)),
+                AutoDeployMethod::Webhook => view! {
+                    {format!("Webhook on {}", s.webhook_repo.clone().unwrap_or_default())}
+                    {s.webhook_delivered_at.map(|at| view! { ", last delivery " <Ago at/> })}
+                    {format!(" · checked every {} as well", every(s.poll_secs))}
+                }
+                .into_any(),
+                _ => format!("Polling every {}", every(s.poll_secs)).into_any(),
             };
-            let last_check = s.checked_at.map(|at| {
-                format!(
-                    "{}{}",
-                    ago(at),
-                    s.seen
-                        .as_deref()
-                        .map(|h| format!(" · {}", short(h)))
-                        .unwrap_or_default()
-                )
-            });
+            let last_check = match s.checked_at {
+                Some(at) => view! {
+                    <Ago at/>
+                    {s.seen.as_deref().map(|h| format!(" · {}", short(h)))}
+                }
+                .into_any(),
+                None => "not yet".into_any(),
+            };
             let last_deploy = match (s.triggered_at, &s.triggered) {
-                (Some(at), Some(what)) => format!(
-                    "{} {} (noticed by {})",
-                    short(what),
-                    ago(at),
-                    s.triggered_by.as_deref().unwrap_or("poll")
-                ),
-                _ => "—".into(),
+                (Some(at), Some(what)) => view! {
+                    {format!("{} ", short(what))}
+                    <Ago at/>
+                    {format!(" (noticed by {})", s.triggered_by.as_deref().unwrap_or("poll"))}
+                }
+                .into_any(),
+                _ => "—".into_any(),
             };
             view! {
                 <section class="card details auto-deploy">
@@ -98,7 +95,7 @@ pub fn AutoDeployPanel(#[prop(into)] path: Signal<String>) -> impl IntoView {
                                 <dt>"Noticed by"</dt>
                                 <dd>{how}</dd>
                                 <dt>"Last check"</dt>
-                                <dd>{last_check.unwrap_or_else(|| "not yet".into())}</dd>
+                                <dd>{last_check}</dd>
                                 <dt>"Last auto deploy"</dt>
                                 <dd>{last_deploy}</dd>
                             </dl>

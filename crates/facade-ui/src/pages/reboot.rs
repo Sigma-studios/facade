@@ -6,8 +6,8 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
-use crate::components::{ErrorNote, Loading, Modal};
-use crate::util::{ago, toasts};
+use crate::components::{Ago, ErrorNote, Loading, Modal};
+use crate::util::toasts;
 
 const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -216,8 +216,12 @@ pub fn RebootDialog(#[prop(into)] node: Signal<String>, open: RwSignal<bool>) ->
                 <Show when=move || p().is_some_and(|p| p.running.is_some())>
                     <div class="note note-info">
                         {move || p().and_then(|p| p.running).map(|r| match r.back {
-                            None => format!("Rebooting: asked by {} {}. Waiting for it to come back.", r.by, ago(r.asked)),
-                            Some(_) => format!("Back from its reboot (asked by {} {}): checking that its apps run again.", r.by, ago(r.asked)),
+                            None => view! {
+                                {format!("Rebooting: asked by {} ", r.by)} <Ago at=r.asked/> ". Waiting for it to come back."
+                            }.into_any(),
+                            Some(_) => view! {
+                                {format!("Back from its reboot (asked by {} ", r.by)} <Ago at=r.asked/> "): checking that its apps run again."
+                            }.into_any(),
                         })}
                     </div>
                 </Show>
@@ -326,7 +330,7 @@ pub fn RebootDialog(#[prop(into)] node: Signal<String>, open: RwSignal<bool>) ->
                 </div>
                 {move || p().and_then(|p| p.last).map(|last| view! {
                     <p class=if last.ok { "muted small" } else { "note note-warning small" }>
-                        {format!("Last ({}): {}", ago(last.at), last.summary)}
+                        "Last (" <Ago at=last.at/> "): " {last.summary}
                     </p>
                 })}
             </Show>

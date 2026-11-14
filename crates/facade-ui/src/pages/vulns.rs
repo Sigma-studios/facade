@@ -6,8 +6,8 @@ use facade_core::vulns::{AckRequest, Finding, FindingStatus, NodeVulns, VulnSeve
 use leptos::prelude::*;
 
 use crate::api;
-use crate::components::{ErrorNote, Loading, Modal};
-use crate::util::{ago, me, polled, run};
+use crate::components::{Ago, ErrorNote, Loading, Modal};
+use crate::util::{me, polled, run};
 
 #[component]
 pub fn VulnsTab(node: String) -> impl IntoView {
@@ -75,18 +75,17 @@ pub fn VulnsTab(node: String) -> impl IntoView {
         data.data.with(|d| {
             let d = d.as_ref()?;
             let s = &d.summary;
-            let mut line = format!(
+            let line = format!(
                 "{} critical, {} high, {} medium or low.",
                 s.critical, s.high, s.other
             );
-            if let Some(src) = &d.source {
-                line.push_str(&format!(" Matched against {src}"));
-                if let Some(at) = s.data_as_of {
-                    line.push_str(&format!(" (published {})", ago(at)));
-                }
-                line.push('.');
-            }
-            Some(line)
+            let source = d.source.clone().map(|src| {
+                let published = s
+                    .data_as_of
+                    .map(|at| view! { " (published " <Ago at/> ")" });
+                view! { {format!(" Matched against {src}")} {published} "." }
+            });
+            Some(view! { {line} {source} })
         })
     };
     let unknown = move || data.data.with(|d| d.as_ref()?.summary.unknown.clone());
@@ -209,7 +208,7 @@ fn Row(
             <td><a href=f.url.clone() target="_blank" rel="noopener">{f.cve.clone()}</a></td>
             <td>{f.package.clone()}<div class="muted small">{f.installed.clone()}</div></td>
             <td>{status}{ack.map(|a| view! { <div class="muted small">{a}</div> })}</td>
-            <td class="muted small">{ago(f.first_seen)}</td>
+            <td class="muted small"><Ago at=f.first_seen/></td>
             <td class="small">{f.title.clone()}</td>
             {action}
         </tr>

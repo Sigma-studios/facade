@@ -3,8 +3,8 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::api;
-use crate::components::{ErrorNote, Loading};
-use crate::util::{Polled, ago, alerts, date, me, polled, run, toasts};
+use crate::components::{Ago, ErrorNote, Loading};
+use crate::util::{Polled, alerts, date, me, polled, run, toasts};
 
 /// Settings → Alerts: where alerts go (admins), and the recent ones.
 #[component]
@@ -39,8 +39,8 @@ pub fn AlertsTab() -> impl IntoView {
                                 <span class="alert-message">{alert.message.clone()}</span>
                                 <span class="muted small">
                                     {match alert.resolved_at {
-                                        Some(at) => format!("resolved {}", ago(at)),
-                                        None => format!("since {}", ago(alert.since)),
+                                        Some(at) => view! { "resolved " <Ago at/> }.into_any(),
+                                        None => view! { "since " <Ago at=alert.since/> }.into_any(),
                                     }}
                                 </span>
                             </li>
@@ -153,14 +153,14 @@ fn DiscordSettings(settings: Polled<NotifySettings>) -> impl IntoView {
                         <dd>{tags}</dd>
                         <dt>"Last message"</dt>
                         <dd>{match s.last_sent {
-                            Some(at) => format!("delivered {}", ago(at)),
-                            None => "none since the server started: send a test to check".into(),
+                            Some(at) => view! { "delivered " <Ago at/> }.into_any(),
+                            None => "none since the server started: send a test to check".into_any(),
                         }}</dd>
                         {failing.then(|| s.last_error.clone()).flatten().map(|e| view! {
                             <dt>"Last failure"</dt>
                             <dd class="notify-error">
                                 <span aria-hidden="true">"⚠ "</span>
-                                {format!("{} ({})", e.error, ago(e.at))}
+                                {e.error} " (" <Ago at=e.at/> ")"
                             </dd>
                         })}
                     </dl>
@@ -290,7 +290,7 @@ fn WeeklySummary(settings: Polled<NotifySettings>) -> impl IntoView {
                         {state}
                         " Per app: availability, requests and their change, 5xx, visitors, deploys, restarts, crashes. "
                         "Per node: disk, bandwidth served, pending updates."
-                        {s.weekly_sent.map(|at| format!(" Last sent {}.", ago(at)))}
+                        {s.weekly_sent.map(|at| view! { " Last sent " <Ago at/> "." })}
                     </p>
                     <div class="form-actions">
                         <button type="button" class="button" on:click=show_preview disabled=move || loading.get()>

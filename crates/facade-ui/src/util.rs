@@ -250,6 +250,45 @@ pub fn ago(at: u64) -> String {
     }
 }
 
+/// The exact local time, `2026-11-14 14:32:05 UTC+1`: what hovering an `ago`
+/// shows (see `components::Ago`).
+pub fn exact(at: u64) -> String {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(at as f64 * 1000.0));
+    // Minutes behind UTC, so the sign is the opposite of the usual offset.
+    let offset = -(date.get_timezone_offset() as i64);
+    let zone = match (offset / 60, (offset % 60).abs()) {
+        (0, 0) => "UTC".to_string(),
+        (h, 0) => format!("UTC{h:+}"),
+        (h, m) => format!(
+            "UTC{}{}:{m:02}",
+            if offset < 0 { '-' } else { '+' },
+            h.abs()
+        ),
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {zone}",
+        date.get_full_year(),
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+        date.get_seconds()
+    )
+}
+
+/// The time in ISO 8601 (UTC), for a `<time datetime>`.
+pub fn iso(at: u64) -> String {
+    js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(at as f64 * 1000.0))
+        .to_iso_string()
+        .into()
+}
+
+/// `ago` with the exact time after it, `3m ago (2026-11-14 14:32:05 UTC+1)`:
+/// for tooltips, which cannot themselves be hovered.
+pub fn ago_exact(at: u64) -> String {
+    format!("{} ({})", ago(at), exact(at))
+}
+
 pub fn clock(at: u64) -> String {
     let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(at as f64 * 1000.0));
     format!("{:02}:{:02}", date.get_hours(), date.get_minutes())

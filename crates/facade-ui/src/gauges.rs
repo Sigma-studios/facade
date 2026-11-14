@@ -5,7 +5,8 @@
 use facade_core::resources::{HealthCheck, Pressure, STRAIN_HELP, Strain};
 use leptos::prelude::*;
 
-use crate::util::{ago, bytes, clock};
+use crate::components::Ago;
+use crate::util::{ago, ago_exact, bytes, clock};
 
 /// Past this share of its limit a bar turns orange, then red.
 const SERIOUS: f64 = 80.0;
@@ -48,16 +49,14 @@ pub fn HealthStrip(#[prop(into)] checks: Signal<Vec<HealthCheck>>) -> impl IntoV
         checks.with(|c| {
             let last = c.last()?;
             let failed = c.iter().filter(|c| !c.ok).count();
-            let mut text = format!(
-                "last {} {}, took {} ms",
-                if last.ok { "passed" } else { "failed" },
-                ago(last.at_ms / 1000),
-                last.ms
-            );
-            if failed > 0 {
-                text += &format!(" · {failed} of the last {} failed", c.len());
-            }
-            Some(text)
+            let failures =
+                (failed > 0).then(|| format!(" · {failed} of the last {} failed", c.len()));
+            Some(view! {
+                {format!("last {} ", if last.ok { "passed" } else { "failed" })}
+                <Ago at=last.at_ms / 1000/>
+                {format!(", took {} ms", last.ms)}
+                {failures}
+            })
         })
     };
     view! {
@@ -111,16 +110,14 @@ pub fn VolumeTrend(points: Vec<(u64, u64)>, span: (u64, u64)) -> impl IntoView {
         let (x1, y1) = (x(at), y(size));
         d = format!("M{:.1},{y1:.1} L{x1:.1},{y1:.1}", (x1 - 4.0).max(0.0));
     }
-    let summary = match (points.first(), points.last()) {
-        (Some(first), Some(last)) if points.len() > 1 => format!(
-            "{} {} → {} now",
-            bytes(first.1),
-            ago(first.0),
-            bytes(last.1)
-        ),
-        _ => "Measured once so far".into(),
+    // The tooltip has the exact time too, as it cannot itself be hovered.
+    let (summary, label) = match (points.first(), points.last()) {
+        (Some(first), Some(last)) if points.len() > 1 => {
+            let says = |when: String| format!("{} {when} → {} now", bytes(first.1), bytes(last.1));
+            (says(ago(first.0)), says(ago_exact(first.0)))
+        }
+        _ => ("Measured once so far".into(), "Measured once so far".into()),
     };
-    let label = summary.clone();
     view! {
         <span class="volume-trend" title=label>
             <svg viewBox=format!("0 0 {TREND_W} {TREND_H}") preserveAspectRatio="none" role="img" aria-label=summary>

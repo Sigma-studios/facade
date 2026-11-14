@@ -8,8 +8,10 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 
 use super::app::DeployStatus;
 use crate::api;
-use crate::components::{ErrorNote, FilterSelect, Loading, MultiSelect, Sort, SortKey, SortTh};
-use crate::util::{ago, polled, run};
+use crate::components::{
+    Ago, ErrorNote, FilterSelect, Loading, MultiSelect, Sort, SortKey, SortTh,
+};
+use crate::util::{polled, run};
 
 fn short(commit: &Option<String>) -> String {
     commit
@@ -265,7 +267,7 @@ pub fn Builds() -> impl IntoView {
                                                 }.into_any(),
                                             }}</td>
                                             <td><code>{short(&b.commit)}</code></td>
-                                            <td class="muted small">{ago(b.since)}</td>
+                                            <td class="muted small"><Ago at=b.since/></td>
                                             <td class="row-actions">
                                                 {match b.deployment {
                                                     Some(id) => view! {
@@ -313,7 +315,7 @@ pub fn Builds() -> impl IntoView {
                                                 <code>{short(&d.commit)}</code>
                                                 {d.commit_title.clone().map(|t| view! { <span class="muted small">" " {t}</span> })}
                                             </td>
-                                            <td class="muted small">{ago(d.created_at)}</td>
+                                            <td class="muted small"><Ago at=d.created_at/></td>
                                             <td class="num small">{took(d.started_at, d.finished_at).map(|t| format!("{t}s"))}</td>
                                             <td class="small error-cell">{error_line(&d.error).to_string()}</td>
                                         </tr>

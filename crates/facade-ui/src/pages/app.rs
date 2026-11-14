@@ -22,11 +22,12 @@ use super::insights::{
 use super::spec_form::{SpecFields, SpecForm};
 use crate::api;
 use crate::components::{
-    ErrorNote, Loading, Menu, Modal, StateBadge, THROTTLE_SHOWN, TabBar, UsageCharts,
+    Ago, ErrorNote, Loading, Menu, Modal, StateBadge, THROTTLE_SHOWN, TabBar, UsageCharts,
 };
 use crate::gauges::{HealthStrip, LimitBar, VolumeTrend};
 use crate::util::{
-    Polled, ago, bytes, clock, cpus, date, me, percent, polled, run, short_hash, strip_ansi, toasts,
+    Polled, ago_exact, bytes, clock, cpus, date, me, percent, polled, run, short_hash, strip_ansi,
+    toasts,
 };
 
 const TABS: &[(&str, &str)] = &[
@@ -944,7 +945,7 @@ fn LatestDeployment(
                             <code>{d.commit.as_deref().map(|c| short_hash(c).to_string()).unwrap_or_else(|| format!("rev {}", d.revision))}</code>
                             {d.commit_title.clone().map(|t| view! { <span class="deploy-strip-title">{t}</span> })}
                         </A>
-                        <span class="muted small">{format!("{}{took}", ago(d.created_at))}</span>
+                        <span class="muted small"><Ago at=d.created_at/>{took}</span>
                     }
                 })}
                 <span class="push-right">{auto}</span>
@@ -1102,7 +1103,7 @@ fn InfoTab(
                         <dd>{bytes(d.backups)}<span class="muted small">" · on the server's disk, chunks shared with other apps split"</span></dd>
                     })}
                 </dl>
-                <p class="muted small kv-foot">{format!("Measured {}.", ago(d.at))}</p>
+                <p class="muted small kv-foot">"Measured " <Ago at=d.at/> "."</p>
                 <ImageLayers disk=Signal::stored(Some(d))/>
             </section>
             }
@@ -1134,7 +1135,7 @@ pub fn CommitRow(c: CommitView) -> impl IntoView {
         <li class="commit">
             <code title=c.hash.clone()>{short_hash(&c.hash).to_string()}</code>
             <span class="commit-subject">{c.subject}</span>
-            <span class="muted small">{format!("{} · {}", c.author, ago(c.time))}</span>
+            <span class="muted small">{format!("{} · ", c.author)} <Ago at=c.time/></span>
         </li>
     }
 }
@@ -1210,7 +1211,7 @@ fn disk_detail(d: AppDiskView) -> String {
             bytes(d.backups)
         ));
     }
-    lines.push(format!("Measured {}", ago(d.at)));
+    lines.push(format!("Measured {}", ago_exact(d.at)));
     lines.join("\n")
 }
 
@@ -1431,7 +1432,7 @@ fn DeploymentsTab(
                                         None => format!("rev {}", d.revision),
                                     }}
                                 </span>
-                                <span class="muted small">{ago(d.created_at)}</span>
+                                <span class="muted small"><Ago at=d.created_at/></span>
                                 {d.commit_title.clone().map(|t| view! { <span class="deploy-title small">{t}</span> })}
                             </button>
                         </li>
@@ -1457,7 +1458,7 @@ fn DeploymentsTab(
                                     <code title=c.clone()>{c[..c.len().min(12)].to_string()}</code>
                                 })}
                                 <span class="muted small">
-                                    {format!("requested {}", ago(d.created_at))}
+                                    "requested " <Ago at=d.created_at/>
                                     {match (d.started_at, d.finished_at) {
                                         (Some(s), Some(f)) => Some(format!(" · took {}s", f.saturating_sub(s))),
                                         (None, None) => Some(" · waiting for the build slot".to_string()),
@@ -1924,7 +1925,10 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
                                             let volume = v.volume.clone();
                                             move || trend(&volume)
                                         }</td>
-                                        <td class="muted">{v.last_backup.map(ago).unwrap_or_else(|| "never".into())}</td>
+                                        <td class="muted">{match v.last_backup {
+                                            Some(at) => view! { <Ago at/> }.into_any(),
+                                            None => "never".into_any(),
+                                        }}</td>
                                         <td class="row-actions">
                                             <button class="link-button"
                                                 on:click=move |_| download(export.clone(), fallback.clone())>"Download"</button>
@@ -1967,7 +1971,7 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
                                         <tr>
                                             <td>
                                                 {format!("{} {}", date(b.id), clock(b.id))}
-                                                <span class="muted small">{format!(" · {}", ago(b.id))}</span>
+                                                <span class="muted small">" · " <Ago at=b.id/></span>
                                             </td>
                                             <td><code>{b.volume.clone()}</code></td>
                                             <td class="num">

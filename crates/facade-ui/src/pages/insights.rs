@@ -12,7 +12,7 @@ use leptos::prelude::*;
 
 use crate::api;
 use crate::components::{Sort, SortKey, SortTh};
-use crate::util::{Polled, ago, bytes, clock, now, polled};
+use crate::util::{Polled, ago, ago_exact, bytes, clock, exact, now, polled};
 
 /// An app's insights, polled every minute.
 pub fn app_insights(name: Memo<String>) -> Polled<AppInsights> {
@@ -193,7 +193,7 @@ pub fn ReachBadge(reach: Option<Reach>) -> impl IntoView {
             };
             let title = format!(
                 "Loaded from the server as a visitor would, {}{}",
-                ago(r.checked_at),
+                ago_exact(r.checked_at),
                 r.status.map(|s| format!(" (HTTP {s})")).unwrap_or_default()
             );
             view! {
@@ -213,7 +213,7 @@ pub fn ReachBadge(reach: Option<Reach>) -> impl IntoView {
             let title = format!(
                 "{} (checked {})",
                 r.error.clone().unwrap_or_else(|| "no answer".into()),
-                ago(r.checked_at)
+                ago_exact(r.checked_at)
             );
             view! {
                 <span class="badge badge-critical reach-badge" title=title>
@@ -497,7 +497,7 @@ pub fn ErrorsSection(name: Memo<String>) -> impl IntoView {
                                         <td class="muted">{r.method.clone()}</td>
                                         <td class="error-path"><code>{r.path.clone()}</code></td>
                                         <td class="num">{r.count}</td>
-                                        <td class="num muted" title=format!("first seen {}", ago(r.first_seen))>{ago(r.last_seen)}</td>
+                                        <td class="num muted" title=format!("last seen {}\nfirst seen {}", exact(r.last_seen), ago_exact(r.first_seen))>{ago(r.last_seen)}</td>
                                     </tr>
                                 </For>
                             </tbody>
