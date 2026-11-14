@@ -438,6 +438,23 @@ impl Agent {
                     maintenance::refresh_report(&agent).await;
                 });
             }
+            AgentRequest::Reboot => {
+                info!("rebooting the node in a few seconds, as the server asks");
+                crate::platform::reboot::soon(Duration::from_secs(5)).await?;
+            }
+            AgentRequest::InstallUpdates => {
+                let platform = crate::platform::current();
+                info!("installing the system's pending updates, as the server asks");
+                let log = platform.install_updates().await?;
+                let upkeep = events::read_upkeep().await;
+                self.activity.set_upkeep(upkeep.clone());
+                if !upkeep.reboot_required() {
+                    platform.after_updates().await;
+                }
+                return Ok(Some(serde_json::to_value(
+                    facade_core::proto::InstalledUpdates { log, upkeep },
+                )?));
+            }
             AgentRequest::RemoveVolume { name } => {
                 self.runtime.remove_volume(&name).await?;
                 let agent = self.clone();

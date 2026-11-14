@@ -118,3 +118,90 @@ mod tests {
         );
     }
 }
+
+/// Where the last upgrade's output goes (a tmpfs: one run's worth).
+const UPGRADE_LOG: &str = "/run/facade-updates.log";
+
+/// Refreshes the package lists and installs every pending update, new
+/// dependencies included (a new kernel comes as one), keeping changed
+/// configuration files. Returns the output's last lines.
+///
+/// apt runs as a unit of its own (`systemd-run --wait`), out of facade's: an
+/// upgrade restarting a service must never stop dpkg halfway, and
+/// `NEEDRESTART_SUSPEND` keeps needrestart from restarting facade meanwhile
+/// (services left on old libraries are restarted afterwards, or by the reboot).
+pub async fn upgrade() -> anyhow::Result<Vec<String>> {
+    let systemd_run = crate::platform::find_tool("systemd-run")
+        .ok_or_else(|| anyhow::anyhow!("systemd-run is not on the node"))?;
+    let lock = "-o DPkg::Lock::Timeout=900";
+    let script = format!(
+        "exec >{UPGRADE_LOG} 2>&1; apt-get -q {lock} update && apt-get -y -q {lock} \
+         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+         --with-new-pkgs upgrade && apt-get -y -q {lock} autoremove"
+    );
+    let out = Command::new(systemd_run)
+        .args([
+            "--unit=facade-updates",
+            "--description=System updates installed by facade",
+            "--wait",
+            "--collect",
+            "--quiet",
+            "--setenv=DEBIAN_FRONTEND=noninteractive",
+            "--setenv=NEEDRESTART_SUSPEND=1",
+            "--setenv=LANG=C",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("PATH", crate::platform::tool_path())
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("running systemd-run: {e}"))?;
+    let log = std::fs::read_to_string(UPGRADE_LOG).unwrap_or_default();
+    let tail: Vec<String> = {
+        let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+        lines[lines.len().saturating_sub(40)..]
+            .iter()
+            .map(|l| l.to_string())
+            .collect()
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let last = tail.last().cloned().unwrap_or_default();
+        if err.contains("already") && err.contains("facade-updates") {
+            anyhow::bail!("updates are already being installed");
+        }
+        anyhow::bail!(
+            "installing updates failed: {}",
+            if last.is_empty() {
+                err.trim().to_string()
+            } else {
+                last
+            }
+        );
+    }
+    Ok(tail)
+}
+
+/// Restarts the services still running replaced libraries, a few seconds from
+/// now (facade may be one), when needrestart is there.
+pub async fn restart_outdated_services() {
+    let (Some(systemd_run), Some(needrestart)) = (
+        crate::platform::find_tool("systemd-run"),
+        crate::platform::find_tool("needrestart"),
+    ) else {
+        return;
+    };
+    let _ = Command::new(systemd_run)
+        .args([
+            "--unit=facade-needrestart",
+            "--on-active=10",
+            "--quiet",
+            "--description=Restart services after updates installed by facade",
+        ])
+        .arg(needrestart)
+        .args(["-r", "a", "-q"])
+        .env("PATH", crate::platform::tool_path())
+        .output()
+        .await;
+}

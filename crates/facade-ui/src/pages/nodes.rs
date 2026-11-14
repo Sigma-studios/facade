@@ -163,6 +163,7 @@ pub fn Nodes() -> impl IntoView {
             },
         );
     };
+    let reboot_open = RwSignal::new(false);
     let ip_open = RwSignal::new(false);
     let ip_value = RwSignal::new(String::new());
     let save_ip = move |auto: bool| {
@@ -297,6 +298,14 @@ pub fn Nodes() -> impl IntoView {
                             <button class="button" title="Also drop the whole build cache (next builds start from scratch) and the images kept for rollbacks"
                                 on:click=move |_| prune(&this(), true)>"Deep clean"</button>
                         </Show>
+                        <button class="button" title="Reboot now or at a time; updates and reboots in a maintenance window"
+                            on:click=move |_| reboot_open.set(true)>
+                            {move || if node.with(|n| n.as_ref().and_then(|n| n.upkeep.as_ref()).is_some_and(|u| u.reboot_required())) {
+                                "Reboot… (required)"
+                            } else {
+                                "Reboot…"
+                            }}
+                        </button>
                         <button class="button" title="The address this node's domains point to" on:click=move |_| {
                             ip_value.set(node.with_untracked(|n| {
                                 n.as_ref().and_then(|n| n.public_ip.clone()).unwrap_or_default()
@@ -365,6 +374,8 @@ pub fn Nodes() -> impl IntoView {
                 </div>
             </Show>
         </Modal>
+
+        <super::reboot::RebootDialog node=Signal::derive(move || current.get().unwrap_or_default()) open=reboot_open/>
 
         <Modal open=ip_open title="Public IP">
             <form class="form" on:submit=move |ev: leptos::ev::SubmitEvent| { ev.prevent_default(); save_ip(false) }>

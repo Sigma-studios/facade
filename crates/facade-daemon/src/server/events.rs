@@ -118,6 +118,11 @@ impl Entry {
         self
     }
 
+    /// [`Entry::problem`] when `yes`.
+    pub fn problem_if(self, yes: bool) -> Self {
+        if yes { self.problem() } else { self }
+    }
+
     pub fn problem(mut self) -> Self {
         self.0.problem = true;
         self
@@ -207,6 +212,17 @@ struct AgentMark {
     started: Option<u64>,
     boot: Option<u64>,
     binary: Option<String>,
+}
+
+/// When the node's machine last booted, as its agent said when it connected.
+pub fn agent_boot(server: &Server, node: &str) -> Option<u64> {
+    server
+        .store
+        .kv_get(&format!("activity.agent.{node}"))
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str::<AgentMark>(&j).ok())
+        .and_then(|m| m.boot)
 }
 
 /// What an agent says about itself when it connects.

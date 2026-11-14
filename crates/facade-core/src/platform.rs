@@ -133,6 +133,27 @@ impl PlatformInfo {
             Support::BestEffort => format!("best effort: {}", self.os.name()),
         }
     }
+
+    /// Whether facade installs the node's pending updates itself (its
+    /// maintenance window), or why not.
+    pub fn installs_updates(&self) -> Result<(), String> {
+        installs_updates(&self.os)
+    }
+}
+
+/// Whether facade installs pending updates on `os`, or why not.
+pub fn installs_updates(os: &OsId) -> Result<(), String> {
+    match os.id.as_str() {
+        "ubuntu" => Ok(()),
+        "nixos" => Err(
+            "on NixOS updates come from the system's configuration: update nixpkgs and rebuild"
+                .into(),
+        ),
+        _ => Err(format!(
+            "facade installs updates on Ubuntu only; this node runs {}",
+            os.name()
+        )),
+    }
 }
 
 /// The answer to a host check: what it found, or why there is no answer.

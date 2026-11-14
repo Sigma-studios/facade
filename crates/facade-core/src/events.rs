@@ -121,6 +121,9 @@ pub enum EventKind {
     Upkeep,
     DiskError,
     Vulnerability,
+    /// facade rebooted a node or installed its updates (asked, or in its
+    /// maintenance window), and how it went.
+    Maintenance,
     #[serde(other)]
     Other,
 }
@@ -183,7 +186,7 @@ impl Category {
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 34] = [
+    pub const ALL: [EventKind; 35] = [
         EventKind::DeployStarted,
         EventKind::Deployed,
         EventKind::DeployFailed,
@@ -217,6 +220,7 @@ impl EventKind {
         EventKind::Upkeep,
         EventKind::DiskError,
         EventKind::Vulnerability,
+        EventKind::Maintenance,
         EventKind::Other,
     ];
 
@@ -255,6 +259,7 @@ impl EventKind {
             EventKind::Upkeep => "upkeep",
             EventKind::DiskError => "disk_error",
             EventKind::Vulnerability => "vulnerability",
+            EventKind::Maintenance => "maintenance",
             EventKind::Other => "other",
         }
     }
@@ -281,7 +286,7 @@ impl EventKind {
             SshLogin => Category::Logins,
             CertIssued | CertFailed | DnsRecord => Category::Certificates,
             Reboot | AgentRestart | ServerStart | FacadeUpdate | Upkeep | DiskError
-            | Vulnerability => Category::System,
+            | Vulnerability | Maintenance => Category::System,
         }
     }
 }

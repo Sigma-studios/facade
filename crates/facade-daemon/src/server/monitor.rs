@@ -185,11 +185,14 @@ fn conditions(server: &Server) -> HashMap<String, String> {
     let now = facade_core::now();
     super::events::conditions(server, &mut out);
     super::vulns::conditions(server, &mut out);
+    super::maintenance::conditions(server, &mut out);
     let live = server.live.read();
 
     for (name, node) in &live.nodes {
         if let Some(since) = node.offline_since {
-            if now.saturating_sub(since) > NODE_OFFLINE_AFTER {
+            // A reboot facade asked for: its own alert says when the node is late.
+            if now.saturating_sub(since) > NODE_OFFLINE_AFTER && !server.maintenance.rebooting(name)
+            {
                 out.insert(
                     format!("node:{name}:offline"),
                     format!("node {name} is offline"),
@@ -374,6 +377,18 @@ impl Note {
             description: message.into(),
             color: 0x3fa45b,
             ping: false,
+            url: None,
+        }
+    }
+
+    /// Something worth knowing as it happens (a reboot coming, a maintenance
+    /// done): pings when `ping`.
+    pub fn notice(title: &str, description: &str, ping: bool) -> Self {
+        Self {
+            title: title.into(),
+            description: description.into(),
+            color: if ping { 0xd93f3f } else { 0x5865f2 },
+            ping,
             url: None,
         }
     }

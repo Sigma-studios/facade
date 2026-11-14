@@ -179,6 +179,8 @@ struct NodeFact {
     /// Disconnected since.
     offline_since: Option<u64>,
     upkeep: Option<Upkeep>,
+    /// A reboot facade plans or is doing (`a reboot is scheduled for …`).
+    reboot_planned: Option<String>,
 }
 
 struct CertFact {
@@ -296,6 +298,7 @@ async fn gather(server: &Server) -> Facts {
             NodeFact {
                 local: n.name == server.cfg.local_node,
                 upkeep: server.activity.upkeep(&n.name),
+                reboot_planned: super::maintenance::planned_note(server, &n.name),
                 offline_since,
                 name: n.name,
             }
@@ -1066,14 +1069,22 @@ fn node_alert(alert: &AlertView, name: &str, kind: &str, node: Option<&NodeFact>
                     u.updates.known(),
                     Some(facade_core::events::Updates::Channel(_))
                 );
+                let reboot = match node.and_then(|n| n.reboot_planned.as_deref()) {
+                    Some(planned) => planned.to_string(),
+                    None => format!(
+                        "reboot it with Reboot on its page, or facade node reboot {name} (a maintenance window can do it on its own)"
+                    ),
+                };
                 f = match (security, u.reboot_required()) {
                     _ if channel && !u.reboot_required() => f.hint(
                         "update nixpkgs and rebuild: nix flake update nixpkgs, then nixos-rebuild switch",
                     ),
                     _ if channel => f.hint("rebuild with an updated nixpkgs, or reboot into the current system: sudo reboot"),
-                    (true, true) => f.hint("run sudo apt upgrade on the node, then reboot it"),
+                    (true, true) => f.hint(format!(
+                        "install them (sudo apt upgrade, or a maintenance window on its page), then {reboot}"
+                    )),
                     (true, false) => f.hint("run sudo apt upgrade on the node"),
-                    (false, true) => f.hint("reboot the node when you can: sudo reboot"),
+                    (false, true) => f.hint(reboot),
                     (false, false) => f,
                 };
             }
@@ -1146,6 +1157,7 @@ mod tests {
             local: name == "main",
             offline_since: None,
             upkeep: None,
+            reboot_planned: None,
         }
     }
 

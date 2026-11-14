@@ -27,7 +27,13 @@ use crate::spec::AppSpec;
 /// the number stays so that agents already at 7 are not refused.
 /// 8: agents send what is installed for the vulnerability check
 /// ([`AgentRequest::Inventory`]); the server asks only agents speaking 8.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// 9: agents reboot the node and install its pending updates when asked
+/// ([`AgentRequest::Reboot`], [`AgentRequest::InstallUpdates`]); the server
+/// asks only agents speaking 9.
+pub const PROTOCOL_VERSION: u32 = 9;
+/// The first protocol with [`AgentRequest::Reboot`] and
+/// [`AgentRequest::InstallUpdates`].
+pub const REBOOT_PROTOCOL: u32 = 9;
 /// The first protocol with [`AgentRequest::ExecStream`].
 pub const EXEC_STREAM_PROTOCOL: u32 = 6;
 /// The oldest agent protocol the server still talks to. Agents in between are
@@ -262,6 +268,12 @@ pub enum AgentRequest {
     Prune {
         aggressive: bool,
     },
+    /// Reboot the machine a few seconds from now (time to answer, and for the
+    /// server's own node to answer its API call). Fails at once when it cannot.
+    Reboot,
+    /// Install the pending system updates (`apt-get upgrade` on Ubuntu). Answers
+    /// [`InstalledUpdates`] once done.
+    InstallUpdates,
     /// Delete a facade volume no app uses any more.
     RemoveVolume {
         name: String,
@@ -301,6 +313,15 @@ pub enum AgentRequest {
         app: String,
         request: crate::exec::ExecRequest,
     },
+}
+
+/// What [`AgentRequest::InstallUpdates`] did.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstalledUpdates {
+    /// The package manager's last lines.
+    pub log: Vec<String>,
+    /// Pending updates and reboot afterwards.
+    pub upkeep: crate::events::Upkeep,
 }
 
 /// Stacks deploy in two phases: every service is built first (nothing changes if

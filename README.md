@@ -315,6 +315,8 @@ template in `lang::generated_dockerfile`.
 | `facade volume ls` / `export` / `import` / `rm` / `node disk` / `node prune` | volumes and disk space |
 | `facade backup ls` / `run` / `get` / `restore` / `server` | backups |
 | `facade node ports <node>` | what listens on a node, and who holds each port |
+| `facade node reboot <node> [--at 04:00]` / `--cancel` | reboot a node now or at a time (see [Reboots](#reboots-and-maintenance-windows)) |
+| `facade node maintenance <node> --days sun --at 04:00` / `--skip` / `--off` | install updates and reboot on a schedule |
 | `facade user add/ls/set/rm` / `app owner` / `app grant` / `whoami` | accounts and who manages what |
 | `facade server` / `server set` | the web UI's domain, ACME contact, direct API port |
 | `facade server update [--check]` | update facade to the latest build of main (see [Updating](#updating)) |
@@ -658,6 +660,42 @@ show`) shows its own, with the largest layers of the image it runs.
 What an app writes inside its container, outside volumes, is lost on redeploy: past
 100 MB it raises an alert. Volumes no app declares any more are flagged as orphaned.
 
+### Reboots and maintenance windows
+
+A node waiting for a reboot (a new kernel installed by Ubuntu's unattended upgrades, a
+NixOS rebuild) is a problem until it reboots. **Reboot…** on the node's page, or
+`facade node reboot <node>`, shows what stops (the running apps, builds cut short),
+what the reboot is for (the packages asking for it, the vulnerabilities it fixes),
+then reboots it now or at a time (`--at 04:00`, `--at "2026-11-15 04:00"`, `--at +2h`:
+UTC on the CLI, your own time in the web UI; `--cancel` cancels). A scheduled reboot
+waits for running builds, up to 30 minutes. Admins only.
+
+A **maintenance window** does it all on its own: on chosen days at a time (UTC), the
+node installs its pending updates (`apt-get upgrade`, new kernels included, changed
+configuration files kept; Ubuntu only: NixOS updates come from its configuration)
+and then reboots if a reboot is required. Without a reboot, services still running
+replaced libraries are restarted (needrestart).
+
+```sh
+facade node maintenance main --days sun --at 04:00   # updates and reboot, Sundays
+facade node maintenance main --updates off           # only the reboots it needs
+facade node maintenance main --skip                  # not this time
+facade node maintenance main --off
+```
+
+Discord hears of every reboot facade makes: 15 minutes before a scheduled one (or a
+window with something to do), as it starts, and once the node is back: how long it
+took, whether every app that ran before runs again, and whether it still asks for a
+reboot (a ping when something is wrong). A node not back 10 minutes after a reboot,
+or still on its old boot, is a problem and pings; its offline alert waits meanwhile.
+The server's own node takes facade down with it, so nothing can warn from there: its
+messages say that no message within 15 minutes means it did not come back. Each step
+is an [Activity](#activity) entry (`facade activity --kind maintenance`).
+
+The agent reboots through a systemd timer (`systemctl reboot` a few seconds after it
+answers), and apt runs as a unit of its own, so restarting a service never stops dpkg
+halfway.
+
 ### Domains and HTTPS
 
 Give an app a domain (`--domain`, `facade domain add`, or its Settings tab). The
@@ -908,7 +946,7 @@ The Overview starts with what is wrong right now, critical first then oldest, an
 sidebar counts it next to Overview (red when one is critical). Each problem says what,
 what it concerns (an app, a domain, a node), since when, and where it is fixed: a link
 to the page or tab, with what to do when it is plain (`create an A record for
-shop.example.com pointing to 51.83.42.59`, `run sudo apt upgrade on the node`, the
+shop.example.com pointing to 51.83.42.59`, `reboot it with Reboot on its page`, the
 renewal's error). A problem lasts as long as its cause: once fixed it leaves the list by
 itself. What happened before is the alerts' history (linked from there) and the
 [Activity](#activity)'s. `facade problems` prints the same list (`--json` for scripts;

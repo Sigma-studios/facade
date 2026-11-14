@@ -65,6 +65,8 @@ fn answer_within(req: &AgentRequest) -> Duration {
         AgentRequest::Exec { timeout_secs, .. } => {
             REQUEST_TIMEOUT + Duration::from_secs(u64::from(*timeout_secs))
         }
+        // apt waits up to 15 minutes for its lock, then downloads and installs.
+        AgentRequest::InstallUpdates => Duration::from_secs(60 * 60),
         _ => REQUEST_TIMEOUT,
     }
 }

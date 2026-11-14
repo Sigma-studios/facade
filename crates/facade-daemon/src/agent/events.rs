@@ -153,7 +153,7 @@ impl Activity {
             .flatten()
     }
 
-    fn set_upkeep(&self, u: Upkeep) {
+    pub(crate) fn set_upkeep(&self, u: Upkeep) {
         let mut upkeep = self.upkeep.lock();
         let changed = upkeep.0.as_ref().is_none_or(|old| {
             Upkeep {
@@ -1336,7 +1336,7 @@ async fn upkeep_loop(agent: Arc<Agent>) {
 }
 
 /// Pending updates and reboot, as the node's platform knows them.
-async fn read_upkeep() -> Upkeep {
+pub(crate) async fn read_upkeep() -> Upkeep {
     let platform = crate::platform::current();
     Upkeep {
         at: facade_core::now(),

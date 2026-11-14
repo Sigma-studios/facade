@@ -9,6 +9,7 @@ pub mod git;
 pub mod insights;
 pub mod nodes;
 pub mod overview;
+pub mod reboot;
 pub mod settings;
 pub mod spec_form;
 pub mod stack;

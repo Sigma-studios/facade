@@ -626,7 +626,7 @@ fn icon(kind: EventKind) -> &'static str {
         SshLogin => "→",
         CertIssued | CertFailed => "◆",
         DnsRecord => "◇",
-        Reboot => "↺",
+        Reboot | Maintenance => "↺",
         FacadeUpdate => "⇡",
         Upkeep => "▲",
         DiskError => "▣",

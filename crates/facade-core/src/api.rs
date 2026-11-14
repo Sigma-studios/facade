@@ -1481,3 +1481,233 @@ pub struct WebhookInfo {
     pub url: Option<String>,
     pub secret: String,
 }
+
+// ---------------------------------------------------------------- reboots and maintenance
+
+/// A node's maintenance window: at `hour:minute` UTC on `days`, facade installs
+/// its pending updates (`updates`) and reboots it when a reboot is required
+/// (`reboot`). Discord hears of it before, and of how it went after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceWindow {
+    /// 0 is Monday; empty: every day.
+    #[serde(default)]
+    pub days: Vec<u8>,
+    pub hour: u8,
+    #[serde(default)]
+    pub minute: u8,
+    pub updates: bool,
+    pub reboot: bool,
+}
+
+impl MaintenanceWindow {
+    pub const DAY_NAMES: [&'static str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+    /// `every day at 04:00 UTC`, `Sun at 04:00 UTC`.
+    pub fn when(&self) -> String {
+        let days = if self.days.is_empty() || self.days.len() == 7 {
+            "every day".to_string()
+        } else {
+            let mut days = self.days.clone();
+            days.sort_unstable();
+            days.dedup();
+            days.iter()
+                .filter_map(|d| Self::DAY_NAMES.get(*d as usize))
+                .map(|d| {
+                    let mut c = d.chars();
+                    c.next()
+                        .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!("{days} at {:02}:{:02} UTC", self.hour, self.minute)
+    }
+
+    /// `installs updates, then reboots if needed`.
+    pub fn what(&self) -> &'static str {
+        match (self.updates, self.reboot) {
+            (true, true) => "installs updates, then reboots if a reboot is required",
+            (true, false) => "installs updates (no reboot)",
+            (false, true) => "reboots if a reboot is required",
+            (false, false) => "does nothing",
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.hour > 23 || self.minute > 59 {
+            return Err("the time must be between 00:00 and 23:59".into());
+        }
+        if self.days.iter().any(|d| *d > 6) {
+            return Err("days go from 0 (Monday) to 6 (Sunday)".into());
+        }
+        if !self.updates && !self.reboot {
+            return Err("a window installs updates, reboots, or both".into());
+        }
+        Ok(())
+    }
+
+    /// The first time of the window at or after `from` (seconds since the epoch).
+    pub fn next_after(&self, from: u64) -> u64 {
+        const DAY: u64 = 86_400;
+        let offset = u64::from(self.hour) * 3600 + u64::from(self.minute) * 60;
+        let today = from / DAY;
+        (0..8)
+            .map(|i| today + i)
+            .filter(|day| {
+                // 1970-01-01 was a Thursday (3 days after a Monday).
+                let weekday = ((day + 3) % 7) as u8;
+                self.days.is_empty() || self.days.contains(&weekday)
+            })
+            .map(|day| day * DAY + offset)
+            .find(|t| *t >= from)
+            .unwrap_or(from + 7 * DAY)
+    }
+}
+
+/// `PUT /api/nodes/{name}/maintenance`: `None` turns the window off.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetMaintenance {
+    pub window: Option<MaintenanceWindow>,
+}
+
+/// `POST /api/nodes/{name}/reboot`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RebootRequest {
+    /// When (seconds since the epoch); now when `None`.
+    #[serde(default)]
+    pub at: Option<u64>,
+}
+
+/// A reboot to come.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledReboot {
+    pub at: u64,
+    pub by: String,
+}
+
+/// A reboot facade asked for and is following.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebootRun {
+    pub by: String,
+    /// When the node was asked.
+    pub asked: u64,
+    /// When it came back (booted again and its agent connected).
+    #[serde(default)]
+    pub back: Option<u64>,
+}
+
+/// How the last reboot or maintenance went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceOutcome {
+    pub at: u64,
+    pub ok: bool,
+    pub summary: String,
+}
+
+/// `GET /api/nodes/{name}/reboot`: what a reboot of the node would do, and
+/// what is planned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebootPlan {
+    pub node: String,
+    /// The server's own node: facade goes down with it.
+    pub local: bool,
+    pub connected: bool,
+    /// Why facade cannot reboot it (offline, an older agent).
+    #[serde(default)]
+    pub unavailable: Option<String>,
+    /// Why facade cannot install its updates (`None`: it can).
+    #[serde(default)]
+    pub updates_unavailable: Option<String>,
+    /// Running apps, which stop meanwhile.
+    pub apps: Vec<String>,
+    /// What asks for a reboot (packages, a kernel).
+    pub reasons: Vec<String>,
+    pub reboot_required: bool,
+    /// Pending updates (package managers).
+    #[serde(default)]
+    pub updates: Option<u32>,
+    /// Vulnerabilities a reboot fixes (CVE IDs).
+    pub fixes: Vec<String>,
+    /// Builds in progress, which a reboot would cut short (a scheduled one
+    /// waits for them).
+    pub builds: Vec<String>,
+    pub scheduled: Option<ScheduledReboot>,
+    pub maintenance: Option<MaintenanceWindow>,
+    /// When the window next runs (skipped occurrences left out).
+    pub next_window: Option<u64>,
+    /// A reboot in progress.
+    pub running: Option<RebootRun>,
+    pub last: Option<MaintenanceOutcome>,
+}
+
+/// `Sun 15 Nov 04:00 UTC`.
+pub fn utc_time(at: u64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let day = at / 86_400;
+    let (_, month, dom) = crate::insights::civil(day);
+    let secs = at % 86_400;
+    format!(
+        "{} {dom} {} {:02}:{:02} UTC",
+        DAYS[((day + 3) % 7) as usize],
+        MONTHS[(month as usize).saturating_sub(1).min(11)],
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    // 2026-11-14 is a Saturday.
+    const SAT_NOV_14: u64 = 1_794_614_400;
+
+    #[test]
+    fn windows_come_round_on_their_days() {
+        assert_eq!(utc_time(SAT_NOV_14 + 4 * 3600), "Sat 14 Nov 04:00 UTC");
+        let sunday = MaintenanceWindow {
+            days: vec![6],
+            hour: 4,
+            minute: 30,
+            updates: true,
+            reboot: true,
+        };
+        // From Saturday noon: Sunday 04:30.
+        let next = sunday.next_after(SAT_NOV_14 + 12 * 3600);
+        assert_eq!(utc_time(next), "Sun 15 Nov 04:30 UTC");
+        // At the very time, that time; a second later, the week after.
+        assert_eq!(sunday.next_after(next), next);
+        assert_eq!(sunday.next_after(next + 1), next + 7 * 86_400);
+        let daily = MaintenanceWindow {
+            days: vec![],
+            ..sunday.clone()
+        };
+        assert_eq!(
+            utc_time(daily.next_after(SAT_NOV_14 + 3600)),
+            "Sat 14 Nov 04:30 UTC"
+        );
+        assert_eq!(daily.when(), "every day at 04:30 UTC");
+        assert_eq!(sunday.when(), "Sun at 04:30 UTC");
+        assert!(
+            MaintenanceWindow {
+                hour: 24,
+                ..daily.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            MaintenanceWindow {
+                updates: false,
+                reboot: false,
+                ..daily
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}

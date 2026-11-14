@@ -6,6 +6,7 @@ mod client;
 mod exec;
 mod insights;
 mod output;
+mod reboot;
 mod resources;
 mod vulns;
 
@@ -776,6 +777,42 @@ enum NodeCommand {
         /// Also drop the whole build cache and the images kept for rollbacks.
         #[arg(long)]
         aggressive: bool,
+    },
+    /// Reboot the node now, after showing what stops and what it fixes, or at a
+    /// time. Discord hears of it before, and of how it went (back, apps running).
+    Reboot {
+        name: String,
+        /// When, in UTC: `04:00` (the next one), `2026-11-15 04:00`, `+2h`.
+        #[arg(long)]
+        at: Option<String>,
+        /// Cancel the scheduled reboot.
+        #[arg(long, conflicts_with = "at")]
+        cancel: bool,
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// The node's maintenance window: on chosen days at a time (UTC), install
+    /// its updates, then reboot it if a reboot is required. Without flags, shows it.
+    Maintenance {
+        name: String,
+        /// `daily`, `sun`, `mon,thu`, `sat-sun`.
+        #[arg(long)]
+        days: Option<String>,
+        /// The time, in UTC: `04:00`.
+        #[arg(long)]
+        at: Option<String>,
+        /// Install pending updates first: on or off.
+        #[arg(long, value_parser = on_off)]
+        updates: Option<bool>,
+        /// Reboot when a reboot is required: on or off.
+        #[arg(long, value_parser = on_off)]
+        reboot: Option<bool>,
+        /// Turn the window off.
+        #[arg(long, conflicts_with_all = ["days", "at", "updates", "reboot", "skip"])]
+        off: bool,
+        /// Skip the window's next time.
+        #[arg(long, conflicts_with_all = ["days", "at", "updates", "reboot"])]
+        skip: bool,
     },
 }
 
@@ -3397,6 +3434,31 @@ async fn node(api: &Api, cmd: NodeCommand, json: bool) -> anyhow::Result<()> {
             )
             .await?;
             eprintln!("updated {name}; DNS records follow");
+        }
+        NodeCommand::Reboot {
+            name,
+            at,
+            cancel,
+            yes,
+        } => reboot::reboot(api, &name, at, cancel, yes, json).await?,
+        NodeCommand::Maintenance {
+            name,
+            days,
+            at,
+            updates,
+            reboot,
+            off,
+            skip,
+        } => {
+            let change = reboot::WindowChange {
+                days,
+                at,
+                updates,
+                reboot,
+                off,
+                skip,
+            };
+            reboot::maintenance(api, &name, change, json).await?
         }
         NodeCommand::Ports { name } => {
             let ports: Vec<Listener> = api.get(&format!("/api/nodes/{name}/ports")).await?;

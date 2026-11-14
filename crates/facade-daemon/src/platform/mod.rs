@@ -51,6 +51,18 @@ pub trait Platform: Send + Sync {
     /// Whether a reboot is needed, and why.
     async fn reboot(&self) -> Checked<Reboot>;
 
+    /// Installs the pending updates; the package manager's last lines.
+    async fn install_updates(&self) -> anyhow::Result<Vec<String>> {
+        match facade_core::platform::installs_updates(self.os()) {
+            Ok(()) => anyhow::bail!("this backend cannot install updates"),
+            Err(why) => anyhow::bail!(why),
+        }
+    }
+
+    /// After installed updates that ask for no reboot: restart what still runs
+    /// old code.
+    async fn after_updates(&self) {}
+
     /// What is installed and running, for the vulnerability check.
     async fn inventory(&self) -> Checked<Inventory> {
         Checked::Unsupported(format!(

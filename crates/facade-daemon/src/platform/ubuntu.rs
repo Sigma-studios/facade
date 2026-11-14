@@ -40,6 +40,14 @@ impl Platform for Ubuntu {
         Checked::Known(reboot::required_file())
     }
 
+    async fn install_updates(&self) -> anyhow::Result<Vec<String>> {
+        pkg::apt::upgrade().await
+    }
+
+    async fn after_updates(&self) {
+        pkg::apt::restart_outdated_services().await
+    }
+
     async fn inventory(&self) -> Checked<Inventory> {
         pkg::dpkg::inventory().await
     }

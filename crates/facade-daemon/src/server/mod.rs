@@ -15,6 +15,7 @@ mod git;
 mod github;
 mod hub;
 mod inspect;
+mod maintenance;
 mod monitor;
 mod problems;
 mod reach;
@@ -98,6 +99,8 @@ pub struct Server {
     pub vulns: vulns::Vulns,
     /// How far NixOS nodes are behind their nixpkgs branch.
     pub channels: channels::Channels,
+    /// Reboots facade asks for, and maintenance windows.
+    pub maintenance: maintenance::Maintenance,
 }
 
 /// Runtime state reported by agents; not persisted.
@@ -628,6 +631,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         problems: Default::default(),
         vulns: Default::default(),
         channels: Default::default(),
+        maintenance: Default::default(),
         cfg,
     });
     if let Err(e) = dns::load(&server).await {
@@ -678,6 +682,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tasks.spawn(artifacts::collect_garbage(server.clone()));
     tasks.spawn(backups::run(server.clone()));
     tokio::spawn(release::check_regularly(server.clone()));
+    tokio::spawn(maintenance::run(server.clone()));
     tokio::spawn(autodeploy::run(server.clone()));
     tokio::spawn(events::run(server.clone()));
     tokio::spawn(weekly::run(server.clone()));

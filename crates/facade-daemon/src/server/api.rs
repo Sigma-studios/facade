@@ -77,6 +77,16 @@ pub fn router(server: Arc<Server>) -> Router {
         )
         .route("/api/nodes/{name}/ip", put(set_node_ip))
         .route("/api/nodes/{name}/prune", post(prune_node))
+        .route(
+            "/api/nodes/{name}/reboot",
+            get(super::maintenance::get_plan)
+                .post(super::maintenance::reboot)
+                .delete(super::maintenance::cancel),
+        )
+        .route(
+            "/api/nodes/{name}/maintenance",
+            put(super::maintenance::set_window),
+        )
         .route("/api/nodes/{name}/ports", get(node_ports))
         .route("/api/nodes/{name}/vulns", get(node_vulns))
         .route("/api/vulns", get(list_vulns))
