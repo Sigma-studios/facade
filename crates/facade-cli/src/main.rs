@@ -597,7 +597,7 @@ enum DbCommand {
 
 #[derive(Subcommand)]
 enum BackupCommand {
-    /// Stored backups, newest first.
+    /// Stored backups, newest first, on the server's disk and offsite.
     #[command(alias = "ls")]
     List { app: Option<String> },
     /// Back up now: one app's volumes, or every app's.
@@ -606,27 +606,64 @@ enum BackupCommand {
     Get {
         app: String,
         volume: String,
-        id: u64,
+        /// The backup's id, or `latest`.
+        id: String,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// `offsite`: bring it back from the offsite copy first.
+        #[arg(long, value_name = "local|offsite")]
+        from: Option<String>,
     },
     /// Replace a volume's contents with a backup.
     Restore {
         app: String,
         volume: String,
-        id: u64,
+        /// The backup's id, or `latest`.
+        id: String,
         #[arg(long, short)]
         yes: bool,
+        /// `offsite`: bring it back from the offsite copy first (what a server
+        /// rebuilt from that copy does; backups only kept offsite come from
+        /// there anyway).
+        #[arg(long, value_name = "local|offsite")]
+        from: Option<String>,
     },
     /// Read back every chunk of every incremental backup and check it is intact
     /// (damaged ones are deleted, so the next backup stores them again).
-    Check,
+    Check {
+        /// Check the offsite copy instead: every chunk is there, and a sample
+        /// read back.
+        #[arg(long)]
+        offsite: bool,
+        /// With --offsite: read back every chunk, not a sample.
+        #[arg(long, requires = "offsite")]
+        all: bool,
+    },
+    /// The offsite copy ([backups.offsite] in server.toml): where, when, how
+    /// big, and what went wrong.
+    Offsite {
+        #[command(subcommand)]
+        command: Option<OffsiteCommand>,
+    },
     /// Download the server's database and master key (everything facade knows,
     /// secrets included: keep it safe).
     Server {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum OffsiteCommand {
+    /// Copy now (it also runs after every backup), and wait for it.
+    Copy,
+    /// Show the key the copy is encrypted with, to keep somewhere else (a
+    /// password manager): without it the copy cannot be read. Shown until you
+    /// say it is kept.
+    Key,
+    /// Copy again after a server was rebuilt from its offsite copy, once its
+    /// volumes are restored.
+    Resume,
 }
 
 #[derive(Subcommand)]
@@ -3969,18 +4006,40 @@ async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()>
             if list.is_empty() {
                 println!("no backups yet");
             }
-            table(
-                &["APP", "VOLUME", "ID", "TAKEN", "SIZE"],
-                list.iter().map(|b| {
-                    vec![
-                        b.app.clone(),
-                        b.volume.clone(),
-                        b.id.to_string(),
-                        output::date(b.id),
-                        backup_size(b),
-                    ]
-                }),
-            );
+            // Where each is, once there is an offsite copy to speak of.
+            if list.iter().any(|b| b.offsite) {
+                table(
+                    &["APP", "VOLUME", "ID", "TAKEN", "SIZE", "WHERE"],
+                    list.iter().map(|b| {
+                        vec![
+                            b.app.clone(),
+                            b.volume.clone(),
+                            b.id.to_string(),
+                            output::date(b.id),
+                            backup_size(b),
+                            match (b.offsite, b.offsite_only) {
+                                (_, true) => "offsite",
+                                (true, false) => "here, offsite",
+                                _ => "here",
+                            }
+                            .to_string(),
+                        ]
+                    }),
+                );
+            } else {
+                table(
+                    &["APP", "VOLUME", "ID", "TAKEN", "SIZE"],
+                    list.iter().map(|b| {
+                        vec![
+                            b.app.clone(),
+                            b.volume.clone(),
+                            b.id.to_string(),
+                            output::date(b.id),
+                            backup_size(b),
+                        ]
+                    }),
+                );
+            }
             // Admins only: it covers every app's backups.
             if let Ok(store) = api.get::<BackupStoreView>("/api/backups/store").await
                 && store.snapshots + store.full_copies > 0
@@ -3988,8 +4047,36 @@ async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()>
                 println!();
                 println!("{}", store_summary(&store));
             }
+            if let Ok(Some(offsite)) = api.get::<Option<OffsiteView>>("/api/backups/offsite").await
+            {
+                println!("{}", offsite_summary(&offsite));
+            }
         }
-        BackupCommand::Check => {
+        BackupCommand::Check { offsite: true, all } => {
+            let report: OffsiteVerifyView = api
+                .json(
+                    api.request(Method::POST, "/api/backups/offsite/verify")
+                        .query(&[("all", all)]),
+                )
+                .await?;
+            if json {
+                return print_json(&report);
+            }
+            println!(
+                "offsite: {} of {} chunk(s) read back intact, {} problem(s)",
+                report.verified,
+                report.chunks,
+                report.problems.len()
+            );
+            for problem in &report.problems {
+                println!("  {problem}");
+            }
+            if !report.problems.is_empty() {
+                bail!("the offsite copy has problems");
+            }
+        }
+        BackupCommand::Offsite { command } => offsite(api, command, json).await?,
+        BackupCommand::Check { offsite: false, .. } => {
             let report: BackupCheckReport = api
                 .json(api.request(Method::POST, "/api/backups/check"))
                 .await?;
@@ -4043,12 +4130,16 @@ async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()>
             volume,
             id,
             output,
+            from,
         } => {
+            let id = backup_id(api, &app, &volume, &id, from.as_deref()).await?;
             let path =
                 output.unwrap_or_else(|| PathBuf::from(format!("{app}-{volume}-{id}.tar.gz")));
-            let resp = api
-                .send(api.request(Method::GET, &format!("/api/backups/{app}/{volume}/{id}")))
-                .await?;
+            let mut req = api.request(Method::GET, &format!("/api/backups/{app}/{volume}/{id}"));
+            if let Some(from) = &from {
+                req = req.query(&[("from", from)]);
+            }
+            let resp = api.send(req).await?;
             let size = download(resp, &path).await?;
             eprintln!("saved {} ({})", path.display(), bytes(size));
         }
@@ -4057,21 +4148,31 @@ async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()>
             volume,
             id,
             yes,
+            from,
         } => {
+            let id = backup_id(api, &app, &volume, &id, from.as_deref()).await?;
+            let source = if from.as_deref() == Some("offsite") {
+                " from the offsite copy"
+            } else {
+                ""
+            };
             if !yes
                 && !confirm(&format!(
-                    "Replace everything in {app}/{volume} with backup {id} ({})?",
+                    "Replace everything in {app}/{volume} with backup {id} ({}){source}?",
                     output::date(id)
                 ))?
             {
                 bail!("aborted");
             }
-            api.send(api.request(
+            let mut req = api.request(
                 Method::POST,
                 &format!("/api/backups/{app}/{volume}/{id}/restore"),
-            ))
-            .await?;
-            eprintln!("{app}/{volume} restored from backup {id}");
+            );
+            if let Some(from) = &from {
+                req = req.query(&[("from", from)]);
+            }
+            api.send(req).await?;
+            eprintln!("{app}/{volume} restored from backup {id}{source}");
         }
         BackupCommand::Server { output } => {
             let path = output.unwrap_or_else(|| {
@@ -4094,6 +4195,223 @@ async fn backup(api: &Api, cmd: BackupCommand, json: bool) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+/// A backup's id as typed: a number, or `latest` (the newest of the volume, on
+/// the server's disk or offsite as `from` says).
+async fn backup_id(
+    api: &Api,
+    app: &str,
+    volume: &str,
+    id: &str,
+    from: Option<&str>,
+) -> anyhow::Result<u64> {
+    if id != "latest" {
+        return id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{id:?}: a backup id is a number (or latest)"));
+    }
+    let list: Vec<BackupView> = api
+        .json(
+            api.request(Method::GET, "/api/backups")
+                .query(&[("app", app)]),
+        )
+        .await?;
+    list.iter()
+        .filter(|b| b.volume == volume)
+        .filter(|b| match from {
+            Some("offsite") => b.offsite,
+            Some("local") => !b.offsite_only,
+            _ => true,
+        })
+        .map(|b| b.id)
+        .max()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no backup of {app}/{volume}{}",
+                if from == Some("offsite") {
+                    " offsite (a server rebuilt from it knows them after `facade backup offsite copy` or `check --offsite`)"
+                } else {
+                    ""
+                }
+            )
+        })
+}
+
+async fn offsite(api: &Api, command: Option<OffsiteCommand>, json: bool) -> anyhow::Result<()> {
+    let view = || async {
+        api.get::<Option<OffsiteView>>("/api/backups/offsite")
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no offsite copy: add [backups.offsite] to the server's server.toml (see deploy/server.example.toml)"
+                )
+            })
+    };
+    match command {
+        None => {
+            let offsite = view().await?;
+            if json {
+                return print_json(&offsite);
+            }
+            print_offsite(&offsite);
+        }
+        Some(OffsiteCommand::Copy) => {
+            let before = view().await?.last_copy.map(|c| c.at);
+            api.send(api.request(Method::POST, "/api/backups/offsite/copy"))
+                .await?;
+            if !json {
+                eprintln!("copying…");
+            }
+            // The copy runs on the server; its outcome lands in the view.
+            let offsite = loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let offsite = view().await?;
+                if !offsite.copying && offsite.last_copy.as_ref().map(|c| c.at) != before {
+                    break offsite;
+                }
+                if !json && let Some((done, total)) = offsite.progress.filter(|p| p.1 > 0) {
+                    eprint!("\r{} of {} sent   ", bytes(done), bytes(total));
+                }
+            };
+            if json {
+                return print_json(&offsite);
+            }
+            eprint!("\r");
+            let copy = offsite.last_copy.as_ref().expect("a copy finished");
+            if let Some(error) = &copy.error {
+                bail!("offsite copy failed: {error}");
+            }
+            println!(
+                "copied {} backup(s): {} chunk(s), {} sent in {}s; {} old backup(s) deleted there",
+                copy.copied,
+                copy.uploaded_chunks,
+                bytes(copy.uploaded_bytes),
+                copy.secs,
+                copy.removed
+            );
+            println!("{}", offsite_summary(&offsite));
+        }
+        Some(OffsiteCommand::Key) => {
+            let key: OffsiteKeyView = api.get("/api/backups/offsite/key").await?;
+            let Some(key) = key.key else {
+                bail!(
+                    "the key was kept elsewhere already, so it is not shown any more \
+                     (root can read it on the server, in /var/lib/facade/offsite.key)"
+                );
+            };
+            if json {
+                return print_json(&OffsiteKeyView { key: Some(key) });
+            }
+            println!("{key}");
+            eprintln!(
+                "\nThis key decrypts the offsite copy: without it, nothing there can be restored, \
+                 even by you. Keep it somewhere other than this server (a password manager)."
+            );
+            if confirm("Is it kept somewhere else now? It will not be shown again")? {
+                api.send(api.request(Method::POST, "/api/backups/offsite/key-saved"))
+                    .await?;
+                eprintln!("noted: the key will not be shown again");
+            } else {
+                eprintln!("it stays a problem until you do (run this again)");
+            }
+        }
+        Some(OffsiteCommand::Resume) => {
+            api.send(api.request(Method::POST, "/api/backups/offsite/resume"))
+                .await?;
+            eprintln!("offsite copies resumed: one starts now");
+        }
+    }
+    Ok(())
+}
+
+fn print_offsite(o: &OffsiteView) {
+    println!("target:      {}", o.target);
+    println!(
+        "keeps:       {} backup(s) per volume; checks {} chunk(s) every {}h",
+        o.keep, o.verify_sample, o.verify_every_hours
+    );
+    if let Some(why) = &o.paused {
+        println!("PAUSED:      {why} (facade backup offsite resume)");
+    }
+    match &o.last_copy {
+        Some(c) => {
+            let state = match &c.error {
+                Some(e) => format!("FAILED: {e}"),
+                None => format!(
+                    "ok, {} chunk(s) sent ({}) in {}s",
+                    c.uploaded_chunks,
+                    bytes(c.uploaded_bytes),
+                    c.secs
+                ),
+            };
+            println!(
+                "last copy:   {} ({}), {state}",
+                output::date(c.at),
+                output::ago(c.at)
+            );
+            println!(
+                "holds:       {} backup(s), {} chunk(s), {}",
+                c.backups,
+                c.chunks,
+                bytes(c.size)
+            );
+        }
+        None => println!("last copy:   none yet"),
+    }
+    if o.copying {
+        println!("copying now");
+    }
+    if o.stale {
+        match o.last_success {
+            Some(at) => println!("STALE:       last good copy {}", output::ago(at)),
+            None => println!("STALE:       no copy has worked yet"),
+        }
+    }
+    if let Some(v) = &o.last_verify {
+        println!(
+            "last check:  {}, {} of {} chunk(s) read back intact, {} problem(s)",
+            output::ago(v.at),
+            v.verified,
+            v.chunks,
+            v.problems.len()
+        );
+        for p in &v.problems {
+            println!("  {p}");
+        }
+    }
+    if !o.key_saved {
+        println!("KEY:         not kept anywhere else yet: facade backup offsite key");
+    }
+    if let Some(key) = &o.public_key {
+        println!("ssh key:     {key}");
+    }
+    if let Some(host) = &o.host_key {
+        println!("host key:    {host}");
+    }
+    if let Some(url) = &o.reports_to {
+        println!("reports to:  {url}");
+    }
+}
+
+/// One line for `facade backup ls`.
+fn offsite_summary(o: &OffsiteView) -> String {
+    match &o.last_copy {
+        Some(c) if c.error.is_some() => format!(
+            "offsite ({}): the last copy FAILED {}: {}",
+            o.target,
+            output::ago(c.at),
+            c.error.as_deref().unwrap_or_default()
+        ),
+        Some(c) => format!(
+            "offsite ({}): {} for {} backup(s), last copy {}",
+            o.target,
+            bytes(c.size),
+            c.backups,
+            output::ago(c.at)
+        ),
+        None => format!("offsite ({}): no copy yet", o.target),
+    }
 }
 
 /// `2.0 GB, 14 MB new` for an incremental backup (what a full copy would take,
