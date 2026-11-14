@@ -763,11 +763,12 @@ live on the app's node, as Docker volumes named `facade-<app>_<volume>`.
 
 The server backs up every volume once a day and keeps the last 7 (`[backups]` in
 `server.toml`), in `/var/lib/facade/backups`, together with a copy of its own
-database and master key. They are on the server's disk: take copies elsewhere with
-`facade backup get <app> <volume> <id>` and `facade backup server` (the database and
-the key to its secrets, in one file). `facade backup run [app]` backs up now and
-`facade backup restore <app> <volume> <id>` puts a backup back. A failed backup is
-an alert.
+database and master key. They are on the server's disk: an [offsite
+copy](#offsite-copies) keeps them somewhere else too, and `facade backup get <app>
+<volume> <id>` and `facade backup server` (the database and the key to its secrets,
+in one file) download them. `facade backup run [app]` backs up now and `facade
+backup restore <app> <volume> <id>` (or `latest`) puts a backup back. A failed
+backup is an alert.
 
 Backups are incremental: the volume's tar is cut into chunks (512 KiB on average,
 cut where the contents say, so an insertion only moves the cuts around it), and
@@ -792,6 +793,142 @@ facade app update world --backup-before "rcon-cli save-off && rcon-cli save-all 
 
 `before` runs before its volumes are copied, and if it fails, nothing is copied;
 `after` runs once they are, whether the copy worked or not.
+
+### Offsite copies
+
+Backups on the server's disk go with the server. `[backups.offsite]` in `server.toml`
+copies them after every backup run, the server's own (database, master key and
+certificate) included, to one of:
+
+* **sftp**: a directory on any SSH server: a Hetzner Storage Box (port 23), a NAS,
+  another VPS.
+* **s3**: a bucket of an S3-compatible object storage (AWS, Hetzner, Scaleway,
+  Backblaze B2, MinIO, Garage…), with its keys in files.
+* **local**: a mounted path (another disk, a network share). The directory must
+  exist: facade does not create it, so that a disk that is not mounted is an error
+  rather than a copy filling the disk underneath.
+
+```toml
+# A Storage Box sub-account (sub-accounts see their own folder as /home).
+[backups.offsite]
+provider = "sftp"
+host = "u123456.your-storagebox.de"
+port = 23
+user = "u123456-sub2"
+key_file = "/etc/facade/offsite_ed25519"   # created if missing; install its .pub there
+path = "facade"                            # from the login's home: /home/facade
+# host_key = "ssh-ed25519 AAAA…"           # ssh-keyscan -p 23 u123456.your-storagebox.de
+# keep = 30                                # more backups offsite than locally (7)
+```
+
+```toml
+[backups.offsite]
+provider = "s3"
+endpoint = "https://fsn1.your-objectstorage.com"
+bucket = "facade-backups"
+region = "fsn1"
+access_key_file = "/etc/facade/s3-access-key"
+secret_key_file = "/etc/facade/s3-secret-key"
+path = "main"                              # a prefix in the bucket
+```
+
+Restart `facaded` after changing it (`systemctl restart facaded`). A missing
+`key_file` is generated at the first start: install its public half (also in
+`facade backup offsite` and Settings → General → Backups) on the target, for a
+Storage Box with `cat /etc/facade/offsite_ed25519.pub | ssh -p 23
+u123456-sub2@u123456.your-storagebox.de install-ssh-key`. Without `host_key`, the
+host key seen at the first connection is kept and required from then on.
+
+**Encrypted before it leaves.** Everything is sealed with XChaCha20-Poly1305 under
+a key the server generates (`/var/lib/facade/offsite.key`, root only): the target
+sees app and volume names, when backups were taken and roughly how big their pieces
+are, nothing else. Chunks are named there by a keyed hash, so whoever reads the
+target cannot check whether a known file is in a backup, and each object's name is
+part of what is authenticated, so one swapped for another (an old backup for a new
+one) fails to open. **Without the key, the copy cannot be read, even by you**:
+`facade backup offsite key` (or **Show the key** in Settings → General → Backups)
+shows it until you say it is kept somewhere else (a password manager), and it is a
+problem until then.
+
+**Incremental.** Chunks never change once written, so a copy sends the chunks of
+new backups that no older one had, then their manifests. The target keeps as many
+backups per volume as the server (`keep`, at least as many), oldest deleted first,
+then the chunks no backup there holds. One server per target: two would delete each
+other's chunks.
+
+**Checked.** Every day (`verify_every_hours`) every chunk the offsite backups list
+must be there, and a sample of them (`verify_sample`, 64) is read back, decrypted
+and checked against its hash. A damaged chunk is deleted there, and the next copy
+uploads it again while the backup is still on the server. `facade backup check
+--offsite [--all]` checks now (`--all`: every chunk).
+
+```sh
+facade backup offsite          # target, last copy, what it holds, last check, errors
+facade backup offsite copy     # copy now and wait for it
+facade backup ls blog          # where each backup is: here, offsite, or both
+facade backup restore blog data 1731550000 --from offsite
+```
+
+A failed copy, one older than `stale_after_hours` (twice the backup interval), and
+a check finding problems are alerts, so [problems](#problems) and Discord messages.
+Backups only kept offsite (with a larger `keep`) are listed, downloaded and restored
+like the others: they are brought back into the server's store first.
+
+**Reporting to Réplique.** With `[backups.replique]`, each copy, check and clean-up
+of old backups is reported to a Réplique server (which watches every backup of your
+devices) as a run of one backup job of this server's device:
+
+```toml
+[backups.replique]
+url = "https://replique.example.com"
+token_file = "/etc/facade/replique-token"   # the device's report token (rpl_…)
+# job = "offsite"
+```
+
+Reports never delay or fail a copy. When Réplique cannot be reached they wait in the
+database (100 runs at most, the oldest dropped with a log line) and go with the next
+report: Réplique typically runs as an app on this very server, so it is away whenever
+it is redeployed, and a copy reported into that gap would otherwise be missing from
+its history and set off its alert for a silent job.
+
+#### Rebuilding a lost server from its offsite copy
+
+You need the offsite key and the target's login (for a Storage Box, the
+sub-account's: reset its password in Hetzner's console if its SSH key died with the
+server).
+
+1. Install facade on the new VPS as usual (`install.sh server …`), then stop it:
+   `systemctl stop facaded`.
+2. Put the same `[backups.offsite]` (and `[backups.replique]`) in
+   `/etc/facade/server.toml`, the SSH key in `key_file` (or a new one, installed on
+   the target), and the offsite key in a file:
+   `install -m 600 /dev/stdin /root/offsite.key` (paste it, then Ctrl-D).
+3. See what is there, then bring back the newest server backup (or `--id`):
+
+   ```sh
+   facaded offsite-restore --list --key-file /root/offsite.key
+   facaded offsite-restore --key-file /root/offsite.key --force
+   ```
+
+   This puts its database, master key and certificate in `/var/lib/facade` (the
+   database the installer created is kept as `facade.db.before-restore`), and the
+   offsite key in `/var/lib/facade/offsite.key`. Offsite copies are paused: the apps
+   come back with empty volumes, and their backups must not push the real ones out
+   of the target before you restore them.
+4. `systemctl start facaded`, and point DNS records and `public_host` at the new
+   address if it changed. The certificate is the old one, so logged-in CLIs and other
+   nodes' agents reconnect by themselves. The server redeploys every app (rebuilt at
+   their deployed commits) with empty volumes; apps from an uploaded executable need
+   it uploaded again (`facade app update <app> --executable …`), since uploads are not
+   in backups.
+5. Restore each volume from the copy (the app is stopped meanwhile):
+
+   ```sh
+   facade backup ls --json | jq -r '.[] | select(.offsite) | "\(.app) \(.volume)"' | sort -u |
+     while read app volume; do facade backup restore "$app" "$volume" latest --from offsite --yes; done
+   ```
+
+6. `facade backup offsite resume`: copies start again.
 
 ### Private registries
 
@@ -985,7 +1122,8 @@ itself. What happened before is the alerts' history (linked from there) and the
   stack whose latest deploy failed, a deployment queued for 2 hours or building for
   75 minutes, a failing health check, auto-deploy unable to check its source.
 * A volume with a size 90 % full; alerts not reaching Discord; the DNS provider
-  unreachable.
+  unreachable; the key of the offsite copy not kept anywhere else yet; offsite copies
+  paused after a rebuild.
 
 Stopped apps, and apps never deployed, have none, nor do their domains. One cause makes
 one row: a site unreachable because its record is wrong is the DNS row (made critical),
@@ -1007,7 +1145,7 @@ facade alerts test
 
 A message is posted when a problem lasts a minute (node offline, app crashed or failed
 to deploy, disk ≥ 90 %, memory ≥ 95 %, app at its memory/CPU limit, entry point unable
-to bind its port, failed backup, app writing over 100 MB inside its container, app
+to bind its port, failed backup, failed, stale or damaged offsite copy, app writing over 100 MB inside its container, app
 answering 5xx to at least 20 % of at least 20 requests over 5 minutes, site unreachable
 from outside for 3 minutes, a certificate expiring within 7 days, a node waiting for a
 reboot or for security updates, disk errors on a node in the last day) and again when
@@ -1201,8 +1339,6 @@ the server; older ones need the server's `facaded` installed by hand.
 ## Not there yet
 
 * Links across nodes: a database and the apps using it share a node.
-* Backups to somewhere other than the server's disk (S3 and the like). Chunks and
-  manifests never change once written, so a copy would only send the new ones.
 * Webhooks from forges other than GitHub (GitLab, Gitea…): their repositories are
   polled.
 * Zero downtime for apps that cannot overlap (published ports, the node's network,

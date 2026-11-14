@@ -27,6 +27,32 @@ public_host = "203.0.113.10"
 # every_hours = 24
 # keep = 7
 
+# A copy of the backups elsewhere, encrypted with a key facade generates
+# (`facade backup offsite key` shows it: keep it somewhere else). One provider:
+# [backups.offsite]
+# provider = "sftp"                       # "sftp", "s3" or "local"
+# host = "u123456.your-storagebox.de"     # sftp
+# port = 23
+# user = "u123456-sub2"
+# key_file = "/etc/facade/offsite_ed25519" # created if missing; install its .pub there
+# host_key = "ssh-ed25519 AAAA…"          # else the one seen first is kept
+# path = "facade"                         # sftp: from the login's home; local: absolute; s3: a prefix
+# endpoint = "https://fsn1.your-objectstorage.com"   # s3
+# bucket = "facade-backups"
+# region = "fsn1"
+# access_key_file = "/etc/facade/s3-access-key"
+# secret_key_file = "/etc/facade/s3-secret-key"
+# keep = 7                                # backups kept offsite per volume (>= [backups] keep)
+# verify_every_hours = 24                 # read back a sample of chunks this often
+# verify_sample = 64
+# stale_after_hours = 48                  # a copy older than this is a problem
+
+# Report each offsite copy to Réplique, as one backup job of this server's device.
+# [backups.replique]
+# url = "https://replique.example.com"
+# token_file = "/etc/facade/replique-token"
+# job = "offsite"
+
 # Where Settings → Updates and `facade server update` get new builds of facade:
 # a GitHub release that CI replaces with every build of main.
 # [update]

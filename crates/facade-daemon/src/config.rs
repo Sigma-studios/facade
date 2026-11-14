@@ -110,8 +110,8 @@ pub enum IngressSetting {
 }
 
 /// Copies of every app volume, and of the server's own database and key, kept in
-/// `<data_dir>/backups`. They sit on the server's disk: download them elsewhere
-/// (`facade backup get`, `facade backup server`) to survive losing the machine.
+/// `<data_dir>/backups`. They sit on the server's disk: `offsite` copies them
+/// elsewhere, to survive losing the machine.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackupConfig {

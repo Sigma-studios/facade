@@ -31,7 +31,7 @@
 //! `backups::collect_garbage`).
 //!
 //! Chunks and manifests never change once written, so copying the store elsewhere
-//! (another disk, object storage) is copying the files not there yet.
+//! is copying the files not there yet (see `offsite`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
