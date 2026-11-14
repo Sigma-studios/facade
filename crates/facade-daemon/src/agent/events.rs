@@ -225,12 +225,35 @@ pub async fn run(agent: Arc<Agent>) {
     tokio::spawn(upkeep_loop(agent));
 }
 
-/// When the machine booted (`btime` in /proc/stat).
+/// When the machine booted, in seconds: see [`boot_time_ms`].
 pub fn boot_time() -> Option<u64> {
+    boot_time_ms().map(|ms| ms / 1000)
+}
+
+/// When the system started, in milliseconds: the kernel's boot (`btime` in
+/// /proc/stat) plus how long after it the first process started. On a machine
+/// that is a second or so after the kernel's boot; in a container running
+/// systemd (how facade's host features are tested), the container's start,
+/// which the host kernel's boot alone would not show.
+pub fn boot_time_ms() -> Option<u64> {
     let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    stat.lines()
+    let btime: u64 = stat
+        .lines()
         .find_map(|l| l.strip_prefix("btime "))
-        .and_then(|v| v.trim().parse().ok())
+        .and_then(|v| v.trim().parse().ok())?;
+    let init = std::fs::read_to_string("/proc/1/stat").ok();
+    let ticks = init.as_deref().and_then(start_ticks).unwrap_or(0);
+    // SAFETY: sysconf only reads a constant.
+    let per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let per_sec = if per_sec > 0 { per_sec as u64 } else { 100 };
+    Some(btime * 1000 + ticks * 1000 / per_sec)
+}
+
+/// A process's start, in clock ticks after the boot: the 22nd field of
+/// `/proc/<pid>/stat`, counted after its name (which may hold spaces).
+fn start_ticks(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 // ---------------------------------------------------------------- Docker
@@ -588,7 +611,7 @@ fn snapshot(text: &str, nanos: i64) -> Vec<String> {
 
 /// Nanoseconds since the epoch of a Docker log timestamp
 /// (`2026-11-04T10:00:00.123456789Z`, RFC 3339 in UTC).
-fn docker_time(ts: &str) -> Option<i64> {
+pub(super) fn docker_time(ts: &str) -> Option<i64> {
     let ts = ts.strip_suffix('Z')?;
     let (date, time) = ts.split_once('T')?;
     let mut d = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
@@ -1348,6 +1371,13 @@ pub(crate) async fn read_upkeep() -> Upkeep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_process_start() {
+        let stat = "1 (sys temd) S 0 1 1 0 -1 4194560 1 2 3 4 5 6 7 8 20 0 1 0 51461835 22016000";
+        assert_eq!(start_ticks(stat), Some(51461835));
+        assert_eq!(start_ticks("garbage"), None);
+    }
 
     const ID: &str = "4f1c3b2a9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a";
 

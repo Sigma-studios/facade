@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod pinned;
 pub mod platform;
 pub mod proto;
+pub mod reboot_report;
 pub mod resources;
 pub mod spec;
 pub mod stack;

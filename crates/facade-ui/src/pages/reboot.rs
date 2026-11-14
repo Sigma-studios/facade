@@ -333,6 +333,7 @@ pub fn RebootDialog(#[prop(into)] node: Signal<String>, open: RwSignal<bool>) ->
                         "Last (" <Ago at=last.at/> "): " {last.summary}
                     </p>
                 })}
+                <super::reboot_timeline::PastReboots node/>
             </Show>
         </Modal>
     }

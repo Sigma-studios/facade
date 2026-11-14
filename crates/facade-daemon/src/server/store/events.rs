@@ -230,6 +230,29 @@ impl Store {
         Ok(EventsPage { events, more })
     }
 
+    /// Rewrites an entry with what is known now (a reboot's report).
+    pub fn update_event(
+        &self,
+        id: i64,
+        severity: Severity,
+        problem: bool,
+        summary: &str,
+        details: &EventDetails,
+    ) -> anyhow::Result<()> {
+        let conn = self.0.lock();
+        conn.execute(
+            "UPDATE events SET severity = ?2, problem = ?3, summary = ?4, details = ?5 WHERE id = ?1",
+            params![
+                id,
+                severity.as_str(),
+                problem,
+                summary,
+                serde_json::to_string(details)?
+            ],
+        )?;
+        Ok(())
+    }
+
     /// One entry, log lines included.
     pub fn get_event(&self, id: i64) -> anyhow::Result<Option<EventView>> {
         let conn = self.0.lock();

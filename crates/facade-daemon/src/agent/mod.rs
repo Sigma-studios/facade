@@ -13,11 +13,13 @@ mod maintenance;
 mod ports;
 mod priority;
 mod queue;
+mod reboot_report;
 mod resources;
 mod routes;
 mod runtime;
 mod sized;
 mod stats;
+mod stop_limit;
 mod volumes;
 
 use std::collections::HashMap;
@@ -179,6 +181,8 @@ impl Agent {
         tokio::spawn(maintenance::run(self.clone()));
         tokio::spawn(cgroups::watch(self.runtime.clone()));
         tokio::spawn(priority::run());
+        tokio::spawn(stop_limit::run(self.runtime.clone()));
+        tokio::spawn(reboot_report::run(self.clone()));
         tokio::spawn(events::run(self.clone()));
         tokio::spawn(inventory::watch(self.clone()));
         {

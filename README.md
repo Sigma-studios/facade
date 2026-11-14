@@ -439,7 +439,10 @@ server writing its world, a queue draining) needs more:
 facade app update world --stop-timeout 120 --stop-signal SIGINT
 ```
 
-Docker uses the same settings when the node reboots.
+Docker uses the same settings when the node reboots. systemd only gives Docker so
+long to stop (90 seconds with Docker's own package), so the agent raises that limit
+to cover the longest stop timeout of its apps plus 30 seconds; an app killed at
+shutdown anyway shows in the reboot's report (see [Reboots](#reboots-and-maintenance-windows)).
 
 ### Deploys without downtime
 
@@ -702,6 +705,17 @@ is an [Activity](#activity) entry (`facade activity --kind maintenance`).
 The agent reboots through a systemd timer (`systemctl reboot` a few seconds after it
 answers), and apt runs as a unit of its own, so restarting a service never stops dpkg
 halfway.
+
+After every reboot, asked by facade or not (a crash, the provider's maintenance), the
+agent reports how it went once the apps are back (or after 5 minutes), on the reboot's
+Activity entry: when the shutdown began, how long each app took to stop and whether it
+was killed past its stop timeout, how long the machine was off, and when each app ran
+and passed its health check again, with how long it was down. The entry draws it as a
+timeline (the node's uptime and **Reboot…** → *Past reboots* lead to it);
+`facade activity --kind reboot --node main` lists them and `facade activity --id <id>`
+shows one in full. The times come from what survives a reboot: Docker's container
+states, and dockerd's lines in the journal (an app killed at shutdown, when the
+shutdown began), so a node whose journal is not kept across boots reports less.
 
 ### Domains and HTTPS
 

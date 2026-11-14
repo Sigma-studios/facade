@@ -710,6 +710,7 @@ fn EventRow(
         .then(|| e.app.clone())
         .flatten();
     let items = e.details.items.clone();
+    let reboot = e.details.reboot.clone();
     let class = format!(
         "{}{}",
         severity_class(e.severity),
@@ -741,6 +742,7 @@ fn EventRow(
                         {deployment.clone().map(|a| view! { " · " <A href=format!("/apps/{a}?tab=deployments")>"deployment log"</A> })}
                     </div>
                     {(!items.is_empty()).then(|| view! { <div class="small ev-items">{items.join(", ")}</div> })}
+                    {reboot.clone().map(|report| view! { <super::reboot_timeline::RebootTimeline report/> })}
                     {move || logs.get().map(|l| match l {
                         Ok(lines) if lines.is_empty() => view! { <div class="small muted">"Loading its lines…"</div> }.into_any(),
                         Ok(lines) => {

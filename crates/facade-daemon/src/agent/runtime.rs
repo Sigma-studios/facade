@@ -1008,6 +1008,9 @@ impl Runtime {
             )
             .await
             .with_context(|| format!("creating container for {app}"))?;
+        if let Some(t) = w.spec.stop_timeout_secs {
+            tokio::spawn(super::stop_limit::cover(u64::from(t)));
+        }
         self.connect_networks(w, name).await
     }
 

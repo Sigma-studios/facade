@@ -1346,3 +1346,35 @@ a.badge:hover { text-decoration: none; filter: brightness(0.97); }
   .problem-body { flex: 1 1 calc(100% - 30px); }
   .problem-fix { margin-left: 30px; }
 }
+
+/* How a reboot went: one row per app on a shared time axis (stopping, down,
+   starting until healthy), the machine's off time hatched behind them. */
+.rb { margin: 10px 0 4px; max-width: 760px; }
+.rb-headline { margin: 0 0 6px; font-variant-numeric: tabular-nums; }
+.rb-headline strong { font-size: 20px; }
+.rb-key { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+.rb-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-left: 10px; }
+.rb-swatch:first-child { margin-left: 0; }
+.rb-chart { position: relative; display: flex; flex-direction: column; gap: 6px; padding: 4px 0; }
+.rb-row { position: relative; display: grid; grid-template-columns: minmax(80px, 140px) 1fr; align-items: center; gap: 8px; }
+.rb-with-notes .rb-row { grid-template-columns: minmax(80px, 140px) 1fr 64px; }
+.rb-name { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+.rb-track { position: relative; height: 12px; }
+.rb-seg { position: absolute; top: 0; bottom: 0; border-radius: 4px; box-shadow: 0 0 0 1px var(--surface-1); }
+.rb-seg:hover { filter: brightness(1.15); outline: 2px solid var(--border-strong); outline-offset: 1px; }
+.rb-stopping { background: var(--series-2); }
+.rb-down { background: var(--series-1); }
+.rb-starting { background: var(--series-3); }
+.rb-off { background: repeating-linear-gradient(45deg, var(--border-strong) 0 2px, transparent 2px 5px); border: 1px solid var(--border-strong); }
+.rb-track { background: var(--surface-2); border-radius: 4px; }
+.rb-off-band, .rb-boot { position: absolute; top: -3px; bottom: -3px; }
+/* Hatched over the bars, so the off time shows inside each app's downtime. */
+.rb-off-band { top: 0; bottom: 0; pointer-events: none; background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--surface-1) 60%, transparent) 0 2px, transparent 2px 5px); }
+.rb-boot { width: 0; border-left: 1px dashed var(--text-muted); }
+.rb-killed { color: var(--critical-text); white-space: nowrap; }
+.rb-axis { display: flex; justify-content: space-between; gap: 12px; margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.rb-facts { margin: 8px 0; padding-left: 18px; color: var(--text-secondary); }
+.rb-table { margin-top: 6px; }
+.rb-past { margin-top: 16px; }
+.rb-past h4 { margin: 0 0 4px; font-size: 13px; }
+.rb-past ul { margin: 0; padding-left: 18px; }

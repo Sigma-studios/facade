@@ -186,6 +186,10 @@ impl Entry {
 /// What an agent saw: its node is the one it speaks for; an app it names must
 /// exist (otherwise the entry is the node's).
 pub fn from_agent(server: &Server, node: &str, e: NodeEvent) {
+    if e.kind == EventKind::Reboot && e.details.reboot.is_some() && reboot_report(server, node, &e)
+    {
+        return;
+    }
     let app = e
         .app
         .filter(|a| server.store.get_app(a).ok().flatten().is_some());
@@ -205,6 +209,45 @@ pub fn from_agent(server: &Server, node: &str, e: NodeEvent) {
 }
 
 // ---------------------------------------------------------------- restarts of facade, reboots
+
+/// A node's report of how its reboot went goes on the "Rebooted" entry its
+/// agent's reconnection made; false when there is none to complete.
+fn reboot_report(server: &Server, node: &str, e: &NodeEvent) -> bool {
+    let entry = server
+        .store
+        .last_node_event(node, EventKind::Reboot, e.at.saturating_sub(600))
+        .ok()
+        .flatten()
+        .filter(|r| r.details.reboot.is_none() && r.at.abs_diff(e.at) < 300);
+    let Some(entry) = entry else {
+        return false;
+    };
+    match server
+        .store
+        .update_event(entry.id, e.severity, e.problem, &e.summary, &e.details)
+    {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(%node, "recording how its reboot went: {err:#}");
+            false
+        }
+    }
+}
+
+/// How the node's latest reboot since `since` went, once its agent said.
+pub fn reboot_report_since(
+    server: &Server,
+    node: &str,
+    since: u64,
+) -> Option<facade_core::events::RebootReport> {
+    server
+        .store
+        .last_node_event(node, EventKind::Reboot, since)
+        .ok()
+        .flatten()?
+        .details
+        .reboot
+}
 
 /// Kept per node, to tell a reboot, an update and a restart apart.
 #[derive(Debug, Default, Serialize, Deserialize)]

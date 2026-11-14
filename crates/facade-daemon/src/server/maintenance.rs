@@ -43,6 +43,8 @@ const LATE: u64 = 10 * 60;
 /// report.
 const SETTLE: u64 = 3 * 60;
 const TICK: Duration = Duration::from_secs(15);
+/// How long after a node is back its reboot report is waited for.
+const REPORT_WAIT: u64 = 7 * 60;
 
 #[derive(Default)]
 pub struct Maintenance {
@@ -672,6 +674,12 @@ async fn follow(server: &Server, node: &str, run: Run, now: u64) {
     if now.saturating_sub(back) < SETTLE {
         return;
     }
+    // The agent's account of the reboot (each app's stop and return) comes
+    // once its apps are back, or 5 minutes after it started: worth waiting for.
+    let report = events::reboot_report_since(server, node, run.asked.saturating_sub(60));
+    if report.is_none() && now.saturating_sub(back) < REPORT_WAIT {
+        return;
+    }
 
     let down: Vec<String> = {
         let live = server.live.read();
@@ -718,7 +726,28 @@ async fn follow(server: &Server, node: &str, run: Run, now: u64) {
     } else if let Some(k) = &kernel {
         lines.push(format!("Running kernel {k}; no reboot pending."));
     }
-    let ok = down.is_empty() && !still;
+    let mut killed = vec![];
+    if let Some(r) = &report {
+        use facade_core::reboot_report::duration;
+        if let Some((a, d)) = r.longest_down() {
+            lines.push(format!(
+                "Apps were down {} at most ({}).",
+                duration(d),
+                a.name
+            ));
+        }
+        if let Some(off) = r.off_for() {
+            lines.push(format!("The machine was off {}.", duration(off)));
+        }
+        killed = r.killed().iter().map(|a| a.name.clone()).collect();
+        if !killed.is_empty() {
+            lines.push(format!(
+                "Killed at shutdown, past their stop timeout: {}.",
+                killed.join(", ")
+            ));
+        }
+    }
+    let ok = down.is_empty() && !still && killed.is_empty();
     let summary = lines.join(" ");
     let id = Entry::node(
         node,

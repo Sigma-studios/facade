@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 pub use crate::platform::Checked;
+pub use crate::reboot_report::{RebootApp, RebootReport};
 use uuid::Uuid;
 
 /// How an entry reads: grey, green, orange or red.
@@ -331,6 +332,9 @@ pub struct EventDetails {
     /// A disk (`sda`) or filesystem (`sda1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// How a reboot went, once its node's apps are back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reboot: Option<RebootReport>,
 }
 
 impl EventDetails {

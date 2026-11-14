@@ -170,6 +170,12 @@ fn show(e: &EventView) {
     if let Some(deployment) = d.deployment {
         println!("  deploy:  {deployment}");
     }
+    if let Some(report) = &d.reboot {
+        println!();
+        for line in report.lines() {
+            println!("  {line}");
+        }
+    }
     if !d.logs.is_empty() {
         println!();
         for line in &d.logs {
