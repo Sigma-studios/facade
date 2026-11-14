@@ -242,6 +242,9 @@ fn build_command(
         .arg(dockerfile)
         .arg(context)
         .env("DOCKER_BUILDKIT", "1");
+    if let Some(parent) = super::priority::cgroup_parent() {
+        cmd.args(["--cgroup-parent", parent]);
+    }
     if let Some(dir) = &options.docker_config {
         cmd.env("DOCKER_CONFIG", dir);
     }

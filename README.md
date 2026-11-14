@@ -352,6 +352,13 @@ builds`, or the Builds page). `facade cancel <app>` stops a queued or building
 deployment: the running version stays, and the app does not move to the cancelled
 commit later. Builds are stopped after an hour.
 
+Builds yield to apps. Their steps run in a systemd slice of their own,
+`facade.slice`, with a CPU and IO weight of 10 where apps have 100: a build takes
+every core of an idle node, and only about a tenth of them while the apps are busy.
+A build's processes are also first in line for the kernel's out-of-memory killer, so
+when memory runs out a build fails rather than an app. (On a node without systemd,
+builds share the CPU evenly with apps.)
+
 A **release command** (`--release "./migrate up"`) runs with `sh -c` in a one-off
 container of the new build, with the app's variables, volumes and links, before the
 new version replaces the running one; if it fails, the deploy stops and the running

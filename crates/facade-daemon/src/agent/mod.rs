@@ -11,6 +11,7 @@ mod inventory;
 mod layers;
 mod maintenance;
 mod ports;
+mod priority;
 mod queue;
 mod resources;
 mod routes;
@@ -177,6 +178,7 @@ impl Agent {
         self.start_routing();
         tokio::spawn(maintenance::run(self.clone()));
         tokio::spawn(cgroups::watch(self.runtime.clone()));
+        tokio::spawn(priority::run());
         tokio::spawn(events::run(self.clone()));
         tokio::spawn(inventory::watch(self.clone()));
         {
