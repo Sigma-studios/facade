@@ -76,6 +76,12 @@ async fn scenario(target: &dyn Target, local_dir: Option<&Path>) {
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("facade.db"), volume(3 << 20, 3)).unwrap();
     std::fs::write(state.join("master.key"), b"THE-PLAINTEXT-OF-A-KEY").unwrap();
+    std::fs::write(dir.join("server.crt"), b"THE-PLAINTEXT-OF-A-CERTIFICATE").unwrap();
+    std::fs::write(
+        dir.join("server.key"),
+        b"THE-PLAINTEXT-OF-A-CERTIFICATE-KEY",
+    )
+    .unwrap();
 
     // The newest two of the volume, and the server's.
     let first = job.copy().await.unwrap();
@@ -196,7 +202,14 @@ async fn scenario(target: &dyn Target, local_dir: Option<&Path>) {
         .fetch_server(250, &other.join("state"))
         .await
         .unwrap();
-    assert_eq!(files, ["facade.db", "master.key"]);
+    assert_eq!(
+        files,
+        ["facade.db", "master.key", "server.crt", "server.key"]
+    );
+    assert_eq!(
+        std::fs::read(other.join("state/server.key")).unwrap(),
+        b"THE-PLAINTEXT-OF-A-CERTIFICATE-KEY"
+    );
     assert_eq!(
         std::fs::read(other.join("state/facade.db")).unwrap(),
         std::fs::read(state.join("facade.db")).unwrap()

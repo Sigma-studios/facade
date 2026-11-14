@@ -647,9 +647,17 @@ impl Job<'_> {
         report: &mut CopyReport,
     ) -> anyhow::Result<()> {
         let dir = dir.to_path_buf();
+        // `<data_dir>/backups/_server`: the data directory, where the server's
+        // certificate is, is two levels up.
+        let data_dir = self
+            .server_dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
         // In memory: the database of one server is tens of megabytes.
         let (header, chunks, data) =
-            tokio::task::spawn_blocking(move || server_chunks(id, &dir)).await??;
+            tokio::task::spawn_blocking(move || server_chunks(id, &dir, data_dir.as_deref()))
+                .await??;
         let data = Arc::new(data);
         self.upload_chunks(chunks.clone(), remote, report, |chunk| {
             let data = data.clone();
@@ -937,18 +945,29 @@ impl Job<'_> {
 
 /// The names a server backup's tar may hold, and nothing else is unpacked.
 const SERVER_FILES: [&str; 2] = ["facade.db", "master.key"];
+/// The server's certificate and its key, which agents and the CLI pin: with
+/// them, a server rebuilt from its offsite copy is the same server to them, so
+/// other nodes reconnect by themselves. Not in local server backups (the
+/// machine holding those has them), so copied from the data directory.
+const IDENTITY_FILES: [&str; 2] = ["server.crt", "server.key"];
 
 /// A server backup cut into chunks: its manifest's header and chunks, and each
 /// chunk's file contents by id.
 type ServerChunks = (Header, Vec<ChunkRef>, HashMap<ChunkId, Vec<u8>>);
 
 /// The tar of a server backup's directory, cut into chunks.
-fn server_chunks(id: u64, dir: &Path) -> anyhow::Result<ServerChunks> {
+fn server_chunks(id: u64, dir: &Path, identity: Option<&Path>) -> anyhow::Result<ServerChunks> {
     let mut tar = tar::Builder::new(Vec::new());
     tar.mode(tar::HeaderMode::Deterministic);
     for name in SERVER_FILES {
         tar.append_path_with_name(dir.join(name), name)
             .with_context(|| format!("reading {}", dir.join(name).display()))?;
+    }
+    for name in IDENTITY_FILES {
+        if let Some(path) = identity.map(|d| d.join(name)).filter(|p| p.is_file()) {
+            tar.append_path_with_name(&path, name)
+                .with_context(|| format!("reading {}", path.display()))?;
+        }
     }
     let tar = tar.into_inner()?;
     let mut header = Header {
@@ -987,7 +1006,7 @@ fn unpack_server(tar: &[u8], into: &Path) -> anyhow::Result<Vec<String>> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let name = entry.path()?.to_string_lossy().to_string();
-        if !SERVER_FILES.contains(&name.as_str()) {
+        if !SERVER_FILES.contains(&name.as_str()) && !IDENTITY_FILES.contains(&name.as_str()) {
             bail!("the server backup holds {name:?}, which is not one of its files");
         }
         let mut data = Vec::new();
@@ -1563,10 +1582,11 @@ pub async fn restore_server(
     let staging = cfg.data_dir.join(".offsite-restore");
     let _ = std::fs::remove_dir_all(&staging);
     let files = job.fetch_server(id, &staging).await?;
-    if files.len() != SERVER_FILES.len() {
+    if SERVER_FILES.iter().any(|f| !files.iter().any(|g| g == f)) {
         bail!("server backup {id} is incomplete ({files:?})");
     }
-    for name in SERVER_FILES {
+    let identity = IDENTITY_FILES.iter().all(|f| files.iter().any(|g| g == f));
+    for name in &files {
         let dest = cfg.data_dir.join(name);
         if dest.exists() {
             std::fs::rename(&dest, cfg.data_dir.join(format!("{name}.before-restore")))?;
@@ -1596,11 +1616,23 @@ pub async fn restore_server(
         restored.kv_put(KV_HOST_KEY, &seen)?;
     }
     println!(
-        "restored the database and master key of {} into {}; offsite copies are paused until \
-         the volumes are restored (facade backup restore <app> <volume> latest --from offsite), \
-         then `facade backup offsite resume`",
+        "restored the database and master key of {} into {}",
         facade_core::rfc3339(id),
         cfg.data_dir.display()
+    );
+    if identity {
+        println!(
+            "and the server's certificate: other nodes and logged-in CLIs reconnect by \
+             themselves once its address points here"
+        );
+    } else {
+        println!(
+            "the backup has no certificate (older facade): log in again, and join other nodes again"
+        );
+    }
+    println!(
+        "offsite copies are paused until the volumes are restored \
+         (facade backup restore <app> <volume> latest --from offsite), then: facade backup offsite resume"
     );
     Ok(())
 }
