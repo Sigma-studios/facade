@@ -87,7 +87,7 @@ fn show(plan: &RebootPlan, at: Option<u64>) {
         let shown: Vec<_> = plan.fixes.iter().take(3).cloned().collect();
         let more = plan.fixes.len().saturating_sub(3);
         println!(
-            "it fixes {}{}",
+            "it fixes {}{} (high and critical)",
             shown.join(", "),
             if more > 0 {
                 format!(" and {more} more")

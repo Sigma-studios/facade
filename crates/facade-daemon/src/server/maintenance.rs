@@ -769,7 +769,10 @@ fn plan(server: &Server, node: &str) -> anyhow::Result<RebootPlan> {
         .store
         .findings(Some(node))?
         .into_iter()
-        .filter(|f| f.status == FindingStatus::FixedAfterReboot)
+        .filter(|f| {
+            f.status == FindingStatus::FixedAfterReboot
+                && f.severity <= facade_core::vulns::VulnSeverity::High
+        })
         .map(|f| f.cve)
         .collect();
     Ok(RebootPlan {

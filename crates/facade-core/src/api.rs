@@ -1627,7 +1627,7 @@ pub struct RebootPlan {
     /// Pending updates (package managers).
     #[serde(default)]
     pub updates: Option<u32>,
-    /// Vulnerabilities a reboot fixes (CVE IDs).
+    /// High and critical vulnerabilities a reboot fixes (CVE IDs).
     pub fixes: Vec<String>,
     /// Builds in progress, which a reboot would cut short (a scheduled one
     /// waits for them).
