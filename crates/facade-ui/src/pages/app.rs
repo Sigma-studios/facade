@@ -1861,6 +1861,12 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
         });
     };
 
+    // Where each backup is, once some are in an offsite copy.
+    let any_offsite = move || {
+        backups
+            .data
+            .with(|b| b.as_ref().is_some_and(|b| b.iter().any(|b| b.offsite)))
+    };
     let restore_open = RwSignal::new(false);
     let restore_target = RwSignal::new(None::<BackupView>);
     let restore = move |_| {
@@ -1956,6 +1962,9 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
                                 <th>"Taken"</th>
                                 <th>"Volume"</th>
                                 <th class="num" title="What a full copy of the volume takes, compressed">"Size"</th>
+                                <Show when=any_offsite>
+                                    <th title="On the server's disk, in the offsite copy, or both">"Where"</th>
+                                </Show>
                                 <th></th>
                             </tr>
                         </thead>
@@ -1967,6 +1976,11 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
                                     let path = format!("/api/backups/{}/{}/{}", b.app, b.volume, b.id);
                                     let fallback = format!("{}-{}-{}.tar.gz", b.app, b.volume, b.id);
                                     let target = b.clone();
+                                    let place = match (b.offsite, b.offsite_only) {
+                                        (_, true) => "offsite",
+                                        (true, false) => "here and offsite",
+                                        _ => "here",
+                                    };
                                     view! {
                                         <tr>
                                             <td>
@@ -1991,6 +2005,9 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
                                                     }.into_any(),
                                                 }}
                                             </td>
+                                            <Show when=any_offsite>
+                                                <td class="muted">{place}</td>
+                                            </Show>
                                             <td class="row-actions">
                                                 <button class="link-button"
                                                     on:click=move |_| download(path.clone(), fallback.clone())>"Download"</button>
@@ -2037,8 +2054,9 @@ fn VolumesTab(name: Memo<String>, #[prop(into)] app: Signal<Option<AppView>>) ->
         <Modal open=restore_open title="Restore backup">
             <p>
                 {move || restore_target.get().map(|b| format!(
-                    "Restore {} to its state of {} {}? The app is stopped and the volume's current files are replaced by this backup.",
-                    b.volume, date(b.id), clock(b.id)
+                    "Restore {} to its state of {} {}? The app is stopped and the volume's current files are replaced by this backup.{}",
+                    b.volume, date(b.id), clock(b.id),
+                    if b.offsite_only { " It is only in the offsite copy: it is brought back from there first." } else { "" }
                 ))}
             </p>
             <div class="form-actions">

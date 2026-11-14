@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AppChange, ApplyReport, ChangePassword, NodeBuildState, RegistryLoginView, ServerSettings,
-    ServerSettingsUpdate, ServerUpdate, SetRegistryLogin, UpdateRun, UpdateState, UpdateTarget,
+    AppChange, ApplyReport, BackupStoreView, ChangePassword, NodeBuildState, OffsiteKeyView,
+    OffsiteVerifyView, OffsiteView, RegistryLoginView, ServerSettings, ServerSettingsUpdate,
+    ServerUpdate, SetRegistryLogin, UpdateRun, UpdateState, UpdateTarget,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -14,7 +15,7 @@ use super::app::CommitRow;
 use super::git::GitAccess;
 use crate::api;
 use crate::components::{Ago, CopyField, ErrorNote, Loading, Modal};
-use crate::util::{alerts, download, me, polled, run, short_hash, toasts};
+use crate::util::{alerts, bytes, download, me, polled, run, short_hash, toasts};
 
 /// Settings tabs: `(key, label, admins only)`.
 const TABS: &[(&str, &str, bool)] = &[
@@ -69,6 +70,7 @@ pub fn Settings() -> impl IntoView {
                     "general" => view! {
                         <ServerAccess/>
                         <Updates/>
+                        <Backups/>
                         <Configuration/>
                     }.into_any(),
                     "app-access" => view! {
@@ -738,6 +740,223 @@ fn RegistryLogins() -> impl IntoView {
                 <button class="button button-danger" on:click=remove>"Remove"</button>
             </div>
         </Modal>
+    }
+}
+
+/// Where backups are: the server's disk, and the offsite copy when
+/// `[backups.offsite]` sets one up.
+#[component]
+fn Backups() -> impl IntoView {
+    let store = polled(None, || async {
+        api::get::<BackupStoreView>("/api/backups/store").await
+    });
+    // Often enough to follow a copy in progress.
+    let offsite = polled(Some(Duration::from_secs(5)), || async {
+        api::get::<Option<OffsiteView>>("/api/backups/offsite").await
+    });
+    let current = move || offsite.data.get().flatten();
+    let copy = move |_| {
+        run(
+            "Offsite copy started",
+            async { api::act("/api/backups/offsite/copy").await },
+            move || offsite.reload(),
+        );
+    };
+    let checking = RwSignal::new(false);
+    let check = move |_| {
+        checking.set(true);
+        spawn_local(async move {
+            match api::act_json::<OffsiteVerifyView>("/api/backups/offsite/verify").await {
+                Ok(v) if v.problems.is_empty() => {
+                    toasts().ok(format!("{} chunks read back intact", v.verified))
+                }
+                Ok(v) => toasts().err(format!(
+                    "{} problem(s): {}",
+                    v.problems.len(),
+                    v.problems[0]
+                )),
+                Err(e) => toasts().err(e),
+            }
+            checking.try_set(false);
+            offsite.reload();
+        });
+    };
+    let resume = move |_| {
+        run(
+            "Offsite copies resumed",
+            async { api::act("/api/backups/offsite/resume").await },
+            move || offsite.reload(),
+        );
+    };
+    // The key, shown on demand until the user says it is kept elsewhere.
+    let key = RwSignal::new(None::<String>);
+    let show_key = move |_| {
+        spawn_local(async move {
+            match api::get::<OffsiteKeyView>("/api/backups/offsite/key").await {
+                Ok(OffsiteKeyView { key: Some(k) }) => key.set(Some(k)),
+                Ok(_) => {
+                    toasts().err("The key was kept elsewhere already: it is not shown any more.")
+                }
+                Err(e) => toasts().err(e),
+            }
+        });
+    };
+    let key_saved = move |_| {
+        run(
+            "Noted: the key will not be shown again",
+            async { api::act("/api/backups/offsite/key-saved").await },
+            move || {
+                key.set(None);
+                offsite.reload();
+            },
+        );
+    };
+
+    view! {
+        <section class="card form" id="backups">
+            <h2 class="section-title">"Backups"</h2>
+            <ErrorNote error=store.error/>
+            <div class="field">
+                <span>"On this server"</span>
+                <p class="small">
+                    {move || store.data.get().map(|s| format!(
+                        "{} on disk for {} incremental backup(s){}, in /var/lib/facade/backups.",
+                        bytes(s.on_disk()),
+                        s.snapshots,
+                        if s.full_copies > 0 { format!(" and {} full copies", s.full_copies) } else { String::new() },
+                    ))}
+                </p>
+            </div>
+            <ErrorNote error=offsite.error/>
+            <Show when=move || offsite.loaded() fallback=Loading>
+                {move || match current() {
+                    None => view! {
+                        <div class="field">
+                            <span>"Offsite"</span>
+                            <p class="small muted">
+                                "Backups are only on this server's disk: losing the server loses them. "
+                                <code>"[backups.offsite]"</code>
+                                " in server.toml copies them, encrypted, to an SFTP server (a Storage Box), "
+                                "an S3-compatible storage or a mounted disk after every backup."
+                            </p>
+                        </div>
+                    }.into_any(),
+                    Some(o) => view! { <OffsiteState o=o.clone()/> }.into_any(),
+                }}
+                {move || current().map(|o| view! {
+                    {o.paused.clone().map(|why| view! {
+                        <div class="note note-warning" role="status">
+                            <strong>"Offsite copies are paused: "</strong>{why}
+                            <div class="form-actions push-left">
+                                <button class="button" on:click=resume>"Resume copies"</button>
+                            </div>
+                        </div>
+                    })}
+                    {(!o.key_saved).then(|| view! {
+                        <div class="note note-warning" role="status">
+                            <strong>"The key of the offsite copy is not kept anywhere else yet. "</strong>
+                            "Without it nothing there can be restored, even by you. Keep it somewhere "
+                            "other than this server, in a password manager."
+                            {move || match key.get() {
+                                None => view! {
+                                    <div class="form-actions push-left">
+                                        <button class="button" on:click=show_key>"Show the key"</button>
+                                    </div>
+                                }.into_any(),
+                                Some(k) => view! {
+                                    <CopyField value=k/>
+                                    <div class="form-actions push-left">
+                                        <button class="button button-primary" on:click=key_saved>
+                                            "It is kept: never show it again"
+                                        </button>
+                                    </div>
+                                }.into_any(),
+                            }}
+                        </div>
+                    })}
+                    <div class="form-actions push-left">
+                        <button class="button" disabled=o.copying || o.paused.is_some() on:click=copy>
+                            {if o.copying { "Copying…" } else { "Copy now" }}
+                        </button>
+                        <button class="button" disabled=move || checking.get() || o.copying on:click=check>
+                            {move || if checking.get() { "Checking…" } else { "Check now" }}
+                        </button>
+                    </div>
+                })}
+            </Show>
+        </section>
+    }
+}
+
+/// What the offsite copy holds and how its last copy and check went.
+#[component]
+fn OffsiteState(o: OffsiteView) -> impl IntoView {
+    let copy = o.last_copy.clone();
+    view! {
+        <dl class="kv">
+            <dt>"Offsite"</dt>
+            <dd><code>{o.target.clone()}</code></dd>
+            <dt>"Last copy"</dt>
+            <dd>
+                {match &copy {
+                    None => view! { <span class="muted">"none yet"</span> }.into_any(),
+                    Some(c) => view! {
+                        <Ago at=c.at/>
+                        {match &c.error {
+                            Some(_) => " · failed".to_string(),
+                            None => format!(
+                                " · {} sent in {} s",
+                                bytes(c.uploaded_bytes),
+                                c.secs
+                            ),
+                        }}
+                    }.into_any(),
+                }}
+                {o.progress.filter(|p| p.1 > 0).map(|(done, total)| view! {
+                    <span class="muted small">{format!(" · copying: {} of {}", bytes(done), bytes(total))}</span>
+                })}
+            </dd>
+            <dt>"Holds"</dt>
+            <dd>
+                {copy.as_ref().map(|c| format!("{} for {} backups", bytes(c.size), c.backups))
+                    .unwrap_or_else(|| "—".into())}
+                <span class="muted small">{format!(" · keeps {} per volume", o.keep)}</span>
+            </dd>
+            <dt>"Last check"</dt>
+            <dd>
+                {match &o.last_verify {
+                    None => view! { <span class="muted">"none yet"</span> }.into_any(),
+                    Some(v) => view! {
+                        <Ago at=v.at/>
+                        {format!(" · {} of {} chunks read back", v.verified, v.chunks)}
+                        <span class="muted small">{format!(" · every {} h", o.verify_every_hours)}</span>
+                    }.into_any(),
+                }}
+            </dd>
+            {o.public_key.clone().map(|k| view! {
+                <dt>"SSH key"</dt>
+                <dd><CopyField value=k/><small class="muted">"Install it on the target (for a Storage Box: its sub-account's authorized keys)."</small></dd>
+            })}
+            {o.host_key.clone().map(|k| view! { <dt>"Host key"</dt><dd><code>{k}</code></dd> })}
+            {o.reports_to.clone().map(|u| view! { <dt>"Reports to"</dt><dd>{format!("Réplique at {u}")}</dd> })}
+        </dl>
+        {copy.and_then(|c| c.error).map(|e| view! {
+            <div class="note note-error">{format!("The last copy failed: {e}")}</div>
+        })}
+        {o.stale.then(|| view! {
+            <div class="note note-warning" role="status">
+                {match o.last_success {
+                    Some(at) => view! { "No offsite copy has worked since " <Ago at/> "." }.into_any(),
+                    None => "No offsite copy has worked yet.".into_any(),
+                }}
+            </div>
+        })}
+        {o.last_verify.filter(|v| !v.problems.is_empty()).map(|v| view! {
+            <div class="note note-error">
+                <strong>{format!("The last check found {} problem(s):", v.problems.len())}</strong>
+                <ul class="notes">{v.problems.into_iter().take(10).map(|p| view! { <li>{p}</li> }).collect_view()}</ul>
+            </div>
+        })}
     }
 }
 
