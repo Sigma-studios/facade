@@ -49,7 +49,7 @@ pub async fn run(agent: Arc<Agent>) {
     let Some(before) = before else {
         return remember();
     };
-    if before.abs_diff(boot) < 120_000 {
+    if before.abs_diff(boot) < facade_core::reboot_report::SAME_BOOT_SECS * 1000 {
         return;
     }
     let report = measure(&agent, boot).await;
@@ -241,15 +241,21 @@ struct Shutdown {
 }
 
 async fn previous_shutdown(boot: u64) -> Shutdown {
+    read_shutdown(&before_boot(boot, &["-u", "docker.service"]).await)
+}
+
+/// Journal entries (matching `filter`) of the hour before `boot`. journalctl
+/// takes whole seconds and a shutdown may end within the second the next boot
+/// starts, so it is asked a second past it, the rest cut here.
+async fn before_boot(boot: u64, filter: &[&str]) -> Vec<(u64, String)> {
     let secs = boot / 1000;
-    let lines = journal(&[
-        "-u",
-        "docker.service",
-        &format!("--since=@{}", secs.saturating_sub(JOURNAL_BACK)),
-        &format!("--until=@{secs}"),
-    ])
-    .await;
-    read_shutdown(&lines)
+    let since = format!("--since=@{}", secs.saturating_sub(JOURNAL_BACK));
+    let until = format!("--until=@{}", secs + 1);
+    let mut args = filter.to_vec();
+    args.extend([since.as_str(), until.as_str()]);
+    let mut lines = journal(&args).await;
+    lines.retain(|(t, _)| *t < boot);
+    lines
 }
 
 /// The last `Processing signal 'terminated'` with nothing starting Docker
@@ -289,16 +295,27 @@ fn read_shutdown(lines: &[(u64, String)]) -> Shutdown {
 
 /// The last line the system logged before `boot`.
 async fn last_line_before(boot: u64) -> Option<u64> {
+    // The last line of the whole seconds before it, and the lines of the
+    // second it started in that came before it.
     let secs = boot / 1000;
-    journal(&[
+    let before = journal(&[
         &format!("--since=@{}", secs.saturating_sub(JOURNAL_BACK)),
         &format!("--until=@{secs}"),
         "-n",
         "1",
     ])
-    .await
-    .last()
-    .map(|(t, _)| *t)
+    .await;
+    let same_second = journal(&[
+        &format!("--since=@{secs}"),
+        &format!("--until=@{}", secs + 1),
+    ])
+    .await;
+    before
+        .into_iter()
+        .chain(same_second)
+        .map(|(t, _)| t)
+        .filter(|t| *t < boot)
+        .max()
 }
 
 /// When Docker was ready after `boot`: its "API listen on" line.

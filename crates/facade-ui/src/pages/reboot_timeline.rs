@@ -279,3 +279,73 @@ pub fn PastReboots(#[prop(into)] node: Signal<String>) -> impl IntoView {
         })
     }
 }
+
+/// The node Overview's Reboots section: the latest reboot's timeline, the ones
+/// before it as links, or what will show here once the node reboots.
+#[component]
+pub fn NodeReboots(node: String) -> impl IntoView {
+    let for_fetch = node.clone();
+    let list = polled(Some(Duration::from_secs(120)), move || {
+        let node = for_fetch.clone();
+        async move {
+            api::get::<EventsPage>(&format!("/api/events?node={node}&kind=reboot&limit=6")).await
+        }
+    });
+    move || {
+        let events = list.data.get()?.events;
+        let node = node.clone();
+        let mut events = events.into_iter();
+        let body = match events.next() {
+            None => view! {
+                <p class="muted small">
+                    "No reboot recorded yet. After the next one (asked by façade or not), this shows how it went: "
+                    "when each app stopped and whether it had to be killed, how long the machine was off, "
+                    "and when each app ran and passed its health check again."
+                </p>
+            }
+            .into_any(),
+            Some(last) => {
+                let href = format!("/nodes/{node}?tab=activity&event={}", last.id);
+                let detail = match last.details.reboot.clone() {
+                    Some(report) => view! { <RebootTimeline report/> }.into_any(),
+                    None => view! {
+                        <p class="muted small">
+                            "No report for this one: façade measures reboots since November 2026."
+                        </p>
+                    }
+                    .into_any(),
+                };
+                let earlier: Vec<_> = events.collect();
+                view! {
+                    <p class="small">
+                        <A href=href><Ago at=last.at/></A>
+                        {format!(": {}", last.summary.trim_start_matches("Rebooted: "))}
+                    </p>
+                    {detail}
+                    {(!earlier.is_empty()).then(|| view! {
+                        <details class="rb-earlier small">
+                            <summary>{format!("{} earlier", earlier.len())}</summary>
+                            <ul>
+                                {earlier.into_iter().map(|e| view! {
+                                    <li>
+                                        <A href=format!("/nodes/{node}?tab=activity&event={}", e.id)>
+                                            <Ago at=e.at/>
+                                        </A>
+                                        {format!(": {}", e.summary.trim_start_matches("Rebooted: "))}
+                                    </li>
+                                }).collect_view()}
+                            </ul>
+                        </details>
+                    })}
+                }
+                .into_any()
+            }
+        };
+        Some(view! {
+            <section class="node-reboots">
+                <h2 class="section-title">"Reboots"</h2>
+                {body}
+            </section>
+        })
+    }
+}

@@ -1378,3 +1378,7 @@ a.badge:hover { text-decoration: none; filter: brightness(0.97); }
 .rb-past { margin-top: 16px; }
 .rb-past h4 { margin: 0 0 4px; font-size: 13px; }
 .rb-past ul { margin: 0; padding-left: 18px; }
+.node-reboots { margin-top: 28px; }
+.node-reboots .section-title { margin-bottom: 8px; }
+.rb-earlier { margin-top: 8px; }
+.rb-earlier ul { margin: 4px 0 0; padding-left: 18px; }

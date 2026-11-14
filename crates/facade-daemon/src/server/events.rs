@@ -297,7 +297,7 @@ pub fn agent_connected(server: &Server, node: &str, hello: AgentHello<'_>) {
         binary: hello.binary.map(str::to_string),
     };
     if let Some(before) = &before {
-        let rebooted = matches!((before.boot, now.boot), (Some(a), Some(b)) if a.abs_diff(b) > 120);
+        let rebooted = matches!((before.boot, now.boot), (Some(a), Some(b)) if a.abs_diff(b) > facade_core::reboot_report::SAME_BOOT_SECS);
         if rebooted {
             Entry::node(node, EventKind::Reboot, Severity::Info, "Rebooted")
                 .at(now.boot.unwrap_or_else(facade_core::now))

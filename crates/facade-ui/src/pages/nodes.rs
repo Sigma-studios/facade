@@ -237,6 +237,7 @@ pub fn Nodes() -> impl IntoView {
                         </Show>
                         "Nodes clean up after builds on their own: every 6 hours, and harder when the disk is 85 % full."
                     </p>
+                    <super::reboot_timeline::NodeReboots node=name.clone()/>
                 }
                 .into_any()
             }

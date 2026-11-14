@@ -9,6 +9,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Two boot times closer than this (seconds) are the same boot: the kernel's
+/// boot time moves by a second or so when the clock is adjusted. A machine
+/// rebooted sooner after starting than this reads as not rebooted.
+pub const SAME_BOOT_SECS: u64 = 30;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RebootReport {
     /// When Docker was told to stop (the shutdown reaching it), from the journal.

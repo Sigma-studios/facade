@@ -656,7 +656,9 @@ async fn follow(server: &Server, node: &str, run: Run, now: u64) {
         let boot = events::agent_boot(server, node);
         let rebooted = connected
             && match (run.boot_before, boot) {
-                (Some(before), Some(after)) => before.abs_diff(after) > 120,
+                (Some(before), Some(after)) => {
+                    before.abs_diff(after) > facade_core::reboot_report::SAME_BOOT_SECS
+                }
                 (None, Some(after)) => after + 60 >= run.asked,
                 _ => false,
             };
