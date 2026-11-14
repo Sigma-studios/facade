@@ -1,0 +1,9 @@
+{
+  "status": "failed",
+  "exit_code": 1,
+  "finished_at": "2026-11-14T20:00:02Z",
+  "errors": [],
+  "error_count": 0,
+  "unreadable_paths": [],
+  "message": "/mnt/windows/c is not a mountpoint"
+}

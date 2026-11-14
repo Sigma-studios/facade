@@ -110,6 +110,25 @@ enum Command {
         #[arg(long, short, default_value = "/etc/facade/server.toml")]
         config: PathBuf,
     },
+    /// Rebuild a lost server from its offsite copy ([backups.offsite] in the
+    /// config): bring back its database and master key, before facaded first
+    /// starts. Offsite copies stay paused until the volumes are restored.
+    OffsiteRestore {
+        #[arg(long, short, default_value = "/etc/facade/server.toml")]
+        config: PathBuf,
+        /// A file holding the offsite key (asked for when absent).
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// The server backup to bring back (its Unix time); the newest otherwise.
+        #[arg(long)]
+        id: Option<u64>,
+        /// List the server backups on the target instead.
+        #[arg(long)]
+        list: bool,
+        /// Replace the database of this server (kept as facade.db.before-restore).
+        #[arg(long)]
+        force: bool,
+    },
     /// Install a release folder (this binary, `facade`, the systemd units) on
     /// the server and restart it, going back to the previous binary if the new
     /// one is not healthy within 90 s. Run as root by deploy/upgrade.sh, and by
@@ -163,6 +182,26 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::BackupState { config } => {
             upgrade::backup_state(&config::ServerConfig::load(&config)?)
+        }
+        Command::OffsiteRestore {
+            config,
+            key_file,
+            id,
+            list,
+            force,
+        } => {
+            let cfg = config::ServerConfig::load(&config)?;
+            let key = match key_file {
+                Some(path) => std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?,
+                None => {
+                    eprint!("Offsite key (64 hexadecimal digits): ");
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line
+                }
+            };
+            server::offsite::restore_server(&cfg, &key, id, list, force).await
         }
         Command::ApplyUpdate {
             stage,

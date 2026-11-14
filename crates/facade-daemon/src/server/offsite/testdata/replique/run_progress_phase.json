@@ -1,0 +1,12 @@
+{
+  "at": "2026-11-14T06:02:00Z",
+  "percent_done": 0.3,
+  "seconds_elapsed": 41,
+  "total_files": 0,
+  "files_done": 0,
+  "total_bytes": 0,
+  "bytes_done": 0,
+  "error_count": 0,
+  "current_files": [],
+  "phase": "diffing snapshots"
+}

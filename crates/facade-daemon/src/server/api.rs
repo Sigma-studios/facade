@@ -207,6 +207,12 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/backups", get(list_backups).post(run_backups))
         .route("/api/backups/store", get(backup_store))
         .route("/api/backups/check", post(check_backups))
+        .route("/api/backups/offsite", get(offsite_view))
+        .route("/api/backups/offsite/copy", post(offsite_copy))
+        .route("/api/backups/offsite/verify", post(offsite_verify))
+        .route("/api/backups/offsite/key", get(offsite_key))
+        .route("/api/backups/offsite/key-saved", post(offsite_key_saved))
+        .route("/api/backups/offsite/resume", post(offsite_resume))
         .route("/api/backups/{app}/{volume}/{id}", get(download_backup))
         .route(
             "/api/backups/{app}/{volume}/{id}/restore",
@@ -3146,14 +3152,132 @@ struct BackupQuery {
     app: Option<String>,
 }
 
+/// Backups on the server's disk and in the offsite copy, newest first: each
+/// once, saying where it is.
 async fn list_backups(
     State(server): S,
     user: User,
     Query(q): Query<BackupQuery>,
 ) -> ApiResult<Json<Vec<BackupView>>> {
     let mut list = super::backups::list(&server, q.app.as_deref())?;
+    let offsite = super::offsite::list(&server, q.app.as_deref());
+    for b in &mut list {
+        b.offsite = offsite
+            .iter()
+            .any(|o| (&o.app, &o.volume, o.id) == (&b.app, &b.volume, b.id));
+    }
+    for o in offsite {
+        if !list
+            .iter()
+            .any(|b| (&o.app, &o.volume, o.id) == (&b.app, &b.volume, b.id))
+        {
+            list.push(o);
+        }
+    }
+    list.sort_by(|a, b| b.id.cmp(&a.id).then(a.app.cmp(&b.app)));
     list.retain(|b| can_see_app(&server, &user, &b.app));
     Ok(Json(list))
+}
+
+/// `?from=offsite` on a download or restore.
+#[derive(Deserialize)]
+struct FromQuery {
+    from: Option<String>,
+}
+
+/// Brings a backup back from the offsite copy first when asked to, or when
+/// the server's disk does not have it any more.
+async fn fetch_if_offsite(
+    server: &Server,
+    app: &str,
+    volume: &str,
+    id: u64,
+    from: Option<&str>,
+) -> ApiResult<()> {
+    let offsite = match from {
+        Some("offsite") => true,
+        None | Some("local") => {
+            super::backups::find(server, app, volume, id).is_err()
+                && super::offsite::list(server, Some(app))
+                    .iter()
+                    .any(|b| b.volume == volume && b.id == id)
+        }
+        Some(other) => {
+            return Err(bad_request(format!(
+                "from={other}: backups come from \"local\" or \"offsite\""
+            )));
+        }
+    };
+    if offsite {
+        super::offsite::fetch(server, app, volume, id)
+            .await
+            .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    }
+    Ok(())
+}
+
+async fn offsite_view(State(server): S, user: User) -> ApiResult<Json<Option<OffsiteView>>> {
+    user.require_admin()?;
+    Ok(Json(super::offsite::view(&server)))
+}
+
+/// Starts a copy and answers at once: a first one can take hours. Its outcome
+/// is in `GET /api/backups/offsite`.
+async fn offsite_copy(State(server): S, user: User) -> ApiResult<StatusCode> {
+    user.require_admin()?;
+    let view = super::offsite::view(&server)
+        .ok_or_else(|| bad_request("no [backups.offsite] in server.toml"))?;
+    if view.copying {
+        return Err(conflict("an offsite copy is already running"));
+    }
+    if let Some(why) = view.paused {
+        return Err(conflict(format!(
+            "offsite copies are paused: {why} (facade backup offsite resume)"
+        )));
+    }
+    tokio::spawn(async move {
+        let _ = super::offsite::copy(&server).await;
+    });
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+struct VerifyQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+async fn offsite_verify(
+    State(server): S,
+    user: User,
+    Query(q): Query<VerifyQuery>,
+) -> ApiResult<Json<OffsiteVerifyView>> {
+    user.require_admin()?;
+    super::offsite::verify(&server, q.all)
+        .await
+        .map(Json)
+        .map_err(|e| conflict(format!("{e:#}")))
+}
+
+/// The offsite key, until the user says it is kept somewhere else.
+async fn offsite_key(State(server): S, user: User) -> ApiResult<Json<OffsiteKeyView>> {
+    user.require_admin()?;
+    let key = super::offsite::reveal_key(&server).map_err(bad_request)?;
+    Ok(Json(OffsiteKeyView { key }))
+}
+
+async fn offsite_key_saved(State(server): S, user: User) -> ApiResult<StatusCode> {
+    user.require_admin()?;
+    super::offsite::key_is_saved(&server)?;
+    info!(user = %user.username, "offsite key kept elsewhere: not shown any more");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn offsite_resume(State(server): S, user: User) -> ApiResult<StatusCode> {
+    user.require_admin()?;
+    super::offsite::resume(&server)?;
+    info!(user = %user.username, "offsite copies resumed");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn run_backups(
@@ -3168,9 +3292,9 @@ async fn run_backups(
         }
     }
     if req.app.is_some() || user.is_admin() {
-        return Ok(Json(
-            super::backups::backup_all(&server, req.app.as_deref()).await,
-        ));
+        let report = super::backups::backup_all(&server, req.app.as_deref()).await;
+        server.offsite.backups_taken();
+        return Ok(Json(report));
     }
     // A member's "everything" is their apps.
     let mut report = BackupReport {
@@ -3185,6 +3309,7 @@ async fn run_backups(
         report.done.extend(one.done);
         report.failed.extend(one.failed);
     }
+    server.offsite.backups_taken();
     Ok(Json(report))
 }
 
@@ -3192,8 +3317,10 @@ async fn download_backup(
     State(server): S,
     user: User,
     Path((app, volume, id)): Path<(String, String, u64)>,
+    Query(q): Query<FromQuery>,
 ) -> ApiResult<Response> {
     load_app_for(&server, &user, &app)?;
+    fetch_if_offsite(&server, &app, &volume, id, q.from.as_deref()).await?;
     let body = match super::backups::find(&server, &app, &volume, id).map_err(not_found)? {
         super::backups::Stored::Full(path) => {
             let file = tokio::fs::File::open(&path)
@@ -3244,8 +3371,10 @@ async fn restore_backup(
     State(server): S,
     user: User,
     Path((app, volume, id)): Path<(String, String, u64)>,
+    Query(q): Query<FromQuery>,
 ) -> ApiResult<StatusCode> {
     volume_node(&server, &user, &app, &volume)?;
+    fetch_if_offsite(&server, &app, &volume, id, q.from.as_deref()).await?;
     super::backups::restore(&server, &app, &volume, id)
         .await
         .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;

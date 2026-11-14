@@ -1,0 +1,23 @@
+{
+  "kind": "backup",
+  "schedule": "daily",
+  "expected_interval_secs": 86400,
+  "rules": {
+    "paths": ["/home/sigma"],
+    "excludes": [
+      "/home/sigma/.local/share/Steam",
+      "/home/sigma/.cache",
+      "/home/sigma/.rustup",
+      "/home/sigma/.cargo/registry",
+      "/home/sigma/Games/Heroic",
+      "/home/sigma/Backups"
+    ],
+    "exclude_caches": true,
+    "generated_excludes_for": ["/home/sigma/Projects"],
+    "retention": {
+      "policy": "keep-deleted",
+      "keep": { "daily": 7, "weekly": 4, "monthly": 12 }
+    },
+    "check_subset": "5%"
+  }
+}

@@ -51,7 +51,7 @@ const AVG_CHUNK: usize = 512 * 1024;
 const MAX_CHUNK: usize = 2 * 1024 * 1024;
 /// zstd's default: about gzip's ratio at several times its speed.
 const ZSTD_LEVEL: i32 = 3;
-const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 1;
 const TEMP_PREFIX: &str = ".tmp-";
 
 pub type ChunkId = [u8; 32];
@@ -84,11 +84,11 @@ pub struct ChunkRef {
 }
 
 impl ChunkRef {
-    fn line(&self) -> String {
+    pub fn line(&self) -> String {
         format!("{} {} {}", hex::encode(self.id), self.len, self.stored)
     }
 
-    fn parse(line: &str) -> Option<Self> {
+    pub fn parse(line: &str) -> Option<Self> {
         let mut parts = line.split(' ');
         let id = parse_id(parts.next()?)?;
         let len = parts.next()?.parse().ok()?;
@@ -97,7 +97,7 @@ impl ChunkRef {
     }
 }
 
-fn parse_id(hex_id: &str) -> Option<ChunkId> {
+pub fn parse_id(hex_id: &str) -> Option<ChunkId> {
     let mut id = [0u8; 32];
     hex::decode_to_slice(hex_id, &mut id).ok()?;
     Some(id)
@@ -118,7 +118,8 @@ impl Store {
         self.root.join(CHUNKS_DIR)
     }
 
-    fn chunk_path(&self, id: &ChunkId) -> PathBuf {
+    /// Where the chunk `id` is (whether it is there or not).
+    pub fn chunk_path(&self, id: &ChunkId) -> PathBuf {
         let name = hex::encode(id);
         self.chunks_dir().join(&name[..2]).join(name)
     }
@@ -144,7 +145,18 @@ impl Store {
             let stored = meta.len() as u32;
             return Ok((ChunkRef { id, len, stored }, false));
         }
-        let compressed = zstd::bulk::compress(data, ZSTD_LEVEL)?;
+        let compressed = compress(data)?;
+        self.write_chunk_file(&path, &compressed, to_sync)?;
+        let stored = compressed.len() as u32;
+        Ok((ChunkRef { id, len, stored }, true))
+    }
+
+    fn write_chunk_file(
+        &self,
+        path: &Path,
+        compressed: &[u8],
+        to_sync: &mut BTreeSet<PathBuf>,
+    ) -> io::Result<()> {
         let dir = path.parent().expect("chunks are in a directory");
         if !dir.is_dir() {
             create_private_dirs(dir)?;
@@ -154,33 +166,50 @@ impl Store {
         let temp = dir.join(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4()));
         let written = (|| {
             let mut file = private_file(&temp)?;
-            file.write_all(&compressed)?;
+            file.write_all(compressed)?;
             file.sync_all()?;
-            std::fs::rename(&temp, &path)
+            std::fs::rename(&temp, path)
         })();
         if let Err(e) = written {
             let _ = std::fs::remove_file(&temp);
             return Err(e);
         }
         to_sync.insert(dir.to_path_buf());
-        let stored = compressed.len() as u32;
-        Ok((ChunkRef { id, len, stored }, true))
+        Ok(())
+    }
+
+    /// Stores a chunk fetched from elsewhere (an offsite copy) as it is in a
+    /// chunk file, compressed, unless the store has it. It is checked against
+    /// its hash first: a damaged chunk is never stored. Directories a new chunk
+    /// went into are added to `to_sync`, to be synced before a manifest lists it.
+    pub fn put_compressed_chunk(
+        &self,
+        chunk: &ChunkRef,
+        compressed: &[u8],
+        to_sync: &mut BTreeSet<PathBuf>,
+    ) -> anyhow::Result<()> {
+        let path = self.chunk_path(&chunk.id);
+        if path.is_file() {
+            return Ok(());
+        }
+        check_chunk(chunk, compressed)?;
+        self.write_chunk_file(&path, compressed, to_sync)?;
+        Ok(())
     }
 
     /// The contents of a chunk, checked against its hash.
     pub fn read_chunk(&self, chunk: &ChunkRef) -> anyhow::Result<Vec<u8>> {
+        check_chunk(chunk, &self.read_chunk_file(chunk)?)
+    }
+
+    /// The chunk's file as it is: compressed, unchecked.
+    pub fn read_chunk_file(&self, chunk: &ChunkRef) -> anyhow::Result<Vec<u8>> {
         let name = hex::encode(chunk.id);
-        let compressed = match std::fs::read(self.chunk_path(&chunk.id)) {
-            Ok(bytes) => bytes,
+        match std::fs::read(self.chunk_path(&chunk.id)) {
+            Ok(bytes) => Ok(bytes),
             Err(e) if e.kind() == io::ErrorKind::NotFound => bail!("chunk {name} is missing"),
-            Err(e) => return Err(e).with_context(|| format!("reading chunk {name}")),
-        };
-        let data = zstd::bulk::decompress(&compressed, chunk.len as usize)
-            .map_err(|e| anyhow!("chunk {name} is damaged ({e})"))?;
-        if data.len() != chunk.len as usize || <ChunkId>::from(blake3::hash(&data)) != chunk.id {
-            bail!("chunk {name} is damaged (its contents do not match its hash)");
+            Err(e) => Err(e).with_context(|| format!("reading chunk {name}")),
         }
-        Ok(data)
     }
 
     /// Cuts the tar read from `tar` into chunks, stores the new ones, then writes
@@ -204,47 +233,38 @@ impl Store {
         };
         let mut chunks = Vec::new();
         let mut to_sync = BTreeSet::new();
-        for chunk in fastcdc::v2020::StreamCDC::new(tar, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
-            let chunk = chunk.map_err(|e| match e {
-                fastcdc::v2020::Error::IoError(e) => anyhow!(e).context("reading the archive"),
-                e => anyhow!("chunking the archive: {e}"),
-            })?;
-            let (chunk, new) = self.put_chunk(&chunk.data, &mut to_sync)?;
+        cut(tar, |data| {
+            let (chunk, new) = self.put_chunk(&data, &mut to_sync)?;
             header.tar_size += chunk.len as u64;
             header.stored += chunk.stored as u64;
             if new {
                 header.added += chunk.stored as u64;
             }
             chunks.push(chunk);
-        }
+            Ok(())
+        })?;
         if chunks.is_empty() {
             bail!("the archive is empty");
         }
         header.chunks = chunks.len();
+        self.write_manifest(&header, &chunks, &to_sync)?;
+        Ok(header)
+    }
+
+    /// Writes the manifest of a backup whose chunks are all in the store, once
+    /// the directories in `to_sync` (where new chunks went) are synced.
+    pub fn write_manifest(
+        &self,
+        header: &Header,
+        chunks: &[ChunkRef],
+        to_sync: &BTreeSet<PathBuf>,
+    ) -> anyhow::Result<()> {
         // The chunks' names must be on disk before a manifest lists them.
-        for dir in &to_sync {
+        for dir in to_sync {
             sync_dir(dir)?;
         }
-        let path = self.snapshot_path(app, volume, id);
-        let dir = path.parent().expect("manifests are in a directory");
-        create_private_dirs(dir)?;
-        let temp = dir.join(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4()));
-        let written = (|| {
-            let mut out = BufWriter::new(private_file(&temp)?);
-            serde_json::to_writer(&mut out, &header)?;
-            out.write_all(b"\n")?;
-            for chunk in &chunks {
-                writeln!(out, "{}", chunk.line())?;
-            }
-            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-            std::fs::rename(&temp, &path)?;
-            sync_dir(dir)
-        })();
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&temp);
-            return Err(anyhow!(e).context("writing the manifest"));
-        }
-        Ok(header)
+        let path = self.snapshot_path(&header.app, &header.volume, header.id);
+        write_manifest_file(&path, header, chunks)
     }
 
     /// A reader of the tar of a backup, from its chunks.
@@ -268,7 +288,7 @@ impl Store {
     }
 
     /// Every manifest, as `(app, volume, path)`.
-    fn snapshots(&self) -> Vec<(String, String, PathBuf)> {
+    pub fn snapshots(&self) -> Vec<(String, String, PathBuf)> {
         let mut out = Vec::new();
         for (app, volume, file) in volume_files(&self.root) {
             if file.to_string_lossy().ends_with(SNAPSHOT_SUFFIX) {
@@ -428,7 +448,12 @@ pub fn read_header(path: &Path) -> anyhow::Result<Header> {
 }
 
 pub fn read_manifest(path: &Path) -> anyhow::Result<(Header, Vec<ChunkRef>)> {
-    let mut lines = BufReader::new(File::open(path)?).lines();
+    parse_manifest(BufReader::new(File::open(path)?))
+}
+
+/// A manifest's header and chunks, from its bytes.
+pub fn parse_manifest(manifest: impl BufRead) -> anyhow::Result<(Header, Vec<ChunkRef>)> {
+    let mut lines = manifest.lines();
     let first = lines.next().context("empty manifest")??;
     let header: Header = serde_json::from_str(&first).context("bad manifest header")?;
     if header.format != FORMAT {
@@ -445,6 +470,72 @@ pub fn read_manifest(path: &Path) -> anyhow::Result<(Header, Vec<ChunkRef>)> {
         bail!("the manifest is incomplete");
     }
     Ok((header, chunks))
+}
+
+/// A manifest's bytes: its header as JSON on the first line, then its chunks.
+pub fn manifest_bytes(header: &Header, chunks: &[ChunkRef]) -> Vec<u8> {
+    let mut out = serde_json::to_vec(header).expect("a header serializes");
+    out.push(b'\n');
+    for chunk in chunks {
+        out.extend_from_slice(chunk.line().as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Writes a manifest at `path` the crash-safe way: whole under its name, or not
+/// there at all.
+pub fn write_manifest_file(
+    path: &Path,
+    header: &Header,
+    chunks: &[ChunkRef],
+) -> anyhow::Result<()> {
+    let dir = path.parent().expect("manifests are in a directory");
+    create_private_dirs(dir)?;
+    let temp = dir.join(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4()));
+    let written = (|| {
+        let mut out = BufWriter::new(private_file(&temp)?);
+        out.write_all(&manifest_bytes(header, chunks))?;
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        sync_dir(dir)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(anyhow!(e).context("writing the manifest"));
+    }
+    Ok(())
+}
+
+/// Cuts what `input` reads into chunks, handing each to `each` in order.
+pub fn cut(
+    input: impl Read,
+    mut each: impl FnMut(Vec<u8>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    for chunk in fastcdc::v2020::StreamCDC::new(input, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
+        let chunk = chunk.map_err(|e| match e {
+            fastcdc::v2020::Error::IoError(e) => anyhow!(e).context("reading the archive"),
+            e => anyhow!("chunking the archive: {e}"),
+        })?;
+        each(chunk.data)?;
+    }
+    Ok(())
+}
+
+/// A chunk's contents as its file holds them.
+pub fn compress(data: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::bulk::compress(data, ZSTD_LEVEL)
+}
+
+/// The contents of a chunk's file, checked against its hash.
+pub fn check_chunk(chunk: &ChunkRef, compressed: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let name = hex::encode(chunk.id);
+    let data = zstd::bulk::decompress(compressed, chunk.len as usize)
+        .map_err(|e| anyhow!("chunk {name} is damaged ({e})"))?;
+    if data.len() != chunk.len as usize || <ChunkId>::from(blake3::hash(&data)) != chunk.id {
+        bail!("chunk {name} is damaged (its contents do not match its hash)");
+    }
+    Ok(data)
 }
 
 /// What each app's backups take: its full copies, and the chunks its manifests

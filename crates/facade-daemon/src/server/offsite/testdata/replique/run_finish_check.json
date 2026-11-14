@@ -1,0 +1,16 @@
+{
+  "status": "success",
+  "exit_code": 0,
+  "finished_at": "2026-11-14T09:48:51Z",
+  "check": {
+    "read_data_subset": "5%",
+    "num_errors": 0,
+    "snapshot_ids": [
+      "60b9632cb99dc43c73727a1da5bb5c48f719c8942bfee76c11b0deadfa744b61",
+      "1f0e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    ]
+  },
+  "errors": [],
+  "error_count": 0,
+  "unreadable_paths": []
+}

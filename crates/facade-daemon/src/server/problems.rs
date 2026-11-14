@@ -170,6 +170,10 @@ struct Facts {
     notify_error: Option<String>,
     /// Why the DNS provider cannot be used.
     dns_error: Option<String>,
+    /// The offsite copy's key is not kept anywhere else yet.
+    offsite_key_unsaved: bool,
+    /// Why offsite copies are paused.
+    offsite_paused: Option<String>,
 }
 
 struct NodeFact {
@@ -425,6 +429,7 @@ async fn gather(server: &Server) -> Facts {
         .filter(|e| notify.discord_webhook.is_some() && e.at >= notify.last_sent.unwrap_or(0))
         .map(|e| e.error);
     let dns = server.dns.settings();
+    let (offsite_key_unsaved, offsite_paused) = super::offsite::notices(server);
 
     Facts {
         alerts: server
@@ -444,6 +449,8 @@ async fn gather(server: &Server) -> Facts {
         volumes,
         notify_error,
         dns_error: dns.error.filter(|_| dns.provider.is_some()),
+        offsite_key_unsaved,
+        offsite_paused,
     }
 }
 
@@ -645,6 +652,18 @@ fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, Seen>) -> Vec<Pr
             "domain" => unreachable.push(alert),
             // Made from the certificates themselves below, from 14 days on.
             "cert" => {}
+            "offsite" => {
+                let f = Found::new(&alert.key, Warning, &alert.message)
+                    .since(Some(alert.since))
+                    .fix("/settings/general#backups", "Backups");
+                out.push(match rest {
+                    "copy" => f.hint("retry: facade backup offsite copy"),
+                    "stale" => f.hint("see why: facade backup offsite"),
+                    _ => f.hint(
+                        "the next copy uploads damaged chunks again: facade backup offsite copy",
+                    ),
+                });
+            }
             "backup" => {
                 let f = Found::new(&alert.key, Warning, &alert.message).since(Some(alert.since));
                 out.push(match rest.split_once('/') {
@@ -994,6 +1013,24 @@ fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, Seen>) -> Vec<Pr
             Found::new("notify", Warning, "alerts are not reaching Discord")
                 .fix("/settings/alerts", "Alert settings")
                 .hint(short(e)),
+        );
+    }
+    if facts.offsite_key_unsaved {
+        out.push(
+            Found::new(
+                "offsite:key",
+                Warning,
+                "the key of the offsite copy is not kept anywhere else yet",
+            )
+            .fix("/settings/general#backups", "Backups")
+            .hint("without it the copy cannot be read: facade backup offsite key"),
+        );
+    }
+    if let Some(why) = &facts.offsite_paused {
+        out.push(
+            Found::new("offsite:paused", Warning, "offsite copies are paused")
+                .fix("/settings/general#backups", "Backups")
+                .hint(format!("{}, then facade backup offsite resume", short(why))),
         );
     }
     if let Some(e) = &facts.dns_error {

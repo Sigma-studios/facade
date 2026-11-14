@@ -17,6 +17,7 @@ mod hub;
 mod inspect;
 mod maintenance;
 mod monitor;
+pub mod offsite;
 mod problems;
 mod reach;
 mod registry;
@@ -80,6 +81,8 @@ pub struct Server {
     /// Shared by what writes or reads the backup store, taken alone by its
     /// garbage collection (see `backups::collect_garbage`).
     pub backup_store_lock: Arc<tokio::sync::RwLock<()>>,
+    /// The offsite copy of the backups (`[backups.offsite]`).
+    pub offsite: offsite::Offsite,
     pub settings: settings::SettingsCell,
     /// Last binary sent to each node to update its agent, and when.
     pub upgrade_attempts: parking_lot::Mutex<HashMap<String, (String, u64)>>,
@@ -621,6 +624,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         stack_runs: Default::default(),
         backup_errors: Default::default(),
         backup_store_lock: Default::default(),
+        offsite: Default::default(),
         settings,
         upgrade_attempts: Default::default(),
         releases: Default::default(),
@@ -681,6 +685,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tasks.spawn(reach::run(server.clone()));
     tasks.spawn(artifacts::collect_garbage(server.clone()));
     tasks.spawn(backups::run(server.clone()));
+    tokio::spawn(offsite::run(server.clone()));
     tokio::spawn(release::check_regularly(server.clone()));
     tokio::spawn(maintenance::run(server.clone()));
     tokio::spawn(autodeploy::run(server.clone()));

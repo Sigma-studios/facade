@@ -119,6 +119,10 @@ pub struct BackupConfig {
     pub every_hours: u64,
     /// Backups kept per volume (and of the server itself).
     pub keep: usize,
+    /// `[backups.offsite]`: a copy of the backups somewhere else, encrypted.
+    pub offsite: Option<OffsiteConfig>,
+    /// `[backups.replique]`: report each offsite copy to a Réplique server.
+    pub replique: Option<RepliqueConfig>,
 }
 
 impl Default for BackupConfig {
@@ -127,7 +131,104 @@ impl Default for BackupConfig {
             enabled: true,
             every_hours: 24,
             keep: 7,
+            offsite: None,
+            replique: None,
         }
+    }
+}
+
+/// Where the offsite copy goes (see `server::offsite`). One flat table rather
+/// than one per provider, so that a setting of another provider is named in the
+/// error instead of being an "unknown field" somewhere.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OffsiteConfig {
+    pub provider: Option<OffsiteProvider>,
+    /// sftp: the server, its port (22; a Hetzner Storage Box takes 23 too) and
+    /// the login.
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    /// sftp: the private key to log in with (OpenSSH format). Generated there
+    /// when missing, so that its public half can be installed on the target.
+    pub key_file: Option<PathBuf>,
+    /// sftp: the server's host key (`ssh-ed25519 AAAA…`) or its fingerprint
+    /// (`SHA256:…`). Without it, the key seen at the first connection is kept and
+    /// required from then on.
+    pub host_key: Option<String>,
+    /// sftp and local: the directory the copy lives in (relative paths are from
+    /// the login's home on sftp). s3: a prefix inside the bucket.
+    pub path: Option<String>,
+    /// s3: the endpoint (`https://s3.eu-central-1.amazonaws.com`,
+    /// `https://fsn1.your-objectstorage.com`, `http://127.0.0.1:9000`…), the
+    /// bucket and its region.
+    pub endpoint: Option<String>,
+    pub bucket: Option<String>,
+    pub region: Option<String>,
+    /// s3: files holding the access key id and the secret key.
+    pub access_key_file: Option<PathBuf>,
+    pub secret_key_file: Option<PathBuf>,
+    /// Backups kept offsite per volume (and of the server itself); `[backups]
+    /// keep` when absent. Never fewer than that.
+    pub keep: Option<usize>,
+    /// How often a sample of the offsite chunks is read back and checked.
+    pub verify_every_hours: u64,
+    /// How many chunks each of those checks reads back.
+    pub verify_sample: usize,
+    /// A copy older than this is a problem (twice the backup interval when
+    /// absent: one missed run goes unremarked, a failed one has its own alert).
+    pub stale_after_hours: Option<u64>,
+}
+
+impl Default for OffsiteConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            host: None,
+            port: None,
+            user: None,
+            key_file: None,
+            host_key: None,
+            path: None,
+            endpoint: None,
+            bucket: None,
+            region: None,
+            access_key_file: None,
+            secret_key_file: None,
+            keep: None,
+            verify_every_hours: 24,
+            verify_sample: 64,
+            stale_after_hours: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OffsiteProvider {
+    Sftp,
+    S3,
+    Local,
+}
+
+/// A Réplique server receiving a report of each offsite copy and check, as one
+/// more device's backup job.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepliqueConfig {
+    /// `https://replique.example.com`
+    pub url: String,
+    /// A file holding the device's report token (`rpl_…`), from Réplique's
+    /// website.
+    pub token_file: PathBuf,
+    /// The job's name on Réplique.
+    #[serde(default = "RepliqueConfig::default_job")]
+    pub job: String,
+}
+
+impl RepliqueConfig {
+    fn default_job() -> String {
+        "offsite".into()
     }
 }
 
@@ -315,6 +416,14 @@ impl ServerConfig {
         facade_core::validate_name("local_node", &config.local_node)?;
         if config.alerts.weekly_hour > 23 {
             anyhow::bail!("[alerts] weekly_hour must be 0 to 23 (UTC)");
+        }
+        if let Some(offsite) = &config.backups.offsite {
+            crate::server::offsite::Settings::from_config(offsite, &config.backups)
+                .context("[backups.offsite]")?;
+        }
+        if let Some(replique) = &config.backups.replique {
+            crate::server::offsite::replique::check_config(replique)
+                .context("[backups.replique]")?;
         }
         Ok(config)
     }

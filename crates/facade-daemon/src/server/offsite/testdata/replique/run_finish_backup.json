@@ -1,0 +1,26 @@
+{
+  "status": "success",
+  "exit_code": 0,
+  "finished_at": "2026-11-14T09:01:33Z",
+  "summary": {
+    "files_new": 1204,
+    "files_changed": 311,
+    "files_unmodified": 1841706,
+    "dirs_new": 52,
+    "dirs_changed": 410,
+    "dirs_unmodified": 220143,
+    "data_blobs": 2861,
+    "tree_blobs": 448,
+    "data_added": 3120938112,
+    "data_added_packed": 2811445760,
+    "total_files_processed": 1843221,
+    "total_bytes_processed": 452381234567,
+    "total_duration": 20928.41,
+    "backup_start": "2026-11-14T03:12:45Z",
+    "backup_end": "2026-11-14T09:01:33Z",
+    "snapshot_id": "60b9632cb99dc43c73727a1da5bb5c48f719c8942bfee76c11b0deadfa744b61"
+  },
+  "errors": [],
+  "error_count": 0,
+  "unreadable_paths": []
+}

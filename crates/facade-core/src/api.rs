@@ -1316,6 +1316,90 @@ pub struct BackupView {
     /// for a full copy (`.tar.gz`, from before incremental backups).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added: Option<u64>,
+    /// It is in the offsite copy (`[backups.offsite]`).
+    #[serde(default)]
+    pub offsite: bool,
+    /// Only there: no longer on the server's disk (offsite keeps more).
+    #[serde(default)]
+    pub offsite_only: bool,
+}
+
+/// `GET /api/backups/offsite`: the copy of the backups kept elsewhere
+/// (`[backups.offsite]`); `null` when there is none.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OffsiteView {
+    /// Where it goes: `sftp://u1-sub2@u1.your-storagebox.de:23/facade`.
+    pub target: String,
+    /// `sftp`, `s3` or `local`.
+    pub provider: String,
+    /// Backups kept there, per volume.
+    pub keep: usize,
+    pub verify_every_hours: u64,
+    /// Chunks read back by each check.
+    pub verify_sample: usize,
+    pub stale_after_hours: u64,
+    pub last_copy: Option<OffsiteCopyView>,
+    /// When a copy last worked.
+    pub last_success: Option<u64>,
+    pub last_verify: Option<OffsiteVerifyView>,
+    /// No copy worked for longer than `stale_after_hours`.
+    pub stale: bool,
+    pub copying: bool,
+    /// While copying: bytes sent, of those to send.
+    #[serde(default)]
+    pub progress: Option<(u64, u64)>,
+    /// Why copies are paused (the server was rebuilt from its copy).
+    #[serde(default)]
+    pub paused: Option<String>,
+    /// The user said the key is kept somewhere else; it is not shown any more.
+    pub key_saved: bool,
+    /// sftp: the public half of the key facade logs in with, to install there.
+    #[serde(default)]
+    pub public_key: Option<String>,
+    /// sftp: the server's host key fingerprint, as configured or first seen.
+    #[serde(default)]
+    pub host_key: Option<String>,
+    /// The Réplique server each copy is reported to.
+    #[serde(default)]
+    pub reports_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OffsiteCopyView {
+    /// When it started.
+    pub at: u64,
+    pub secs: u64,
+    /// Why it failed (or did not clean up).
+    pub error: Option<String>,
+    /// What it sent, sealed.
+    pub uploaded_chunks: u64,
+    pub uploaded_bytes: u64,
+    /// Backups it copied, and old ones it deleted there.
+    pub copied: u64,
+    pub removed: u64,
+    /// What the target holds: backups (the server's included), chunks, bytes.
+    pub backups: u64,
+    pub chunks: u64,
+    pub size: u64,
+}
+
+/// A check of the offsite copy: every chunk listed there, a sample read back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OffsiteVerifyView {
+    pub at: u64,
+    /// Chunks read back intact.
+    pub verified: u64,
+    /// Chunks the offsite backups hold.
+    pub chunks: u64,
+    pub problems: Vec<String>,
+}
+
+/// `GET /api/backups/offsite/key`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OffsiteKeyView {
+    /// The key the offsite copy is sealed with: 64 hex digits. Absent once the
+    /// user said it is kept somewhere else.
+    pub key: Option<String>,
 }
 
 /// `GET /api/backups/store`: what volume backups take on the server's disk.

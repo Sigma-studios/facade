@@ -1,0 +1,15 @@
+{
+  "status": "success",
+  "exit_code": 0,
+  "finished_at": "2026-11-14T09:20:10Z",
+  "prune": {
+    "policy": "keep-deleted",
+    "snapshots_before": 31,
+    "snapshots_removed": 3,
+    "snapshots_tagged_keep": 1,
+    "bytes_freed": 812345678
+  },
+  "errors": [],
+  "error_count": 0,
+  "unreadable_paths": []
+}

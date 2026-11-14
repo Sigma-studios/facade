@@ -60,6 +60,10 @@ x509-parser = "0.18"
 zstd = "0.14"
 serde_yaml_ng = "0.10"
 ssh-key = { version = "0.6", features = ["ed25519", "std", "rand_core"] }
+# Offsite copies of backups (server::offsite): SFTP and S3-compatible targets.
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2"] }
+russh-sftp = "3"
+object_store = { version = "0.12", default-features = false, features = ["aws"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

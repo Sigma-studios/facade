@@ -33,7 +33,8 @@ use crate::tls;
 
 const CHECK_EVERY: Duration = Duration::from_secs(600);
 const LAST_RUN_KEY: &str = "backups.last_run";
-const SERVER_DIR: &str = "_server";
+/// The server's own backups, one directory each.
+pub const SERVER_DIR: &str = "_server";
 
 /// Under the data directory; the local agent reports what it takes.
 pub const DIR: &str = "backups";
@@ -77,6 +78,9 @@ pub async fn run(server: Arc<Server>) -> anyhow::Result<()> {
                 report.done.len(),
                 report.failed.len()
             );
+            // The copy runs on its own task: a slow target never delays the
+            // next backup.
+            server.offsite.backups_taken();
             server
                 .store
                 .kv_put(LAST_RUN_KEY, &facade_core::now().to_string())?;
@@ -262,6 +266,8 @@ pub async fn backup_volume(server: &Server, app: &str, volume: &str) -> anyhow::
         id,
         size: header.stored,
         added: Some(header.added),
+        offsite: false,
+        offsite_only: false,
     })
 }
 
@@ -342,6 +348,8 @@ pub fn list(server: &Server, app: Option<&str>) -> anyhow::Result<Vec<BackupView
                     id,
                     size,
                     added,
+                    offsite: false,
+                    offsite_only: false,
                 });
             }
         }

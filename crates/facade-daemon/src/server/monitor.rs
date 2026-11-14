@@ -239,6 +239,7 @@ fn conditions(server: &Server) -> HashMap<String, String> {
             format!("backup of {what} failed: {error}"),
         );
     }
+    super::offsite::conditions(server, &mut out);
 
     let apps = match server.store.list_apps() {
         Ok(apps) => apps,

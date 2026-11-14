@@ -1,0 +1,12 @@
+{
+  "kind": "backup",
+  "rules": {
+    "paths": ["/mnt/windows/c/Users", "/mnt/windows/data"],
+    "excludes": ["$RECYCLE.BIN", "System Volume Information", "/mnt/windows/c/Users/*/AppData/Local/Temp"],
+    "exclude_caches": false,
+    "retention": {
+      "policy": "versions",
+      "keep": { "daily": 7, "weekly": 4, "monthly": "unlimited", "within": "14d" }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "at": "2026-11-14T05:40:12Z",
+  "percent_done": 0.4213,
+  "seconds_elapsed": 8847,
+  "seconds_remaining": 12153,
+  "total_files": 1843221,
+  "files_done": 771092,
+  "total_bytes": 452381234567,
+  "bytes_done": 190588123456,
+  "error_count": 2,
+  "current_files": [
+    "/home/sigma/Photos/2019/IMG_2041.CR2",
+    "/home/sigma/Projects/fractale/assets/terrain.blend"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "client_run_id": "6f1c2a9e-3b7d-4e58-9a0c-1d2e3f4a5b6c",
+  "job": "hetzner",
+  "kind": "backup",
+  "started_at": "2026-11-14T03:12:45Z",
+  "restic_version": "0.19.1",
+  "client_version": "replique-client 0.1.0"
+}
