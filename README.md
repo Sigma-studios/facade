@@ -839,6 +839,35 @@ Storage Box with `cat /etc/facade/offsite_ed25519.pub | ssh -p 23
 u123456-sub2@u123456.your-storagebox.de install-ssh-key`. Without `host_key`, the
 host key seen at the first connection is kept and required from then on.
 
+**A sub-account from Réplique.** When [Réplique](https://github.com/Sigma-studios/replique)
+manages the Storage Box, it creates the sub-account (Add device, kind *façade*) and
+never shows its password, so the key goes on by pairing instead of
+`install-ssh-key`. With the pairing code it shows (valid 15 minutes), as root:
+
+```sh
+umask 077
+[ -f /etc/facade/offsite_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C facade-offsite -f /etc/facade/offsite_ed25519
+python3 - XXXX-XXXX <<'EOF'
+import json, sys, urllib.request
+key = open("/etc/facade/offsite_ed25519.pub").read().strip()
+body = json.dumps({"code": sys.argv[1], "device_name": "façade", "kind": "facade",
+                   "ssh_public_key": key, "client_version": "facade"}).encode()
+req = urllib.request.Request("https://replique.example.com/api/v1/pair", body,
+                             {"Content-Type": "application/json"})
+r = json.load(urllib.request.urlopen(req))
+open("/etc/facade/replique-token", "w").write(r["report_token"])
+s = r["storage"]
+host_key = s["known_hosts"][0].split(" ", 1)[1] if s.get("known_hosts") else ""
+print(f'host = "{s["host"]}"\nport = {s["port"]}\nuser = "{s["username"]}"\nhost_key = "{host_key}"')
+EOF
+```
+
+It installs the key, prints `host`, `port`, `user` and `host_key` for
+`[backups.offsite]`, and writes the report token for `[backups.replique]` below. Set
+`path = "restic"`: Réplique measures each device through a read-only login whose home
+is that folder, so copies anywhere else show as empty there (the `.ssh` folder
+Réplique keeps in it is its own; leave it).
+
 **Encrypted before it leaves.** Everything is sealed with XChaCha20-Poly1305 under
 a key the server generates (`/var/lib/facade/offsite.key`, root only): the target
 sees app and volume names, when backups were taken and roughly how big their pieces
