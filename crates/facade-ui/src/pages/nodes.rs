@@ -19,6 +19,7 @@ use crate::util::{Polled, bytes, me, percent, polled, run, toasts};
 const TABS: &[(&str, &str)] = &[
     ("overview", "Overview"),
     ("activity", "Activity"),
+    ("reboots", "Reboots"),
     ("ports", "Ports"),
     ("volumes", "Volumes"),
     ("vulnerabilities", "Vulnerabilities"),
@@ -218,6 +219,7 @@ pub fn Nodes() -> impl IntoView {
         Some(match tab.get().as_str() {
             "ports" => view! { <Ports node=name/> }.into_any(),
             "activity" => view! { <super::activity::ActivityTab node=name/> }.into_any(),
+            "reboots" => view! { <super::reboot_timeline::RebootsTab node=name/> }.into_any(),
             "volumes" => view! { <NodeVolumes node=name volumes/> }.into_any(),
             "vulnerabilities" => view! { <super::vulns::VulnsTab node=name/> }.into_any(),
             _ => {
@@ -237,7 +239,6 @@ pub fn Nodes() -> impl IntoView {
                         </Show>
                         "Nodes clean up after builds on their own: every 6 hours, and harder when the disk is 85 % full."
                     </p>
-                    <super::reboot_timeline::NodeReboots node=name.clone()/>
                 }
                 .into_any()
             }

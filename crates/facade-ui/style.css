@@ -1378,7 +1378,14 @@ a.badge:hover { text-decoration: none; filter: brightness(0.97); }
 .rb-past { margin-top: 16px; }
 .rb-past h4 { margin: 0 0 4px; font-size: 13px; }
 .rb-past ul { margin: 0; padding-left: 18px; }
-.node-reboots { margin-top: 28px; }
-.node-reboots .section-title { margin-bottom: 8px; }
-.rb-earlier { margin-top: 8px; }
-.rb-earlier ul { margin: 4px 0 0; padding-left: 18px; }
+/* The Reboots tab: a line per reboot, opening to its timeline. */
+.rb-list .rb-line { cursor: pointer; }
+.rb-list tbody + tbody > tr:first-child > td { border-top: 1px solid var(--border); }
+.rb-list td { border-bottom: 0; }
+.rb-list .rb-detail:hover { background: none; }
+.rb-list .rb-detail td { padding-top: 0; }
+.rb-list .rb-detail .rb { max-width: 900px; }
+.rb-target > .rb-line { background: var(--surface-2); }
+.rb-toggle { display: inline-flex; align-items: center; gap: 8px; background: none; border: 0; padding: 0; font: inherit; color: var(--text-primary); font-weight: 600; cursor: pointer; white-space: nowrap; }
+.rb-chevron { display: inline-block; font-size: 10px; color: var(--text-muted); transition: transform 0.12s; }
+.rb-toggle[aria-expanded="true"] .rb-chevron { transform: rotate(90deg); }

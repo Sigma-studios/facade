@@ -504,7 +504,7 @@ pub fn NodeUptime(
         Some(match reboot {
             Some(e) => view! {
                 " · "
-                <A href=format!("/nodes/{}?tab=activity&event={}", node.get_untracked(), e.id)
+                <A href=format!("/nodes/{}?tab=reboots&event={}", node.get_untracked(), e.id)
                     attr:title=format!("Last reboot {}", ago_exact(e.at))>{text}</A>
             }
             .into_any(),

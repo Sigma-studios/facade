@@ -2,14 +2,15 @@
 //! shared time axis (stopping, down, starting until healthy), the machine's
 //! off time behind them, and the same numbers in a table.
 
-use facade_core::events::{EventsPage, RebootApp, RebootReport};
+use facade_core::events::{EventView, EventsPage, RebootApp, RebootReport};
 use facade_core::reboot_report::duration;
 use leptos::prelude::*;
 use leptos_router::components::A;
+use leptos_router::hooks::use_query_map;
 use std::time::Duration;
 
 use crate::api;
-use crate::components::Ago;
+use crate::components::{Ago, ErrorNote, Loading};
 use crate::util::polled;
 
 /// Local `HH:MM:SS` of a time in milliseconds.
@@ -268,7 +269,7 @@ pub fn PastReboots(#[prop(into)] node: Signal<String>) -> impl IntoView {
                 <ul class="small">
                     {events.into_iter().map(|e| view! {
                         <li>
-                            <A href=format!("/nodes/{node}?tab=activity&event={}", e.id)>
+                            <A href=format!("/nodes/{node}?tab=reboots&event={}", e.id)>
                                 <Ago at=e.at/>
                             </A>
                             {format!(": {}", e.summary.trim_start_matches("Rebooted: "))}
@@ -280,72 +281,181 @@ pub fn PastReboots(#[prop(into)] node: Signal<String>) -> impl IntoView {
     }
 }
 
-/// The node Overview's Reboots section: the latest reboot's timeline, the ones
-/// before it as links, or what will show here once the node reboots.
+/// A node's Reboots tab: one row per reboot (when, how long the machine was
+/// off, the app down the longest, what went wrong), each opening to its
+/// timeline: every app's stop, downtime and return. `?event=` opens one.
 #[component]
-pub fn NodeReboots(node: String) -> impl IntoView {
-    let for_fetch = node.clone();
-    let list = polled(Some(Duration::from_secs(120)), move || {
-        let node = for_fetch.clone();
+pub fn RebootsTab(#[prop(into)] node: Signal<String>) -> impl IntoView {
+    const PAGE: u32 = 20;
+    let query = use_query_map();
+    let wanted = query
+        .read_untracked()
+        .get("event")
+        .and_then(|e| e.parse::<i64>().ok());
+    let shown = RwSignal::new(PAGE);
+    let list = polled(Some(Duration::from_secs(60)), move || {
+        let (node, limit) = (node.get(), shown.get());
         async move {
-            api::get::<EventsPage>(&format!("/api/events?node={node}&kind=reboot&limit=6")).await
+            api::get::<EventsPage>(&format!(
+                "/api/events?node={node}&kind=reboot&limit={limit}"
+            ))
+            .await
         }
     });
-    move || {
-        let events = list.data.get()?.events;
-        let node = node.clone();
-        let mut events = events.into_iter();
-        let body = match events.next() {
-            None => view! {
-                <p class="muted small">
-                    "No reboot recorded yet. After the next one (asked by façade or not), this shows how it went: "
-                    "when each app stopped and whether it had to be killed, how long the machine was off, "
-                    "and when each app ran and passed its health check again."
-                </p>
-            }
-            .into_any(),
-            Some(last) => {
-                let href = format!("/nodes/{node}?tab=activity&event={}", last.id);
-                let detail = match last.details.reboot.clone() {
-                    Some(report) => view! { <RebootTimeline report/> }.into_any(),
-                    None => view! {
-                        <p class="muted small">
-                            "No report for this one: façade measures reboots since November 2026."
-                        </p>
-                    }
-                    .into_any(),
-                };
-                let earlier: Vec<_> = events.collect();
-                view! {
-                    <p class="small">
-                        <A href=href><Ago at=last.at/></A>
-                        {format!(": {}", last.summary.trim_start_matches("Rebooted: "))}
-                    </p>
-                    {detail}
-                    {(!earlier.is_empty()).then(|| view! {
-                        <details class="rb-earlier small">
-                            <summary>{format!("{} earlier", earlier.len())}</summary>
-                            <ul>
-                                {earlier.into_iter().map(|e| view! {
-                                    <li>
-                                        <A href=format!("/nodes/{node}?tab=activity&event={}", e.id)>
-                                            <Ago at=e.at/>
-                                        </A>
-                                        {format!(": {}", e.summary.trim_start_matches("Rebooted: "))}
-                                    </li>
-                                }).collect_view()}
-                            </ul>
-                        </details>
-                    })}
+    let events = move || list.data.get().map(|p| p.events).unwrap_or_default();
+    let more = move || list.data.with(|p| p.as_ref().is_some_and(|p| p.more));
+    view! {
+        <ErrorNote error=list.error/>
+        <Show when=move || list.loaded() fallback=Loading>
+            <Show when=move || list.data.with(|p| p.as_ref().is_some_and(|p| !p.events.is_empty()))
+                fallback=|| view! {
+                    <div class="empty"><p>
+                        "No reboot recorded yet. After the next one (asked by façade or not), each shows here: "
+                        "when each app stopped and whether it had to be killed, how long the machine was off, "
+                        "and when each app ran and passed its health check again."
+                    </p></div>
+                }>
+                <div class="table-wrap">
+                    <table class="table rb-list">
+                        <thead><tr>
+                            <th>"Rebooted"</th>
+                            <th class="num">"Off"</th>
+                            <th class="num">"Longest down"</th>
+                            <th>"Apps"</th>
+                            <th>"Problems"</th>
+                        </tr></thead>
+                        <For each=events key=|e| (e.id, e.summary.clone()) let:e>
+                            {
+                                let open = wanted == Some(e.id);
+                                view! { <RebootRow e open node=node.get_untracked()/> }
+                            }
+                        </For>
+                    </table>
+                </div>
+                <Show when=more>
+                    <div class="table-more">
+                        <button class="button" on:click=move |_| shown.update(|s| *s += PAGE)>"Show more"</button>
+                    </div>
+                </Show>
+            </Show>
+        </Show>
+    }
+}
+
+/// One reboot: its figures on a line, and its timeline under it when open.
+#[component]
+fn RebootRow(e: EventView, open: bool, node: String) -> impl IntoView {
+    let open = RwSignal::new(open);
+    let id = e.id;
+    let report = e.details.reboot.clone();
+    let cells = match &report {
+        None => view! {
+            <td colspan="4" class="muted small">
+                "No report: façade measures reboots since November 2026."
+            </td>
+        }
+        .into_any(),
+        Some(r) => {
+            let off = r.off_for().map(duration).unwrap_or_else(|| "—".into());
+            let longest = match r.longest_down() {
+                Some((a, d)) => view! {
+                    {duration(d)}
+                    <span class="muted">{format!(" ({})", a.name)}</span>
                 }
-                .into_any()
+                .into_any(),
+                None => "—".into_any(),
+            };
+            let n = r.apps.len();
+            let not_back = r.not_back();
+            let apps = match (n, not_back.len()) {
+                (0, _) => "none ran there".to_string(),
+                (1, 0) => format!("{} back", r.apps[0].name),
+                (n, 0) => format!("all {n} back"),
+                (n, missing) => format!("{} of {n} back", n - missing),
+            };
+            let mut problems = vec![];
+            if !r.clean {
+                problems.push(("badge badge-critical", "not shut down cleanly".to_string(),
+                    "No shutdown in Docker's journal: the machine went down under the apps (a crash or power cut?)".to_string()));
             }
-        };
-        Some(view! {
-            <section class="node-reboots">
-                <h2 class="section-title">"Reboots"</h2>
-                {body}
-            </section>
-        })
+            if !not_back.is_empty() {
+                let names: Vec<_> = not_back.iter().map(|a| a.name.as_str()).collect();
+                problems.push((
+                    "badge badge-critical",
+                    format!("{} not back", not_back.len()),
+                    format!("Not running again: {}", names.join(", ")),
+                ));
+            }
+            let killed = r.killed();
+            if !killed.is_empty() {
+                let names: Vec<_> = killed.iter().map(|a| a.name.as_str()).collect();
+                problems.push((
+                    "badge badge-warn",
+                    format!("{} killed", killed.len()),
+                    format!(
+                        "Did not stop within their stop timeout: {}",
+                        names.join(", ")
+                    ),
+                ));
+            }
+            let problems = if problems.is_empty() {
+                view! { <span class="muted">"—"</span> }.into_any()
+            } else {
+                problems
+                    .into_iter()
+                    .map(|(class, label, tip)| view! { <span class=class title=tip>{label}</span> " " })
+                    .collect_view()
+                    .into_any()
+            };
+            view! {
+                <td class="num">{off}</td>
+                <td class="num">{longest}</td>
+                <td>{apps}</td>
+                <td>{problems}</td>
+            }
+            .into_any()
+        }
+    };
+    let entry = format!("/nodes/{node}?tab=activity&event={id}");
+    let target = open.get_untracked();
+    let row = NodeRef::<leptos::html::Tr>::new();
+    if target {
+        row.on_load(|el| {
+            let el = el.clone();
+            request_animation_frame(move || el.scroll_into_view());
+        });
+    }
+    view! {
+        <tbody class=if target { "rb-group rb-target" } else { "rb-group" }>
+            <tr class="rb-line" node_ref=row on:click=move |ev| {
+                // A link in the row goes where it says.
+                let on_link = ev
+                    .target()
+                    .and_then(|t| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(t).ok())
+                    .is_some_and(|t| t.closest("a").ok().flatten().is_some());
+                if !on_link {
+                    open.update(|o| *o = !*o);
+                }
+            }>
+                <td>
+                    <button type="button" class="rb-toggle" aria-expanded=move || open.get().to_string()
+                        title="Show each app's stop, downtime and return">
+                        <span class="rb-chevron" aria-hidden="true">"▸"</span>
+                        <Ago at=e.at/>
+                    </button>
+                </td>
+                {cells}
+            </tr>
+            <Show when=move || open.get()>
+                <tr class="rb-detail">
+                    <td colspan="5">
+                        {report.clone().map(|report| view! { <RebootTimeline report/> })}
+                        <p class="small muted">
+                            <A href=entry.clone()>"Its Activity entry"</A>
+                        </p>
+                    </td>
+                </tr>
+            </Show>
+        </tbody>
     }
 }

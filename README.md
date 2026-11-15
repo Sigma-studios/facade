@@ -710,8 +710,10 @@ After every reboot, asked by facade or not (a crash, the provider's maintenance)
 agent reports how it went once the apps are back (or after 5 minutes), on the reboot's
 Activity entry: when the shutdown began, how long each app took to stop and whether it
 was killed past its stop timeout, how long the machine was off, and when each app ran
-and passed its health check again, with how long it was down. The entry draws it as a
-timeline (the node's uptime and **Reboot…** → *Past reboots* lead to it);
+and passed its health check again, with how long it was down. The node's **Reboots**
+tab lists them, a line each (how long it was off, the app down the longest, any app
+killed or not back), opening to the reboot's timeline (the node's uptime and
+**Reboot…** → *Past reboots* lead there);
 `facade activity --kind reboot --node main` lists them and `facade activity --id <id>`
 shows one in full. The times come from what survives a reboot: Docker's container
 states, and dockerd's lines in the journal (an app killed at shutdown, when the
