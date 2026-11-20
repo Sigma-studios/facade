@@ -516,7 +516,8 @@ impl Store {
     pub fn delete_user(&self, id: i64) -> anyhow::Result<()> {
         let conn = self.0.lock();
         conn.execute("UPDATE apps SET owner_id = NULL WHERE owner_id = ?1", [id])?;
-        conn.execute("DELETE FROM credentials WHERE owner_id = ?1", [id])?;
+        conn.execute("DELETE FROM registry_logins WHERE owner_id = ?1", [id])?;
+        conn.execute("DELETE FROM git_credentials WHERE owner_id = ?1", [id])?;
         conn.execute("DELETE FROM users WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -2051,6 +2052,19 @@ fn migrate_from_branch_logins(conn: &Connection) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_a_user_takes_their_sessions_and_logins() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store.create_user("alice", "x", "member", false).unwrap();
+        let id = store.user_by_name("alice").unwrap().unwrap().id;
+        store
+            .create_session("hash", id, facade_core::now() + 60)
+            .unwrap();
+        store.delete_user(id).unwrap();
+        assert!(store.user_by_id(id).unwrap().is_none());
+        assert!(store.session_user("hash").unwrap().is_none());
+    }
 
     #[test]
     fn deployments_are_found_and_counted() {
