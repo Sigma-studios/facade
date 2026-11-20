@@ -318,6 +318,7 @@ template in `lang::generated_dockerfile`.
 | `facade node reboot <node> [--at 04:00]` / `--cancel` | reboot a node now or at a time (see [Reboots](#reboots-and-maintenance-windows)) |
 | `facade node maintenance <node> --days sun --at 04:00` / `--skip` / `--off` | install updates and reboot on a schedule |
 | `facade user add/ls/set/rm` / `app owner` / `app grant` / `whoami` | accounts and who manages what |
+| `facade token create <name> [--read-only] [--expires DAYS]` / `token ls` / `token revoke` | API tokens for scripts and widgets (see [For scripts…](#for-scripts-widgets-and-ai-agents)) |
 | `facade server` / `server set` | the web UI's domain, ACME contact, direct API port |
 | `facade server update [--check]` | update facade to the latest build of main (see [Updating](#updating)) |
 | `facade stop` / `start` / `restart` / `app rm [--volumes]` | lifecycle |
@@ -1351,10 +1352,29 @@ facade user set alice --role admin             # or --memory/--cpus (0 removes a
 * Members cannot put apps on the node's network, and can only add domain names that
   do not resolve yet.
 
-### For scripts and AI agents
+### For scripts, widgets and AI agents
 
 Every command accepts `--json`. Instead of `facade login`, set `FACADE_SERVER`,
 `FACADE_TOKEN` (and `FACADE_FINGERPRINT` for a self-signed server).
+
+A login lasts 30 days. Something running unattended (a script, a desktop widget
+polling `GET /api/problems`) gets an API token instead, which lasts until revoked:
+
+```sh
+facade token create "desktop widget" --read-only   # prints fct_… once
+facade token create deploy-bot --expires 90         # full access, for 90 days
+facade token ls                                     # name, scope, created, last used
+facade token revoke "desktop widget"                # or its id
+```
+
+Send it as `Authorization: Bearer fct_…` (or as `FACADE_TOKEN`). A token acts as
+the user who made it, with what they may do; a read-only one only looks: `GET`
+requests, and not those reaching further than a view (a shell in an app, secret
+values, backup downloads, the offsite key), so a leaked widget token changes nothing.
+Only a hash of each is kept, and when it was last used (to the minute). Each user
+manages their own, in the CLI or Settings → API tokens (`GET`/`POST /api/tokens`,
+`DELETE /api/tokens/{id}`); tokens go with their user, and outlive password changes,
+which only end login sessions.
 
 ### Export / restore
 
