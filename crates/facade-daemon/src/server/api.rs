@@ -44,6 +44,14 @@ pub fn router(server: Arc<Server>) -> Router {
         .route("/api/whoami", get(whoami))
         .route("/api/password", put(change_password))
         .route(
+            "/api/tokens",
+            get(super::tokens::list).post(super::tokens::create),
+        )
+        .route(
+            "/api/tokens/{id}",
+            axum::routing::delete(super::tokens::revoke),
+        )
+        .route(
             "/api/server-settings",
             get(server_settings).put(update_server_settings),
         )
@@ -339,6 +347,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
 
 // ---------------------------------------------------------------- errors & auth
 
+#[derive(Debug)]
 pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
@@ -386,30 +395,79 @@ pub struct User {
     pub username: String,
     pub role: String,
     token_hash: String,
+    /// Through an API token: which one, and whether it only reads.
+    pub api_token: Option<(i64, TokenScope)>,
 }
 
 impl FromRequestParts<Arc<Server>> for User {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, server: &Arc<Server>) -> ApiResult<Self> {
-        let unauthorized = || ApiError(StatusCode::UNAUTHORIZED, "not logged in".into());
         let token = parts
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(unauthorized)?;
-        let token_hash = hash_secret(token.trim());
-        let user = server
-            .store
-            .session_user(&token_hash)?
-            .ok_or_else(unauthorized)?;
+            .ok_or_else(not_logged_in)?;
+        User::authenticate(&server.store, &parts.method, token, facade_core::now())
+    }
+}
+
+fn not_logged_in() -> ApiError {
+    ApiError(StatusCode::UNAUTHORIZED, "not logged in".into())
+}
+
+impl User {
+    /// The caller behind a bearer token: a login session, or an API token
+    /// (`fct_…`). A read-only API token only gets through on `GET`.
+    pub(super) fn authenticate(
+        store: &super::store::Store,
+        method: &axum::http::Method,
+        token: &str,
+        now: u64,
+    ) -> ApiResult<Self> {
+        let token = token.trim();
+        let token_hash = hash_secret(token);
+        if token.starts_with(API_TOKEN_PREFIX) {
+            let t = store.api_token_user(&token_hash, now)?.ok_or_else(|| {
+                ApiError(
+                    StatusCode::UNAUTHORIZED,
+                    "unknown, revoked or expired API token".into(),
+                )
+            })?;
+            if t.scope == TokenScope::ReadOnly
+                && !matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
+            {
+                return Err(super::users::forbidden("this API token is read-only"));
+            }
+            super::tokens::note_use(store, t.id, t.last_used, now);
+            return Ok(User {
+                id: t.user.id,
+                username: t.user.username,
+                role: t.user.role,
+                token_hash,
+                api_token: Some((t.id, t.scope)),
+            });
+        }
+        let user = store.session_user(&token_hash)?.ok_or_else(not_logged_in)?;
         Ok(User {
             id: user.id,
             username: user.username,
             role: user.role,
             token_hash,
+            api_token: None,
         })
+    }
+
+    /// For the few reads reaching further than a view (a shell in an app,
+    /// secret values, backups and keys): not for a read-only API token.
+    pub(super) fn require_full_access(&self) -> ApiResult<()> {
+        match self.api_token {
+            Some((_, TokenScope::ReadOnly)) => Err(super::users::forbidden(
+                "this API token is read-only: it cannot do this",
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -737,7 +795,12 @@ async fn alerts(State(server): S, user: User) -> Json<Vec<AlertView>> {
 
 async fn notify_settings(State(server): S, user: User) -> ApiResult<Json<NotifySettings>> {
     user.require_admin()?;
-    Ok(Json(server.notifier.settings()))
+    let mut settings = server.notifier.settings();
+    // The webhook URL lets anyone post to the channel: not for a read-only token.
+    if user.require_full_access().is_err() {
+        settings.discord_webhook = settings.discord_webhook.map(|_| "(hidden)".into());
+    }
+    Ok(Json(settings))
 }
 
 async fn update_notify(
@@ -1837,6 +1900,9 @@ async fn get_env(
     Query(q): Query<RevealQuery>,
 ) -> ApiResult<Json<Vec<EnvView>>> {
     load_app_for(&server, &user, &name)?;
+    if q.reveal {
+        user.require_full_access()?;
+    }
     let vars = server
         .store
         .list_env(&name)?
@@ -2015,6 +2081,7 @@ async fn exec_app(
 ) -> ApiResult<Response> {
     use facade_core::exec::{ExecRequest, Frame, UPGRADE};
     use tokio::io::AsyncWriteExt;
+    user.require_full_access()?;
     let row = match load_app_for(&server, &user, &name) {
         Err(_) if user.is_admin() && server.store.get_stack(&name)?.is_some() => {
             return Err(not_found(format!(
@@ -3094,6 +3161,7 @@ async fn export_volume(
     user: User,
     Path((app, volume)): Path<(String, String)>,
 ) -> ApiResult<Response> {
+    user.require_full_access()?;
     let (node, docker_name, _) = volume_node(&server, &user, &app, &volume)?;
     let stream = server
         .hub
@@ -3262,6 +3330,7 @@ async fn offsite_verify(
 /// The offsite key, until the user says it is kept somewhere else.
 async fn offsite_key(State(server): S, user: User) -> ApiResult<Json<OffsiteKeyView>> {
     user.require_admin()?;
+    user.require_full_access()?;
     let key = super::offsite::reveal_key(&server).map_err(bad_request)?;
     Ok(Json(OffsiteKeyView { key }))
 }
@@ -3319,6 +3388,7 @@ async fn download_backup(
     Path((app, volume, id)): Path<(String, String, u64)>,
     Query(q): Query<FromQuery>,
 ) -> ApiResult<Response> {
+    user.require_full_access()?;
     load_app_for(&server, &user, &app)?;
     fetch_if_offsite(&server, &app, &volume, id, q.from.as_deref()).await?;
     let body = match super::backups::find(&server, &app, &volume, id).map_err(not_found)? {
@@ -3386,6 +3456,7 @@ async fn restore_backup(
 /// both, `apply` is not even needed: put them in a new data_dir and start.
 async fn server_backup(State(server): S, user: User) -> ApiResult<Response> {
     user.require_admin()?;
+    user.require_full_access()?;
     let bytes = super::backups::server_archive(&server).await?;
     Ok((
         [

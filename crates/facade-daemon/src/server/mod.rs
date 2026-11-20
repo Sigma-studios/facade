@@ -27,6 +27,7 @@ pub mod secrets;
 mod settings;
 mod stack;
 pub mod store;
+mod tokens;
 mod ui;
 mod updates;
 pub mod users;

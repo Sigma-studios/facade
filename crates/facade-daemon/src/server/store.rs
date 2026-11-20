@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 pub mod edge;
 mod resources;
+mod tokens;
 mod vulns;
 pub use vulns::FindingChanges;
 
@@ -368,6 +369,7 @@ impl Store {
         conn.execute_batch(resources::SCHEMA)?;
         conn.execute_batch(edge::SCHEMA)?;
         conn.execute_batch(vulns::SCHEMA)?;
+        conn.execute_batch(tokens::SCHEMA)?;
         edge::migrate(&conn)?;
         add_column(&conn, "nodes", "public_ip", "TEXT")?;
         add_column(&conn, "node_usage", "net_rx", "INTEGER NOT NULL DEFAULT 0")?;

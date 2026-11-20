@@ -615,6 +615,9 @@ pub async fn get_env(
     Query(q): Query<RevealQuery>,
 ) -> ApiResult<Json<Vec<EnvView>>> {
     user.require_admin()?;
+    if q.reveal {
+        user.require_full_access()?;
+    }
     load(&server, &name)?;
     let vars = server
         .store

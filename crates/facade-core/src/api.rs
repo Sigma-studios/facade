@@ -25,6 +25,64 @@ pub struct ChangePassword {
     pub password: String,
 }
 
+/// What API token secrets start with, so they read apart from session tokens
+/// (in a config file, a log, a leak scanner).
+pub const API_TOKEN_PREFIX: &str = "fct_";
+
+/// What an API token may do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TokenScope {
+    /// Whatever its user may do.
+    #[default]
+    Full,
+    /// Look, change nothing: `GET` requests only, and not those reaching
+    /// further than a view (a shell in an app, secret values, backups).
+    ReadOnly,
+}
+
+impl TokenScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenScope::Full => "full",
+            TokenScope::ReadOnly => "read-only",
+        }
+    }
+}
+
+/// A long-lived API token (`GET /api/tokens`), for scripts and widgets that
+/// should not log in again every 30 days. Never its secret: only a hash is kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiTokenView {
+    pub id: i64,
+    pub name: String,
+    pub scope: TokenScope,
+    pub created_at: u64,
+    /// `None`: it lasts until revoked.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// To the minute: noted at most once a minute.
+    #[serde(default)]
+    pub last_used: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateApiToken {
+    pub name: String,
+    #[serde(default)]
+    pub scope: TokenScope,
+    /// Days until it stops working; `None` for never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_days: Option<u64>,
+}
+
+/// The token just created, with its secret: shown this once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedApiToken {
+    pub token: ApiTokenView,
+    pub secret: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: String,
