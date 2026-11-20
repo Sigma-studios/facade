@@ -8,6 +8,7 @@ mod insights;
 mod output;
 mod reboot;
 mod resources;
+mod tokens;
 mod vulns;
 
 use std::collections::BTreeMap;
@@ -207,6 +208,10 @@ enum Command {
     User(UserCommand),
     /// Who you are logged in as, and your resource cap.
     Whoami,
+    /// API tokens that last (until revoked, or for some days), for scripts and
+    /// widgets: `create`, `list`, `revoke`.
+    #[command(subcommand)]
+    Token(tokens::TokenCommand),
     /// How this server is reached: its web UI domain, ACME contact, direct API port.
     Server {
         #[command(subcommand)]
@@ -1925,6 +1930,7 @@ async fn dispatch(api: &Api, command: Command, json: bool) -> anyhow::Result<()>
         Command::Git(cmd) => git(api, cmd, json).await?,
         Command::Backup(cmd) => backup(api, cmd, json).await?,
         Command::Registry(cmd) => registry(api, cmd, json).await?,
+        Command::Token(cmd) => tokens::run(api, cmd, json).await?,
         Command::User(cmd) => user(api, cmd, json).await?,
         Command::Whoami => {
             let me: WhoAmI = api.get("/api/whoami").await?;
