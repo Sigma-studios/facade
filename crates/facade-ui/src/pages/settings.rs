@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 use facade_core::api::{
-    AppChange, ApplyReport, BackupStoreView, ChangePassword, NodeBuildState, OffsiteKeyView,
-    OffsiteVerifyView, OffsiteView, RegistryLoginView, ServerSettings, ServerSettingsUpdate,
-    ServerUpdate, SetRegistryLogin, UpdateRun, UpdateState, UpdateTarget,
+    ApiTokenView, AppChange, ApplyReport, BackupStoreView, ChangePassword, CreateApiToken,
+    CreatedApiToken, NodeBuildState, OffsiteKeyView, OffsiteVerifyView, OffsiteView,
+    RegistryLoginView, ServerSettings, ServerSettingsUpdate, ServerUpdate, SetRegistryLogin,
+    TokenScope, UpdateRun, UpdateState, UpdateTarget,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -15,7 +16,7 @@ use super::app::CommitRow;
 use super::git::GitAccess;
 use crate::api;
 use crate::components::{Ago, CopyField, ErrorNote, Loading, Modal};
-use crate::util::{alerts, bytes, download, me, polled, run, short_hash, toasts};
+use crate::util::{alerts, bytes, date, download, me, polled, run, short_hash, toasts};
 
 /// Settings tabs: `(key, label, admins only)`.
 const TABS: &[(&str, &str, bool)] = &[
@@ -23,6 +24,7 @@ const TABS: &[(&str, &str, bool)] = &[
     ("alerts", "Alerts", false),
     ("app-access", "App access", false),
     ("password", "Password", false),
+    ("api-tokens", "API tokens", false),
 ];
 
 #[component]
@@ -78,6 +80,7 @@ pub fn Settings() -> impl IntoView {
                         <RegistryLogins/>
                     }.into_any(),
                     "password" => view! { <Password/> }.into_any(),
+                    "api-tokens" => view! { <ApiTokens/> }.into_any(),
                     _ => view! { <AlertsTab/> }.into_any(),
                 }}
             </Show>
@@ -133,6 +136,176 @@ fn Password() -> impl IntoView {
                 </div>
             </form>
         </section>
+    }
+}
+
+/// The user's API tokens: for scripts and widgets, which a login would leave
+/// stranded after 30 days. A new one's secret is shown once.
+#[component]
+fn ApiTokens() -> impl IntoView {
+    let list = polled(None, || async {
+        api::get::<Vec<ApiTokenView>>("/api/tokens").await
+    });
+    let name = RwSignal::new(String::new());
+    let read_only = RwSignal::new(true);
+    let days = RwSignal::new(String::new());
+    let error = RwSignal::new(None::<String>);
+    let created = RwSignal::new(None::<CreatedApiToken>);
+    let created_open = RwSignal::new(false);
+    let secret = Signal::derive(move || created.get().map(|c| c.secret).unwrap_or_default());
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let expires_days = match days.get_untracked().trim() {
+            "" => None,
+            d => match d.parse::<u64>() {
+                Ok(d) if d > 0 => Some(d),
+                _ => return error.set(Some("Days: a whole number, 1 or more".into())),
+            },
+        };
+        error.set(None);
+        let body = CreateApiToken {
+            name: name.get_untracked().trim().to_string(),
+            scope: if read_only.get_untracked() {
+                TokenScope::ReadOnly
+            } else {
+                TokenScope::Full
+            },
+            expires_days,
+        };
+        spawn_local(async move {
+            match api::post::<_, CreatedApiToken>("/api/tokens", &body).await {
+                Ok(c) => {
+                    name.set(String::new());
+                    days.set(String::new());
+                    created.set(Some(c));
+                    created_open.set(true);
+                    list.reload();
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+    let revoke_open = RwSignal::new(false);
+    let revoke_target = RwSignal::new(None::<ApiTokenView>);
+    let revoke = move |_| {
+        let Some(t) = revoke_target.get_untracked() else {
+            return;
+        };
+        run(
+            format!("Token {} revoked", t.name),
+            async move { api::delete(&format!("/api/tokens/{}", t.id)).await },
+            move || {
+                revoke_open.set(false);
+                list.reload();
+            },
+        );
+    };
+    view! {
+        <section class="card form">
+            <h2 class="section-title">"API tokens"</h2>
+            <p class="muted small">
+                "For scripts and widgets: sent as " <code>"Authorization: Bearer fct_…"</code>
+                ", a token acts as you and lasts until revoked (or for the days given). "
+                "A read-only one only looks: no changes, no shell in an app, no secret values or backups."
+            </p>
+            <ErrorNote error=list.error/>
+            <Show when=move || list.loaded() fallback=Loading>
+                <Show when=move || list.data.with(|l| l.as_ref().is_some_and(|l| !l.is_empty()))
+                    fallback=|| view! { <p class="muted small">"No tokens yet."</p> }>
+                    <div class="table-wrap">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>"Name"</th><th>"Scope"</th><th>"Created"</th>
+                                    <th>"Last used"</th><th>"Expires"</th><th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <For each=move || list.data.get().unwrap_or_default()
+                                    key=|t| t.id
+                                    let:t>
+                                    {
+                                        let target = t.clone();
+                                        let expires = match t.expires_at {
+                                            None => "never".to_string(),
+                                            Some(at) if at <= crate::util::now() => format!("expired {}", date(at)),
+                                            Some(at) => date(at),
+                                        };
+                                        view! {
+                                            <tr>
+                                                <td>{t.name.clone()}</td>
+                                                <td>{t.scope.as_str()}</td>
+                                                <td><Ago at=t.created_at/></td>
+                                                <td>{match t.last_used {
+                                                    Some(at) => view! { <Ago at=at/> }.into_any(),
+                                                    None => view! { <span class="muted">"never"</span> }.into_any(),
+                                                }}</td>
+                                                <td class="muted">{expires}</td>
+                                                <td class="row-actions">
+                                                    <button class="link-button danger" on:click=move |_| {
+                                                        revoke_target.set(Some(target.clone()));
+                                                        revoke_open.set(true);
+                                                    }>"Revoke"</button>
+                                                </td>
+                                            </tr>
+                                        }
+                                    }
+                                </For>
+                            </tbody>
+                        </table>
+                    </div>
+                </Show>
+            </Show>
+            <form class="form" on:submit=submit>
+                <div class="form-row">
+                    <label class="field">
+                        <span>"Name"</span>
+                        <input type="text" bind:value=name required maxlength="64" autocomplete="off"
+                            placeholder="desktop widget"/>
+                    </label>
+                    <label class="field">
+                        <span>"Expires after"</span>
+                        <input type="number" min="1" bind:value=days placeholder="never"/>
+                        <small>"Days; empty for never."</small>
+                    </label>
+                    <label class="check">
+                        <input type="checkbox" bind:checked=read_only/>
+                        "Read-only"
+                    </label>
+                </div>
+                <ErrorNote error=error/>
+                <div class="form-actions">
+                    <button type="submit" class="button button-primary">"Create token"</button>
+                </div>
+            </form>
+        </section>
+
+        <Modal open=created_open title="New API token">
+            <p>
+                "Copy the token " <strong>{move || created.get().map(|c| c.token.name).unwrap_or_default()}</strong>
+                " now: it is not shown again."
+            </p>
+            <CopyField value=secret/>
+            <div class="form-actions">
+                <button class="button button-primary" on:click=move |_| {
+                    created_open.set(false);
+                    created.set(None);
+                }>"Done"</button>
+            </div>
+        </Modal>
+
+        <Modal open=revoke_open title="Revoke token">
+            <p>
+                {move || revoke_target.get().map(|t| format!(
+                    "Revoke {}? What uses it stops working at once.",
+                    t.name
+                ))}
+            </p>
+            <div class="form-actions">
+                <button class="button" on:click=move |_| revoke_open.set(false)>"Cancel"</button>
+                <button class="button button-danger" on:click=revoke>"Revoke"</button>
+            </div>
+        </Modal>
     }
 }
 
