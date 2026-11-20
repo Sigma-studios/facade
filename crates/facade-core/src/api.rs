@@ -767,6 +767,16 @@ pub struct Problem {
     /// What to do, when it is plain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Whether doing something makes it go away. A vulnerability with no fix
+    /// released is not: it stays listed, so it is seen, but after the others,
+    /// as a warning, and out of the counts. Servers from before it say nothing:
+    /// everything was actionable then.
+    #[serde(default = "actionable")]
+    pub actionable: bool,
+}
+
+fn actionable() -> bool {
+    true
 }
 
 /// Critical sorts first.

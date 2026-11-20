@@ -1332,6 +1332,9 @@ a.badge:hover { text-decoration: none; filter: brightness(0.97); }
 .problem-icon { flex: none; width: 18px; text-align: center; font-size: 13px; align-self: flex-start; line-height: 20px; }
 .problem-critical .problem-icon { color: var(--critical); }
 .problem-warning .problem-icon { color: var(--serious); }
+.problem-waiting { box-shadow: inset 3px 0 0 var(--border-strong); }
+.problem-waiting .problem-icon, .problem-waiting .problem-message { color: var(--text-muted); }
+.problem-waiting .problem-message { font-weight: 450; }
 .problem-body { flex: 1; min-width: 0; }
 .problem-message { font-weight: 550; overflow-wrap: anywhere; }
 .problem-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; font-size: 12.5px; color: var(--text-muted); }

@@ -1154,6 +1154,12 @@ itself. What happened before is the alerts' history (linked from there) and the
   unreachable; the key of the offsite copy not kept anywhere else yet; offsite copies
   paused after a rebuild.
 
+A vulnerability with no fix released (see [Vulnerabilities](#vulnerabilities)) is
+listed too, but nothing makes it go away short of a fix coming out: it is a warning,
+after the others and muted, left out of the sidebar's count and `facade status`'s, and
+marked `"actionable": false` in `GET /api/problems` (every other problem is
+`true`). Acknowledging it removes it.
+
 Stopped apps, and apps never deployed, have none, nor do their domains. One cause makes
 one row: a site unreachable because its record is wrong is the DNS row (made critical),
 one whose certificate expired is the certificate's, one on an offline node or a node
@@ -1285,7 +1291,8 @@ priority.
   with when each was first seen and the date of the data.
 * A finding with no fix released raises an alert of its own (`node:main:vuln:CVE-…`)
   from `alert_min` up: critical by default, since a kernel always has dozens of high
-  ones waiting for a fix (drivers a server never loads, mostly). High and critical
+  ones waiting for a fix (drivers a server never loads, mostly). In
+  [Problems](#problems) it is listed apart, not counted, since only a fix ends it. High and critical
   ones an update or a reboot fixes are named in the upkeep alert instead
   (`3 updates (1 security) (fixes CVE-2026-45447)`).
 * `facade vulns [--node N] [--all] [--json]` lists them; `facade vulns ack CVE-2026-98432

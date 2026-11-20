@@ -67,7 +67,7 @@ pub fn Overview() -> impl IntoView {
 }
 
 /// What is wrong right now, critical first then oldest, each with where it is
-/// fixed. A fixed problem leaves the list by itself; what happened before is
+/// fixed; what only waits for a fix last, muted. A fixed problem leaves the list by itself; what happened before is
 /// the alerts' history (linked) and the Activity's.
 #[component]
 fn ProblemsSection() -> impl IntoView {
@@ -111,12 +111,17 @@ fn ProblemRow(problem: Problem) -> impl IntoView {
     };
     // A domain's app, after the domain.
     let app = problem.app.clone().filter(|_| problem.domain.is_some());
+    // Nothing to do but wait for a fix: muted, after the rest (the server
+    // sorts them last).
+    let waiting = !problem.actionable;
+    let (class, label, icon) = match (waiting, critical) {
+        (true, _) => ("problem problem-waiting", "waiting for a fix", "·"),
+        (false, true) => ("problem problem-critical", "critical", "✕"),
+        (false, false) => ("problem problem-warning", "warning", "⚠"),
+    };
     view! {
-        <li class=if critical { "problem problem-critical" } else { "problem problem-warning" }>
-            <span class="problem-icon" role="img"
-                aria-label=if critical { "critical" } else { "warning" }>
-                {if critical { "✕" } else { "⚠" }}
-            </span>
+        <li class=class>
+            <span class="problem-icon" role="img" aria-label=label>{icon}</span>
             <div class="problem-body">
                 <div class="problem-message">{problem.message.clone()}</div>
                 // Separated by the stylesheet, so a missing part leaves no stray dot.

@@ -138,14 +138,16 @@ pub fn problems() -> Problems {
 }
 
 impl Problems {
-    /// How many, and whether any is critical.
+    /// How many can be acted on, and whether any of those is critical. The
+    /// rest (vulnerabilities with no fix released) are listed, not counted.
     pub fn count(&self) -> (usize, bool) {
         self.0.data.with(|p| {
             let p = p.as_deref().unwrap_or_default();
-            let critical = p
-                .iter()
+            let actionable = p.iter().filter(|p| p.actionable);
+            let critical = actionable
+                .clone()
                 .any(|p| p.severity == facade_core::api::ProblemSeverity::Critical);
-            (p.len(), critical)
+            (actionable.count(), critical)
         })
     }
 }

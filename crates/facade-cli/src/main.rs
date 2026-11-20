@@ -60,7 +60,8 @@ enum Command {
     Passwd,
     /// Nodes and apps at a glance.
     Status,
-    /// What is wrong right now and where to fix it; a problem is gone once fixed.
+    /// What is wrong right now and where to fix it; a problem is gone once
+    /// fixed. Vulnerabilities with no fix released are listed apart.
     Problems,
     /// Vulnerabilities in what the nodes run (high and critical; --all for
     /// every one); `ack` silences one until its status changes.
@@ -4884,16 +4885,25 @@ fn node_notes(n: &NodeView) -> Vec<String> {
     notes
 }
 
-/// `no problems`, or `3 problems (1 critical): facade problems`.
+/// `no problems`, or `3 problems (1 critical): facade problems`. Problems
+/// nothing can be done about (vulnerabilities with no fix released) are not
+/// counted, only mentioned.
 fn problems_count(problems: &[Problem]) -> String {
-    let critical = problems
+    let (actionable, waiting): (Vec<&Problem>, Vec<&Problem>) =
+        problems.iter().partition(|p| p.actionable);
+    let critical = actionable
         .iter()
         .filter(|p| p.severity == ProblemSeverity::Critical)
         .count();
-    match problems.len() {
-        0 => "no problems".into(),
+    let waiting = match waiting.len() {
+        0 => String::new(),
+        n => format!(" ({n} waiting for a fix)"),
+    };
+    match actionable.len() {
+        0 if waiting.is_empty() => "no problems".into(),
+        0 => format!("no problems{waiting}: facade problems"),
         n => format!(
-            "{n} problem{}{}: facade problems",
+            "{n} problem{}{}{waiting}: facade problems",
             if n == 1 { "" } else { "s" },
             if critical > 0 {
                 format!(" ({critical} critical)")
@@ -4905,33 +4915,25 @@ fn problems_count(problems: &[Problem]) -> String {
 }
 
 /// Each problem on a line, then what it concerns, since when and where it is
-/// fixed in the web UI (`web` is its address), then what to do.
+/// fixed in the web UI (`web` is its address), then what to do. Those nothing
+/// can be done about come last, under a heading of their own.
 fn print_problems(problems: &[Problem], web: &str) {
     if problems.is_empty() {
         println!("no problems");
         return;
     }
-    for p in problems {
-        let icon = match p.severity {
-            ProblemSeverity::Critical => "✕",
-            ProblemSeverity::Warning => "⚠",
-        };
-        println!("{icon} {}", p.message);
-        let mut facts = Vec::new();
-        match p.subject() {
-            ("server", _) => {}
-            (kind, name) => facts.push(format!("{kind} {name}")),
+    let (actionable, waiting): (Vec<&Problem>, Vec<&Problem>) =
+        problems.iter().partition(|p| p.actionable);
+    for p in &actionable {
+        print_problem(p, web);
+    }
+    if !waiting.is_empty() {
+        if !actionable.is_empty() {
+            println!();
         }
-        if let Some(since) = p.since {
-            facts.push(format!(
-                "for {}",
-                output::ago(since).trim_end_matches(" ago")
-            ));
-        }
-        facts.push(format!("{}: {web}{}", p.fix_label, p.fix));
-        println!("  {}", facts.join(" · "));
-        if let Some(hint) = &p.hint {
-            println!("  → {hint}");
+        println!("Waiting for a fix (not counted):");
+        for p in &waiting {
+            print_problem(p, web);
         }
     }
     println!();
@@ -4939,6 +4941,31 @@ fn print_problems(problems: &[Problem], web: &str) {
         "{}",
         problems_count(problems).replace(": facade problems", "")
     );
+}
+
+fn print_problem(p: &Problem, web: &str) {
+    let icon = match p.severity {
+        _ if !p.actionable => "·",
+        ProblemSeverity::Critical => "✕",
+        ProblemSeverity::Warning => "⚠",
+    };
+    println!("{icon} {}", p.message);
+    let mut facts = Vec::new();
+    match p.subject() {
+        ("server", _) => {}
+        (kind, name) => facts.push(format!("{kind} {name}")),
+    }
+    if let Some(since) = p.since {
+        facts.push(format!(
+            "for {}",
+            output::ago(since).trim_end_matches(" ago")
+        ));
+    }
+    facts.push(format!("{}: {web}{}", p.fix_label, p.fix));
+    println!("  {}", facts.join(" · "));
+    if let Some(hint) = &p.hint {
+        println!("  → {hint}");
+    }
 }
 
 fn print_apps(apps: &[AppView]) {

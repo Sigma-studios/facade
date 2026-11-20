@@ -13,6 +13,9 @@
 //! wrong is the DNS row, made critical; one unreachable because its node is
 //! offline is the node's row; an app that is down does not also answer errors
 //! or fail its health check.
+//!
+//! A vulnerability with no fix released is listed too, but marked not
+//! actionable: a warning, after the rest, left out of the counts.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -490,6 +493,7 @@ impl Found {
                 fix: "/".into(),
                 fix_label: "Overview".into(),
                 hint: None,
+                actionable: true,
             },
             known: None,
             after: 0,
@@ -525,6 +529,11 @@ impl Found {
     fn hint(mut self, hint: impl Into<String>) -> Self {
         let hint = hint.into();
         self.problem.hint = (!hint.trim().is_empty()).then_some(hint);
+        self
+    }
+
+    fn unactionable(mut self) -> Self {
+        self.problem.actionable = false;
         self
     }
 
@@ -601,7 +610,8 @@ fn lasted(secs: u64) -> String {
     format!("for {}", minutes(secs / 60))
 }
 
-/// Everything wrong in `facts`, one row per cause, critical first then oldest.
+/// Everything wrong in `facts`, one row per cause, critical first then oldest,
+/// what cannot be acted on last.
 /// `seen` holds when each was first seen; it is updated to the current ones.
 fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, Seen>) -> Vec<Problem> {
     use ProblemSeverity::{Critical, Warning};
@@ -618,15 +628,14 @@ fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, Seen>) -> Vec<Pr
         let (scope, rest) = alert.key.split_once(':').unwrap_or((&alert.key, ""));
         let (name, kind) = rest.rsplit_once(':').unwrap_or((rest, ""));
         match scope {
+            // Only findings with no fix released alert: nothing to do but
+            // wait, or mitigate and acknowledge. Listed so they are seen, but
+            // as warnings that do not count, whatever the CVE's priority.
             "node" if rest.contains(":vuln:") => {
                 let (name, cve) = rest.split_once(":vuln:").unwrap_or((rest, ""));
-                let severity = if alert.message.contains("(critical)") {
-                    Critical
-                } else {
-                    Warning
-                };
                 out.push(
-                    Found::new(&alert.key, severity, &alert.message)
+                    Found::new(&alert.key, Warning, &alert.message)
+                        .unactionable()
                         .node(name)
                         .since(Some(alert.since))
                         .fix(format!("/nodes/{name}?tab=vulnerabilities"), "Vulnerabilities")
@@ -1063,7 +1072,9 @@ fn assemble(facts: &Facts, now: u64, seen: &mut HashMap<String, Seen>) -> Vec<Pr
             Some(f.problem)
         })
         .collect();
-    list.sort_by(|a, b| (a.severity, a.since, &a.key).cmp(&(b.severity, b.since, &b.key)));
+    // Actionable ones first: the rest only wait.
+    let order = |p: &Problem| (!p.actionable, p.severity, p.since, p.key.clone());
+    list.sort_by_cached_key(order);
     list
 }
 
@@ -1306,6 +1317,46 @@ mod tests {
             Some("run sudo apt upgrade on the node")
         );
         assert_eq!(list[3].fix, "/apps/blog?tab=volumes");
+    }
+
+    #[test]
+    fn vulnerabilities_without_a_fix_wait_after_the_rest() {
+        let facts = Facts {
+            alerts: vec![
+                alert(
+                    "node:main:vuln:CVE-2026-98432",
+                    "CVE-2026-98432 (critical) in linux has no fix released: mptcp",
+                    NOW - 9000,
+                ),
+                alert(
+                    "node:main:upkeep",
+                    "node main: 3 updates (1 security)",
+                    NOW - 100,
+                ),
+            ],
+            nodes: vec![node("main")],
+            ..Default::default()
+        };
+        let list = run(&facts);
+        assert_eq!(
+            keys(&list),
+            ["node:main:upkeep", "node:main:vuln:CVE-2026-98432"]
+        );
+        assert!(list[0].actionable);
+        let vuln = &list[1];
+        assert!(!vuln.actionable);
+        // Critical for Ubuntu, but nothing to do about it: not a critical problem.
+        assert_eq!(vuln.severity, ProblemSeverity::Warning);
+        assert_eq!(vuln.fix, "/nodes/main?tab=vulnerabilities");
+    }
+
+    #[test]
+    fn problems_from_older_servers_are_actionable() {
+        let p: Problem = serde_json::from_str(
+            r#"{"key":"notify","severity":"warning","message":"m","fix":"/","fix_label":"x"}"#,
+        )
+        .unwrap();
+        assert!(p.actionable);
     }
 
     #[test]
