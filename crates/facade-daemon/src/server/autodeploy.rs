@@ -1184,6 +1184,9 @@ pub async fn list(State(server): S, user: User) -> ApiResult<Json<Vec<AutoDeploy
 /// token for, say).
 pub async fn hook_info(State(server): S, user: User) -> ApiResult<Json<WebhookInfo>> {
     user.require_admin()?;
+    // The secret signs deliveries, so it can trigger deploys: not for a
+    // read-only token.
+    user.require_full_access()?;
     Ok(Json(WebhookInfo {
         url: webhook_url(&server),
         secret: webhook_secret(&server)?,
